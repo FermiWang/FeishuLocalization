@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feishu Archive</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="brand-mark">FA</div>
+        <div><h1>Feishu Archive</h1><p>本机离线档案</p></div>
+      </header>
+      <div id="archive-status" class="status-card">正在读取档案…</div>
+      <label class="search-label" for="chat-search">筛选会话</label>
+      <input id="chat-search" class="input" type="search" placeholder="输入会话名称">
+      <nav id="conversation-list" class="conversation-list" aria-label="会话列表"></nav>
+    </aside>
+
+    <main class="content">
+      <header class="content-header">
+        <div><p class="eyebrow">离线阅读</p><h2 id="chat-title">请选择会话</h2></div>
+        <div class="export-actions">
+          <button id="export-html" class="button secondary" disabled>导出 HTML</button>
+          <button id="export-json" class="button" disabled>导出 JSON</button>
+        </div>
+      </header>
+
+      <section class="filters" aria-label="消息筛选">
+        <label>全文搜索<input id="query" class="input" type="search" placeholder="输入关键词"></label>
+        <label>人员<select id="sender" class="input"><option value="">全部人员</option></select></label>
+        <label>类型<select id="message-type" class="input">
+          <option value="">全部类型</option><option value="text">文本</option><option value="post">富文本</option>
+          <option value="image">图片</option><option value="file">文件</option><option value="audio">音频</option><option value="media">视频</option>
+        </select></label>
+        <label>开始日期<input id="date-from" class="input" type="date"></label>
+        <label>结束日期<input id="date-to" class="input" type="date"></label>
+        <button id="search" class="button">筛选</button>
+      </section>
+
+      <section class="result-summary"><span id="result-count">0 条消息</span><span id="coverage-note">仅显示官方接口已授权且可见的内容</span></section>
+      <section id="messages" class="messages" aria-live="polite">
+        <div class="empty-state"><strong>选择左侧会话开始阅读</strong><span>所有内容均从本机档案加载。</span></div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

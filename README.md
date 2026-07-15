@@ -1,2 +1,135 @@
-# FeishuLocalization
-用于开发可离线运行的飞书应用
+# Feishu Archive
+
+Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书官方授权接口同步用户可见的消息，将消息、同步状态与附件保存在本机，并通过只监听 `127.0.0.1` 的阅读器进行搜索和导出。
+
+> 项目不会读取、复制或尝试解密 `LarkShell`、`messages.db`、`im.db`、`Core.db` 等飞书客户端私有数据。
+
+## 当前 PoC 能力
+
+- OAuth 2.0 用户授权，`access_token` 与 `refresh_token` 仅存 macOS 钥匙串。
+- 使用用户令牌发现群聊并同步指定会话最近 N 天的历史消息。
+- 普通群消息包含 `thread_id` 时，自动二次同步话题回复。
+- SQLite 保存会话、成员、消息、编辑/删除状态、附件清单与同步运行记录。
+- SQLite FTS5 全文搜索，支持会话、日期、人员和消息类型筛选。
+- 附件下载前检查单文件 100 MB 上限和本地总容量上限。
+- 完全本地的离线网页阅读器；不加载 CDN、字体、统计或其他网络资源。
+- 单个会话导出为 JSON 或自包含 HTML。
+- 示例数据模式，无飞书应用凭据也能验证完整阅读闭环。
+
+## 安全边界
+
+- 阅读器只允许绑定 `127.0.0.1`、`::1` 或 `localhost`。
+- OAuth `state` 会校验，授权码只在本地回调服务内交换。
+- 令牌由 macOS Keychain 保存，日志和 SQLite 中不写入令牌。
+- SQLite、FTS 索引和附件由本机 FileVault 提供静态加密保护；`doctor` 会检查 FileVault 状态。
+- App Secret 只从环境变量读取，不写入配置文件。
+- 导出文件是明文副本，用户需要自行控制其保存位置和传播范围。
+
+## 1. 运行
+
+```bash
+./bin/feishu-archive --version
+```
+
+项目运行时只依赖 macOS 自带能力和 Python 3.11+，不需要联网安装第三方包。需要标准 Python 命令入口的开发者也可以使用 `python -m pip install -e .`。
+
+## 2. 无凭据验证
+
+```bash
+./bin/feishu-archive init
+./bin/feishu-archive demo
+./bin/feishu-archive serve
+```
+
+浏览器打开 <http://127.0.0.1:8765>。默认档案目录为：
+
+```text
+~/Library/Application Support/Feishu Archive
+```
+
+可通过 `--archive-dir` 指向独立测试目录。
+
+## 3. 创建并配置飞书自建应用
+
+在飞书开放平台创建企业自建应用，开启机器人能力，并申请、发布下列最小权限：
+
+- `im:message:readonly`
+- `im:message.p2p_msg:get_as_user`
+- `im:message.group_msg:get_as_user`
+- `im:chat:readonly` 或当前后台显示的等价群信息只读权限
+- `im:chat.members:read`（用于把消息发送者 ID 映射为成员姓名）
+- `offline_access`
+
+在安全设置中添加回调地址：
+
+```text
+http://127.0.0.1:8766/oauth/callback
+```
+
+设置仅在当前终端有效的应用凭据：
+
+```bash
+export FEISHU_APP_ID='cli_xxx'
+export FEISHU_APP_SECRET='xxx'
+```
+
+执行授权：
+
+```bash
+./bin/feishu-archive auth
+```
+
+授权完成后，凭据仍不会写入仓库或档案数据库。
+
+## 4. 发现与同步
+
+```bash
+# 查看用户令牌能发现的群聊；官方群列表接口不返回单聊
+./bin/feishu-archive discover
+
+# 同步指定会话最近 30 天；可重复传入 --chat-id
+./bin/feishu-archive sync --chat-id oc_xxx --days 30
+
+# 不下载附件，仅核对消息覆盖率
+./bin/feishu-archive sync --chat-id oc_xxx --days 30 --skip-attachments
+```
+
+推荐首轮分别选择一个已知单聊 `chat_id`、一个内部群和一个外部群。外部群、保密群或机器人不在群内时，程序会把接口错误写入同步运行记录，不会把它解释成空会话。
+
+## 5. 容量控制
+
+附件默认总上限为 20 GiB，可在命令中调整：
+
+```bash
+./bin/feishu-archive sync --chat-id oc_xxx --days 30 --max-attachment-gib 10
+```
+
+单个资源始终限制为 100 MB。达到总上限后，消息仍会保存，附件状态标记为 `skipped_capacity`。
+
+## 6. 检查与测试
+
+```bash
+./bin/feishu-archive doctor
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+```
+
+## 官方覆盖限制
+
+- 获取指定消息和资源仍要求应用开启机器人能力，机器人需要位于消息所属会话。
+- 群列表接口不包含单聊，因此单聊 PoC 需要从事件、已知链接或其他合规来源取得 `chat_id` 后显式同步。
+- 普通对话群中，按 `chat` 查询只能取得话题根消息；回复需要再按 `thread` 查询。
+- `thread` 查询不支持 `start_time` / `end_time`，程序拉取后会在本地按时间范围过滤。
+- 资源接口限制单文件不超过 100 MB，不支持部分卡片、合并转发子消息、表情包和防泄密资源。
+- 被删除、撤回、超过租户保留期限或因历史消息可见性设置不可见的内容无法补救性恢复。
+
+参考：
+
+- [获取会话历史消息](https://open.feishu.cn/document/server-docs/im-v1/message/list)
+- [话题概述](https://open.feishu.cn/document/im-v1/message/thread-introduction)
+- [获取用户或机器人所在的群列表](https://open.feishu.cn/document/server-docs/group/chat/list)
+- [获取消息中的资源文件](https://open.feishu.cn/document/server-docs/im-v1/message/get-2)
+- [浏览器网页授权接入指南](https://open.feishu.cn/document/sso/web-application-end-user-consent/guide)
+
+## 项目阶段
+
+当前是 30 天、小样本覆盖率验证 PoC。验证通过后再进入 18 个月回溯、增量调度、应用级加密和签名安装包阶段。
