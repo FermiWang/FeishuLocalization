@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -191,6 +192,7 @@ class ArchiveDatabase:
                 "INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)",
                 (str(int(time.time() * 1000)),),
             )
+        os.chmod(self.path, 0o600)
 
     def integrity_check(self) -> str:
         with self.connection() as con:

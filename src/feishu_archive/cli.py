@@ -46,6 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init", help="初始化本地档案库")
     subparsers.add_parser("demo", help="写入三个 PoC 示例会话")
 
+    configure = subparsers.add_parser("configure", help="把飞书应用凭据安全保存到 macOS 钥匙串")
+    configure_mode = configure.add_mutually_exclusive_group(required=True)
+    configure_mode.add_argument(
+        "--app-id-stdin",
+        action="store_true",
+        help="从标准输入读取 App ID",
+    )
+    configure_mode.add_argument(
+        "--app-secret-stdin",
+        action="store_true",
+        help="从标准输入读取 App Secret（需先保存 App ID）",
+    )
+
     auth = subparsers.add_parser("auth", help="通过浏览器完成飞书用户 OAuth 授权")
     auth.add_argument("--oauth-port", type=int, default=DEFAULT_OAUTH_PORT)
     auth.add_argument("--no-open", action="store_true", help="只显示授权链接，不自动打开浏览器")
@@ -86,6 +99,8 @@ def main(argv: list[str] | None = None) -> None:
                 f"示例数据已就绪：{result['conversations']} 个会话，"
                 f"新增 {result['messages_written']} 条消息，{result['attachments']} 个附件"
             )
+        elif args.command == "configure":
+            _configure(args.app_id_stdin, args.app_secret_stdin)
         elif args.command == "auth":
             _authorize(args.oauth_port, args.no_open)
         elif args.command == "discover":
@@ -131,12 +146,54 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2) from exc
 
 
+def _app_config(
+    oauth_port: int = DEFAULT_OAUTH_PORT,
+    store: KeychainStore | None = None,
+) -> FeishuAppConfig:
+    store = store or KeychainStore()
+    app_id = os.environ.get("FEISHU_APP_ID", "").strip() or (store.get("app_id") or "").strip()
+    app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+    if app_id and not app_secret:
+        app_secret = (store.get(f"{app_id}:app_secret") or "").strip()
+    if not app_id or not app_secret:
+        raise ValueError(
+            "请先通过 configure 将 App ID 和 App Secret 保存到钥匙串，"
+            "或设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET"
+        )
+    redirect_uri = os.environ.get(
+        "FEISHU_REDIRECT_URI",
+        f"http://127.0.0.1:{oauth_port}/oauth/callback",
+    ).strip()
+    return FeishuAppConfig(app_id=app_id, app_secret=app_secret, redirect_uri=redirect_uri)
+
+
+def _configure(app_id_stdin: bool, app_secret_stdin: bool) -> None:
+    value = sys.stdin.read().strip()
+    if not value:
+        raise ValueError("标准输入为空")
+    store = KeychainStore()
+    if app_id_stdin:
+        store.set("app_id", value)
+        print("App ID 已保存到 macOS 钥匙串。")
+        return
+    if app_secret_stdin:
+        app_id = (store.get("app_id") or "").strip()
+        if not app_id:
+            raise ValueError("请先执行 configure --app-id-stdin")
+        store.set(f"{app_id}:app_secret", value)
+        print("App Secret 已保存到 macOS 钥匙串。")
+        return
+    raise ValueError("请选择要保存的凭据类型")
+
+
 def _client(oauth_port: int = DEFAULT_OAUTH_PORT) -> FeishuClient:
-    return FeishuClient(FeishuAppConfig.from_env(oauth_port), KeychainStore())
+    store = KeychainStore()
+    return FeishuClient(_app_config(oauth_port, store), store)
 
 
 def _authorize(oauth_port: int, no_open: bool) -> None:
-    config = FeishuAppConfig.from_env(oauth_port)
+    store = KeychainStore()
+    config = _app_config(oauth_port, store)
     parsed_redirect = urllib.parse.urlparse(config.redirect_uri)
     redirect_host = parsed_redirect.hostname or ""
     redirect_port = parsed_redirect.port or (443 if parsed_redirect.scheme == "https" else 80)
@@ -144,7 +201,7 @@ def _authorize(oauth_port: int, no_open: bool) -> None:
         raise ValueError("FEISHU_REDIRECT_URI 路径必须是 /oauth/callback")
     if not is_loopback_host(redirect_host) or redirect_port != oauth_port:
         raise ValueError("OAuth 回调必须指向本机回环地址和 --oauth-port 指定端口")
-    client = FeishuClient(config, KeychainStore())
+    client = FeishuClient(config, store)
     state = client.new_state()
     result: dict[str, str] = {}
 
@@ -217,15 +274,21 @@ def _doctor(database: ArchiveDatabase, root: Path) -> bool:
     integrity = database.integrity_check()
     checks.append(("SQLite 完整性", integrity == "ok", integrity))
     checks.append(("阅读器绑定", is_loopback_host("127.0.0.1"), "127.0.0.1 only"))
-    app_id = os.environ.get("FEISHU_APP_ID", "").strip()
+    store = KeychainStore()
+    app_id = os.environ.get("FEISHU_APP_ID", "").strip() or (store.get("app_id") or "").strip()
     if app_id:
         try:
-            token_present = bool(KeychainStore().get(f"{app_id}:refresh_token"))
+            secret_present = bool(
+                os.environ.get("FEISHU_APP_SECRET", "").strip()
+                or store.get(f"{app_id}:app_secret")
+            )
+            checks.append(("飞书应用配置", secret_present, "已保存" if secret_present else "缺少 App Secret"))
+            token_present = bool(store.get(f"{app_id}:refresh_token"))
             checks.append(("OAuth 刷新令牌", token_present, "已保存" if token_present else "未保存"))
         except KeychainError as exc:
             checks.append(("OAuth 刷新令牌", False, str(exc)))
     else:
-        checks.append(("飞书应用配置", False, "未设置 FEISHU_APP_ID（demo/阅读不受影响）"))
+        checks.append(("飞书应用配置", False, "未配置 App ID（demo/阅读不受影响）"))
     for name, ok, detail in checks:
         print(f"{'✓' if ok else '!'} {name}: {detail}")
     hard_failures = [name for name, ok, _ in checks if not ok and name in {"FileVault", "SQLite 完整性", "阅读器绑定"}]

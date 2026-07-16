@@ -16,6 +16,11 @@ class FakeResponse(io.BytesIO):
         self.headers = {"Content-Length": str(len(payload)), "Content-Type": "text/plain"}
 
 
+class TimeoutResponse(FakeResponse):
+    def read(self, size=-1):
+        raise TimeoutError("test timeout")
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.now_ms = int(time.time() * 1000)
@@ -66,6 +71,12 @@ class FakeClient:
         return FakeResponse(b"offline attachment")
 
 
+class TimeoutClient(FakeClient):
+    def open_resource(self, message_id, file_key, resource_type):
+        self.calls.append(("resource", message_id, file_key, resource_type))
+        return TimeoutResponse(b"offline attachment")
+
+
 class SyncTests(unittest.TestCase):
     def test_chat_thread_and_attachment_vertical_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -95,6 +106,29 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(client.calls[1][0], "chat")
             self.assertEqual(client.calls[2][0], "thread")
             self.assertEqual(client.calls[2][2], {})
+
+    def test_attachment_timeout_is_recorded_without_aborting_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            syncer = ArchiveSyncer(
+                database,
+                TimeoutClient(),
+                paths,
+                max_attachment_bytes=1024 * 1024,
+            )
+
+            counts = syncer.sync(["oc_1"], days=30)
+
+            self.assertEqual(counts.messages_written, 2)
+            attachment = database.attachments_for_messages(["om_reply"])["om_reply"][0]
+            self.assertEqual(attachment["status"], "error")
+            self.assertIn("test timeout", attachment["error"])
+            latest = database.status()["latest_sync"]
+            self.assertEqual(latest["status"], "partial")
+            self.assertIn("1 个附件下载失败", latest["error"])
 
 
 if __name__ == "__main__":

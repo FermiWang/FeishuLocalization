@@ -1,4 +1,6 @@
+import time
 import unittest
+from unittest.mock import patch
 
 from feishu_archive.config import FeishuAppConfig
 from feishu_archive.feishu import FeishuClient
@@ -56,6 +58,17 @@ class FeishuClientTests(unittest.TestCase):
         self.assertIn("offline_access", url)
         self.assertIn("safe-state", url)
         self.assertIn("client_id=cli_test", url)
+
+    def test_resource_download_uses_user_access_token(self) -> None:
+        client = RecordingClient()
+        client.token_store.set(client.account("access_token"), "user-token")
+        client.token_store.set(client.account("access_expires_at"), str(int(time.time()) + 3600))
+
+        with patch("feishu_archive.feishu.urllib.request.urlopen", return_value=object()) as opener:
+            client.open_resource("om_1", "img_1", "image")
+
+        request = opener.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer user-token")
 
 
 if __name__ == "__main__":

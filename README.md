@@ -20,9 +20,9 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 
 - 阅读器只允许绑定 `127.0.0.1`、`::1` 或 `localhost`。
 - OAuth `state` 会校验，授权码只在本地回调服务内交换。
-- 令牌由 macOS Keychain 保存，日志和 SQLite 中不写入令牌。
+- 应用凭据和令牌由 macOS Keychain 保存，日志和 SQLite 中不写入这些敏感值。
 - SQLite、FTS 索引和附件由本机 FileVault 提供静态加密保护；`doctor` 会检查 FileVault 状态。
-- App Secret 只从环境变量读取，不写入配置文件。
+- App Secret 只从环境变量或 macOS Keychain 读取，不写入配置文件。
 - 导出文件是明文副本，用户需要自行控制其保存位置和传播范围。
 
 ## 1. 运行
@@ -32,6 +32,7 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 ```
 
 项目运行时只依赖 macOS 自带能力和 Python 3.11+，不需要联网安装第三方包。需要标准 Python 命令入口的开发者也可以使用 `python -m pip install -e .`。
+网络请求在 macOS 上显式使用系统 CA 证书包 `/etc/ssl/cert.pem`，避免独立 Python 安装缺少默认证书路径时误报 TLS 校验失败。
 
 ## 2. 无凭据验证
 
@@ -48,6 +49,20 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 ```
 
 可通过 `--archive-dir` 指向独立测试目录。
+
+### 安装为本机后台服务
+
+```bash
+./scripts/install-local.sh
+```
+
+安装后会在当前 macOS 用户登录时自动启动，只监听 <http://127.0.0.1:8765>。稳定运行副本位于档案目录的 `runtime/`，日志位于 `logs/`。
+
+移除后台服务但保留档案数据：
+
+```bash
+./scripts/uninstall-local.sh
+```
 
 ## 3. 创建并配置飞书自建应用
 
@@ -66,12 +81,17 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 http://127.0.0.1:8766/oauth/callback
 ```
 
-设置仅在当前终端有效的应用凭据：
+推荐通过系统剪贴板把应用凭据分别保存到 macOS 钥匙串；命令不会回显凭据：
 
 ```bash
-export FEISHU_APP_ID='cli_xxx'
-export FEISHU_APP_SECRET='xxx'
+# 在开发者后台复制 App ID 后
+pbpaste | ./bin/feishu-archive configure --app-id-stdin
+
+# 再复制 App Secret
+pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 ```
+
+也可以临时使用 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 环境变量；环境变量优先于钥匙串。
 
 执行授权：
 
@@ -79,7 +99,7 @@ export FEISHU_APP_SECRET='xxx'
 ./bin/feishu-archive auth
 ```
 
-授权完成后，凭据仍不会写入仓库或档案数据库。
+授权完成后，应用凭据和用户令牌均不会写入仓库或档案数据库。
 
 ## 4. 发现与同步
 

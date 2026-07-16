@@ -79,14 +79,17 @@ class ArchiveSyncer:
                         status="error",
                         error=str(exc),
                     )
+            attachment_failures = 0
             if not skip_attachments:
-                self._download_pending(unique_chat_ids, counts)
+                attachment_failures = self._download_pending(unique_chat_ids, counts)
             if errors and len(errors) == len(unique_chat_ids):
                 status = "error"
-            elif errors:
+            elif errors or attachment_failures:
                 status = "partial"
             else:
                 status = "success"
+            if attachment_failures:
+                errors.append(f"{attachment_failures} 个附件下载失败，可在下次同步时自动重试")
             self.database.finish_sync_run(
                 run_id,
                 status=status,
@@ -226,9 +229,10 @@ class ArchiveSyncer:
                 resource.filename,
             )
 
-    def _download_pending(self, chat_ids: list[str], counts: SyncCounts) -> None:
+    def _download_pending(self, chat_ids: list[str], counts: SyncCounts) -> int:
         allowed_chats = set(chat_ids)
         used_bytes = self.database.attachment_bytes()
+        failures = 0
         for attachment in self.database.list_pending_attachments():
             if attachment["chat_id"] not in allowed_chats:
                 continue
@@ -248,9 +252,22 @@ class ArchiveSyncer:
                 )
                 counts.attachments_skipped += 1
             except FeishuAPIError as exc:
+                if "size exceeds limit" in str(exc).lower():
+                    self.database.update_attachment(
+                        attachment["id"], status="skipped_too_large", error=str(exc)
+                    )
+                    counts.attachments_skipped += 1
+                else:
+                    self.database.update_attachment(
+                        attachment["id"], status="error", error=str(exc)
+                    )
+                    failures += 1
+            except OSError as exc:
                 self.database.update_attachment(
-                    attachment["id"], status="error", error=str(exc)
+                    attachment["id"], status="error", error=f"附件下载失败：{exc}"
                 )
+                failures += 1
+        return failures
 
     def _download_one(self, attachment: dict[str, Any], remaining_bytes: int) -> int:
         with self.client.open_resource(

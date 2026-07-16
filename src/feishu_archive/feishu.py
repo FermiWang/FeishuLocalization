@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -14,6 +16,8 @@ from .config import FeishuAppConfig
 
 API_BASE = "https://open.feishu.cn/open-apis"
 AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
+MACOS_SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
+RESOURCE_DOWNLOAD_TIMEOUT = 120
 
 
 class TokenStore(Protocol):
@@ -49,6 +53,10 @@ class FeishuClient:
         self.config = config
         self.token_store = token_store
         self.timeout = timeout
+        ca_file = os.environ.get("SSL_CERT_FILE", "").strip()
+        if not ca_file and os.path.isfile(MACOS_SYSTEM_CA_FILE):
+            ca_file = MACOS_SYSTEM_CA_FILE
+        self.ssl_context = ssl.create_default_context(cafile=ca_file or None)
         self._tenant_token: str | None = None
         self._tenant_token_expires_at = 0
 
@@ -231,10 +239,17 @@ class FeishuClient:
         request = urllib.request.Request(
             url,
             method="GET",
-            headers={"Authorization": f"Bearer {self.tenant_access_token()}"},
+            # Keep resource visibility aligned with the OAuth user's message
+            # access. Feishu still requires the matching app-identity message
+            # scope to be enabled for this endpoint.
+            headers={"Authorization": f"Bearer {self.user_access_token()}"},
         )
         try:
-            return urllib.request.urlopen(request, timeout=self.timeout)
+            return urllib.request.urlopen(
+                request,
+                timeout=max(self.timeout, RESOURCE_DOWNLOAD_TIMEOUT),
+                context=self.ssl_context,
+            )
         except urllib.error.HTTPError as exc:
             raise self._http_error(exc) from exc
         except urllib.error.URLError as exc:
@@ -262,7 +277,11 @@ class FeishuClient:
         for attempt in range(4):
             request = urllib.request.Request(url, data=body, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=self.timeout,
+                    context=self.ssl_context,
+                ) as response:
                     result = json.loads(response.read().decode("utf-8"))
                 if int(result.get("code") or 0) != 0:
                     raise FeishuAPIError(
