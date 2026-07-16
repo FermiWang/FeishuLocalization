@@ -26,6 +26,9 @@ class FakeClient:
         self.now_ms = int(time.time() * 1000)
         self.calls = []
 
+    def current_user_open_id(self):
+        return "ou_self"
+
     def iter_member_pages(self, chat_id):
         self.calls.append(("members", chat_id))
         yield {"items": [{"member_id": "ou_1", "name": "测试用户", "member_id_type": "open_id"}], "has_more": False}
@@ -52,7 +55,16 @@ class FakeClient:
                 "has_more": False,
             }
 
-    def message(self, message_id, *, thread_id=None, content=None, message_type="text", created_at=None):
+    def message(
+        self,
+        message_id,
+        *,
+        thread_id=None,
+        content=None,
+        message_type="text",
+        created_at=None,
+        sender_id="ou_1",
+    ):
         if content is None:
             content = {"text": message_id}
         return {
@@ -62,7 +74,7 @@ class FakeClient:
             "msg_type": message_type,
             "create_time": str(created_at or self.now_ms),
             "update_time": str(created_at or self.now_ms),
-            "sender": {"id": "ou_1", "sender_type": "user"},
+            "sender": {"id": sender_id, "sender_type": "user"},
             "body": {"content": json.dumps(content)},
         }
 
@@ -77,7 +89,65 @@ class TimeoutClient(FakeClient):
         return TimeoutResponse(b"offline attachment")
 
 
+class DiscoverClient(FakeClient):
+    def iter_chat_pages(self):
+        yield {
+            "items": [{"chat_id": "oc_group", "name": "内部群", "chat_mode": "group"}],
+            "has_more": False,
+        }
+
+    def iter_message_search_pages(self, *, chat_type, page_token=None):
+        self.calls.append(("search", chat_type, page_token))
+        yield {
+            "items": [
+                {
+                    "meta_data": {
+                        "chat_id": "oc_p2p",
+                        "is_p2p_chat": True,
+                    }
+                },
+                {
+                    "meta_data": {
+                        "chat_id": "oc_p2p",
+                        "is_p2p_chat": True,
+                    }
+                },
+            ],
+            "has_more": False,
+        }
+
+    def iter_member_pages(self, chat_id):
+        self.calls.append(("members", chat_id))
+        yield {
+            "items": [
+                {"member_id": "ou_self", "name": "我", "member_id_type": "open_id"},
+                {"member_id": "ou_other", "name": "对方用户", "member_id_type": "open_id"},
+            ],
+            "has_more": False,
+        }
+
+
 class SyncTests(unittest.TestCase):
+    def test_discover_combines_groups_and_p2p_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            syncer = ArchiveSyncer(
+                database,
+                DiscoverClient(),
+                paths,
+                max_attachment_bytes=1024 * 1024,
+            )
+
+            chats = syncer.discover()
+
+            self.assertEqual({item["chat_id"] for item in chats}, {"oc_group", "oc_p2p"})
+            conversations = {item["chat_id"]: item for item in database.list_conversations()}
+            self.assertEqual(conversations["oc_p2p"]["name"], "对方用户")
+            self.assertEqual(conversations["oc_p2p"]["chat_mode"], "p2p")
+
     def test_chat_thread_and_attachment_vertical_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))
@@ -129,6 +199,75 @@ class SyncTests(unittest.TestCase):
             latest = database.status()["latest_sync"]
             self.assertEqual(latest["status"], "partial")
             self.assertIn("1 个附件下载失败", latest["error"])
+
+    def test_all_history_omits_time_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            client = FakeClient()
+            syncer = ArchiveSyncer(
+                database,
+                client,
+                paths,
+                max_attachment_bytes=1024 * 1024,
+            )
+
+            counts = syncer.sync(["oc_1"])
+
+            chat_call = next(call for call in client.calls if call[0] == "chat")
+            self.assertIsNone(chat_call[2]["start_time"])
+            self.assertIsNone(chat_call[2]["end_time"])
+            self.assertEqual(counts.messages_written, 3)
+            latest = database.status()["latest_sync"]
+            self.assertIsNone(latest["requested_days"])
+
+    def test_sent_attachments_are_pruned_and_not_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            client = FakeClient()
+            own_message = client.message(
+                "om_self_file",
+                content={"file_key": "file_self", "file_name": "mine.txt"},
+                message_type="file",
+                sender_id="ou_self",
+            )
+            from feishu_archive.parser import normalize_message
+
+            database.upsert_message(normalize_message(own_message, "oc_1"))
+            attachment_id = database.ensure_attachment(
+                "om_self_file", "file_self", "file", "mine.txt"
+            )
+            local_path = Path("attachments") / "oc_1" / "mine.txt"
+            target = paths.root / local_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"mine")
+            database.update_attachment(
+                attachment_id,
+                status="downloaded",
+                byte_size=4,
+                local_path=str(local_path),
+            )
+            syncer = ArchiveSyncer(
+                database,
+                client,
+                paths,
+                max_attachment_bytes=1024 * 1024,
+            )
+
+            counts = syncer.sync(["oc_1"], days=30)
+
+            self.assertEqual(counts.attachments_pruned, 1)
+            self.assertEqual(counts.attachment_bytes_pruned, 4)
+            self.assertFalse(target.exists())
+            self.assertNotIn(
+                "om_self_file",
+                database.attachments_for_messages(["om_self_file"]),
+            )
 
 
 if __name__ == "__main__":

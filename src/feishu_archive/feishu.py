@@ -17,7 +17,7 @@ from .config import FeishuAppConfig
 API_BASE = "https://open.feishu.cn/open-apis"
 AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 MACOS_SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
-RESOURCE_DOWNLOAD_TIMEOUT = 120
+RESOURCE_DOWNLOAD_TIMEOUT = 15
 
 
 class TokenStore(Protocol):
@@ -59,6 +59,7 @@ class FeishuClient:
         self.ssl_context = ssl.create_default_context(cafile=ca_file or None)
         self._tenant_token: str | None = None
         self._tenant_token_expires_at = 0
+        self._current_user_open_id: str | None = None
 
     def account(self, name: str) -> str:
         return f"{self.config.app_id}:{name}"
@@ -167,6 +168,47 @@ class FeishuClient:
             next_token = data.get("page_token")
             if not next_token or next_token == page_token:
                 raise FeishuAPIError("群列表分页返回了无效 page_token")
+            page_token = str(next_token)
+
+    def current_user_open_id(self) -> str:
+        if self._current_user_open_id:
+            return self._current_user_open_id
+        result = self._json_request("GET", "/authen/v1/user_info")
+        data = result.get("data") or result
+        open_id = str(data.get("open_id") or "").strip()
+        if not open_id:
+            raise FeishuAPIError("飞书用户信息响应中没有 open_id")
+        self._current_user_open_id = open_id
+        return open_id
+
+    def iter_message_search_pages(
+        self,
+        *,
+        chat_type: str = "p2p",
+        page_token: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        if chat_type not in {"p2p", "group"}:
+            raise ValueError("chat_type 必须是 p2p 或 group")
+        while True:
+            params: dict[str, Any] = {
+                "page_size": 50,
+                "user_id_type": "open_id",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            result = self._json_request(
+                "POST",
+                "/im/v1/messages/search",
+                params=params,
+                payload={"filter": {"chat_type": chat_type}},
+            )
+            data = result.get("data") or {}
+            yield data
+            if not data.get("has_more"):
+                return
+            next_token = data.get("page_token")
+            if not next_token or next_token == page_token:
+                raise FeishuAPIError("消息搜索分页返回了无效 page_token")
             page_token = str(next_token)
 
     def iter_message_pages(
@@ -301,6 +343,11 @@ class FeishuClient:
                     time.sleep(min(2**attempt, 5))
                     continue
                 raise FeishuAPIError(f"飞书 API 网络请求失败：{exc.reason}") from exc
+            except TimeoutError as exc:
+                if attempt < 3:
+                    time.sleep(min(2**attempt, 5))
+                    continue
+                raise FeishuAPIError("飞书 API 网络请求失败：请求超时") from exc
         raise FeishuAPIError("飞书 API 请求重试次数已用尽")
 
     @staticmethod

@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,8 @@ class SyncCounts:
     messages_written: int = 0
     attachments_downloaded: int = 0
     attachments_skipped: int = 0
+    attachments_pruned: int = 0
+    attachment_bytes_pruned: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -45,28 +49,118 @@ class ArchiveSyncer:
         self.max_attachment_bytes = max(0, max_attachment_bytes)
 
     def discover(self) -> list[dict[str, Any]]:
+        current_user_id = self.client.current_user_open_id()
         chats: list[dict[str, Any]] = []
         for page in self.client.iter_chat_pages():
             for item in page.get("items") or []:
                 self.database.upsert_conversation(item)
                 chats.append(item)
+
+        discovery_type = "discovery"
+        discovery_id = "p2p_message_search"
+        discovery_state = self.database.get_sync_state(discovery_type, discovery_id)
+        resume_token = None
+        if discovery_state and discovery_state.get("status") in {"running", "error"}:
+            resume_token = str(discovery_state.get("page_token") or "").strip() or None
+
+        p2p_chat_ids = dict.fromkeys(self.database.conversation_ids("p2p"))
+        try:
+            for page in self.client.iter_message_search_pages(
+                chat_type="p2p",
+                page_token=resume_token,
+            ):
+                for item in page.get("items") or []:
+                    metadata = item.get("meta_data") or {}
+                    chat_id = str(metadata.get("chat_id") or "").strip()
+                    if not chat_id or not bool(metadata.get("is_p2p_chat")):
+                        continue
+                    if chat_id not in p2p_chat_ids:
+                        p2p_chat_ids[chat_id] = None
+                        self.database.upsert_conversation(
+                            {
+                                "chat_id": chat_id,
+                                "name": f"单聊 {chat_id[-8:]}",
+                                "chat_mode": "p2p",
+                                "chat_type": "private",
+                                "status": "active",
+                                "discovered_via": "message_search",
+                            }
+                        )
+                has_more = bool(page.get("has_more"))
+                resume_token = (
+                    str(page.get("page_token") or "").strip() or None
+                    if has_more
+                    else None
+                )
+                self.database.set_sync_state(
+                    discovery_type,
+                    discovery_id,
+                    window_start=None,
+                    window_end=None,
+                    page_token=resume_token,
+                    status="running" if has_more else "success",
+                )
+        except Exception as exc:
+            self.database.set_sync_state(
+                discovery_type,
+                discovery_id,
+                window_start=None,
+                window_end=None,
+                page_token=resume_token,
+                status="error",
+                error=str(exc),
+            )
+            raise
+
+        for chat_id in p2p_chat_ids:
+            self.database.ensure_conversation(chat_id)
+            member_names = self._sync_members(chat_id)
+            other_names = [
+                name
+                for member_id, name in member_names.items()
+                if member_id != current_user_id and name
+            ]
+            item = {
+                "chat_id": chat_id,
+                "name": other_names[0] if other_names else f"单聊 {chat_id[-8:]}",
+                "chat_mode": "p2p",
+                "chat_type": "private",
+                "status": "active",
+                "discovered_via": "message_search",
+            }
+            self.database.upsert_conversation(item)
+            chats.append(item)
         return chats
 
-    def sync(self, chat_ids: list[str], *, days: int, skip_attachments: bool = False) -> SyncCounts:
+    def sync(
+        self,
+        chat_ids: list[str],
+        *,
+        days: int | None = None,
+        skip_attachments: bool = False,
+    ) -> SyncCounts:
         if not chat_ids:
             raise ValueError("至少需要一个 chat_id")
-        if days < 1:
+        if days is not None and days < 1:
             raise ValueError("days 必须大于 0")
         unique_chat_ids = list(dict.fromkeys(chat_ids))
         run_id = self.database.start_sync_run(unique_chat_ids, days)
         counts = SyncCounts()
-        now_s = int(time.time())
-        start_s = now_s - days * 86400
+        current_user_id = self.client.current_user_open_id()
+        counts.attachments_pruned, counts.attachment_bytes_pruned = (
+            self._prune_sent_attachments(current_user_id)
+        )
+        if days is None:
+            start_s = None
+            end_s = None
+        else:
+            end_s = int(time.time())
+            start_s = end_s - days * 86400
         errors: list[str] = []
         try:
             for chat_id in unique_chat_ids:
                 try:
-                    self._sync_chat(chat_id, start_s, now_s, counts)
+                    self._sync_chat(chat_id, start_s, end_s, counts, current_user_id)
                 except Exception as exc:
                     message = f"{chat_id}: {exc}"
                     errors.append(message)
@@ -74,7 +168,7 @@ class ArchiveSyncer:
                         "chat",
                         chat_id,
                         window_start=start_s,
-                        window_end=now_s,
+                        window_end=end_s,
                         page_token=None,
                         status="error",
                         error=str(exc),
@@ -106,7 +200,42 @@ class ArchiveSyncer:
             raise
         return counts
 
-    def _sync_chat(self, chat_id: str, start_s: int, end_s: int, counts: SyncCounts) -> None:
+    def download_pending_attachments(
+        self,
+        chat_ids: list[str],
+        *,
+        workers: int = 4,
+    ) -> SyncCounts:
+        if not chat_ids:
+            raise ValueError("至少需要一个 chat_id")
+        if not 1 <= workers <= 8:
+            raise ValueError("workers 必须在 1 到 8 之间")
+        unique_chat_ids = list(dict.fromkeys(chat_ids))
+        run_id = self.database.start_sync_run(unique_chat_ids, None)
+        counts = SyncCounts()
+        current_user_id = self.client.current_user_open_id()
+        counts.attachments_pruned, counts.attachment_bytes_pruned = (
+            self._prune_sent_attachments(current_user_id)
+        )
+        failures = self._download_pending(unique_chat_ids, counts, workers=workers)
+        status = "partial" if failures else "success"
+        error = f"{failures} 个附件下载失败，可再次执行 attachments 重试" if failures else None
+        self.database.finish_sync_run(
+            run_id,
+            status=status,
+            error=error,
+            **counts.as_dict(),
+        )
+        return counts
+
+    def _sync_chat(
+        self,
+        chat_id: str,
+        start_s: int | None,
+        end_s: int | None,
+        counts: SyncCounts,
+        current_user_id: str,
+    ) -> None:
         self.database.ensure_conversation(chat_id)
         member_names = self._sync_members(chat_id)
         self.database.set_sync_state(
@@ -128,7 +257,12 @@ class ArchiveSyncer:
                     normalized["sender_name"] = member_names.get(str(normalized["sender_id"]))
                 counts.messages_seen += 1
                 counts.messages_written += int(self.database.upsert_message(normalized))
-                self._record_resources(normalized["message_id"], normalized["resources"])
+                self._record_resources(
+                    normalized["message_id"],
+                    normalized["resources"],
+                    sender_id=normalized.get("sender_id"),
+                    current_user_id=current_user_id,
+                )
                 if normalized.get("thread_id"):
                     thread_ids.add(str(normalized["thread_id"]))
                 created_at = normalized.get("created_at")
@@ -144,9 +278,18 @@ class ArchiveSyncer:
                 last_message_at=last_message_at,
             )
 
-        start_ms, end_ms = start_s * 1000, end_s * 1000 + 999
+        start_ms = start_s * 1000 if start_s is not None else None
+        end_ms = end_s * 1000 + 999 if end_s is not None else None
         for thread_id in sorted(thread_ids):
-            self._sync_thread(thread_id, chat_id, start_ms, end_ms, counts, member_names)
+            self._sync_thread(
+                thread_id,
+                chat_id,
+                start_ms,
+                end_ms,
+                counts,
+                member_names,
+                current_user_id,
+            )
 
         self.database.set_sync_state(
             "chat",
@@ -162,16 +305,17 @@ class ArchiveSyncer:
         self,
         thread_id: str,
         chat_id: str,
-        start_ms: int,
-        end_ms: int,
+        start_ms: int | None,
+        end_ms: int | None,
         counts: SyncCounts,
         member_names: dict[str, str],
+        current_user_id: str,
     ) -> None:
         self.database.set_sync_state(
             "thread",
             thread_id,
-            window_start=start_ms // 1000,
-            window_end=end_ms // 1000,
+            window_start=start_ms // 1000 if start_ms is not None else None,
+            window_end=end_ms // 1000 if end_ms is not None else None,
             page_token=None,
             status="running",
         )
@@ -181,16 +325,26 @@ class ArchiveSyncer:
                 if not normalized.get("sender_name") and normalized.get("sender_id"):
                     normalized["sender_name"] = member_names.get(str(normalized["sender_id"]))
                 created_at = normalized.get("created_at")
-                if created_at is not None and not (start_ms <= created_at <= end_ms):
+                if (
+                    created_at is not None
+                    and start_ms is not None
+                    and end_ms is not None
+                    and not (start_ms <= created_at <= end_ms)
+                ):
                     continue
                 counts.messages_seen += 1
                 counts.messages_written += int(self.database.upsert_message(normalized))
-                self._record_resources(normalized["message_id"], normalized["resources"])
+                self._record_resources(
+                    normalized["message_id"],
+                    normalized["resources"],
+                    sender_id=normalized.get("sender_id"),
+                    current_user_id=current_user_id,
+                )
         self.database.set_sync_state(
             "thread",
             thread_id,
-            window_start=start_ms // 1000,
-            window_end=end_ms // 1000,
+            window_start=start_ms // 1000 if start_ms is not None else None,
+            window_end=end_ms // 1000 if end_ms is not None else None,
             page_token=None,
             status="success",
         )
@@ -220,7 +374,16 @@ class ArchiveSyncer:
             )
         return self.database.member_names(chat_id)
 
-    def _record_resources(self, message_id: str, resources: list[ResourceRef]) -> None:
+    def _record_resources(
+        self,
+        message_id: str,
+        resources: list[ResourceRef],
+        *,
+        sender_id: str | None,
+        current_user_id: str,
+    ) -> None:
+        if sender_id == current_user_id:
+            return
         for resource in resources:
             self.database.ensure_attachment(
                 message_id,
@@ -229,45 +392,115 @@ class ArchiveSyncer:
                 resource.filename,
             )
 
-    def _download_pending(self, chat_ids: list[str], counts: SyncCounts) -> int:
-        allowed_chats = set(chat_ids)
-        used_bytes = self.database.attachment_bytes()
-        failures = 0
-        for attachment in self.database.list_pending_attachments():
-            if attachment["chat_id"] not in allowed_chats:
+    def _prune_sent_attachments(self, current_user_id: str) -> tuple[int, int]:
+        attachments = self.database.list_attachments_by_sender(current_user_id)
+        if not attachments:
+            return 0, 0
+        root = self.paths.root.resolve()
+        removed_bytes = 0
+        attachment_ids: list[int] = []
+        for attachment in attachments:
+            attachment_ids.append(int(attachment["id"]))
+            removed_bytes += int(attachment.get("byte_size") or 0)
+            local_path = attachment.get("local_path")
+            if not local_path:
                 continue
-            if used_bytes >= self.max_attachment_bytes:
+            target = (root / str(local_path)).resolve()
+            if target != root and root in target.parents:
+                target.unlink(missing_ok=True)
+        self.database.delete_attachments(attachment_ids)
+        return len(attachment_ids), removed_bytes
+
+    def _download_pending(
+        self,
+        chat_ids: list[str],
+        counts: SyncCounts,
+        *,
+        workers: int = 4,
+    ) -> int:
+        allowed_chats = set(chat_ids)
+        pending = [
+            attachment
+            for attachment in self.database.list_pending_attachments()
+            if attachment["chat_id"] in allowed_chats
+        ]
+        condition = threading.Condition()
+        shared = {
+            "used_bytes": self.database.attachment_bytes(),
+            "reserved_bytes": 0,
+            "failures": 0,
+        }
+
+        def download_with_retries(attachment: dict[str, Any], reservation: int) -> int:
+            for attempt in range(3):
+                try:
+                    return self._download_one(attachment, reservation)
+                except OSError:
+                    if attempt >= 2:
+                        raise
+                    time.sleep(2**attempt)
+            raise OSError("附件下载重试次数已用尽")
+
+        def process(attachment: dict[str, Any]) -> None:
+            reservation = 0
+            with condition:
+                while True:
+                    permanent_available = self.max_attachment_bytes - shared["used_bytes"]
+                    if permanent_available <= 0:
+                        break
+                    desired = min(MAX_SINGLE_ATTACHMENT_BYTES, permanent_available)
+                    concurrent_available = permanent_available - shared["reserved_bytes"]
+                    if concurrent_available >= desired:
+                        reservation = desired
+                        shared["reserved_bytes"] += reservation
+                        break
+                    condition.wait()
+            if reservation <= 0:
                 self.database.update_attachment(
                     attachment["id"], status="skipped_capacity", error="已达到附件总容量上限"
                 )
-                counts.attachments_skipped += 1
-                continue
+                with condition:
+                    counts.attachments_skipped += 1
+                return
+            downloaded_bytes = 0
             try:
-                byte_size = self._download_one(attachment, self.max_attachment_bytes - used_bytes)
-                used_bytes += byte_size
-                counts.attachments_downloaded += 1
+                downloaded_bytes = download_with_retries(attachment, reservation)
+                with condition:
+                    counts.attachments_downloaded += 1
             except CapacityError as exc:
                 self.database.update_attachment(
                     attachment["id"], status=exc.status, error=str(exc)
                 )
-                counts.attachments_skipped += 1
+                with condition:
+                    counts.attachments_skipped += 1
             except FeishuAPIError as exc:
                 if "size exceeds limit" in str(exc).lower():
                     self.database.update_attachment(
                         attachment["id"], status="skipped_too_large", error=str(exc)
                     )
-                    counts.attachments_skipped += 1
+                    with condition:
+                        counts.attachments_skipped += 1
                 else:
                     self.database.update_attachment(
                         attachment["id"], status="error", error=str(exc)
                     )
-                    failures += 1
+                    with condition:
+                        shared["failures"] += 1
             except OSError as exc:
                 self.database.update_attachment(
                     attachment["id"], status="error", error=f"附件下载失败：{exc}"
                 )
-                failures += 1
-        return failures
+                with condition:
+                    shared["failures"] += 1
+            finally:
+                with condition:
+                    shared["reserved_bytes"] -= reservation
+                    shared["used_bytes"] += downloaded_bytes
+                    condition.notify_all()
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="feishu-attachment") as pool:
+            list(pool.map(process, pending))
+        return shared["failures"]
 
     def _download_one(self, attachment: dict[str, Any], remaining_bytes: int) -> int:
         with self.client.open_resource(

@@ -1,6 +1,6 @@
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from feishu_archive.config import FeishuAppConfig
 from feishu_archive.feishu import FeishuClient
@@ -52,6 +52,23 @@ class FeishuClientTests(unittest.TestCase):
         self.assertEqual(kwargs["params"]["member_id_type"], "open_id")
         self.assertEqual(kwargs["params"]["page_size"], 100)
 
+    def test_message_search_uses_empty_query_and_p2p_filter(self) -> None:
+        client = RecordingClient()
+        pages = list(client.iter_message_search_pages(chat_type="p2p"))
+        self.assertEqual(len(pages), 2)
+        method, path, kwargs = client.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/im/v1/messages/search")
+        self.assertEqual(kwargs["params"]["page_size"], 50)
+        self.assertNotIn("query", kwargs["payload"])
+        self.assertEqual(kwargs["payload"]["filter"]["chat_type"], "p2p")
+
+    def test_message_search_can_resume_from_page_token(self) -> None:
+        client = RecordingClient()
+        pages = list(client.iter_message_search_pages(chat_type="p2p", page_token="next"))
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(client.calls[0][2]["params"]["page_token"], "next")
+
     def test_authorization_url_contains_offline_access_and_state(self) -> None:
         client = RecordingClient()
         url = client.authorization_url("safe-state")
@@ -69,6 +86,23 @@ class FeishuClientTests(unittest.TestCase):
 
         request = opener.call_args.args[0]
         self.assertEqual(request.get_header("Authorization"), "Bearer user-token")
+
+    def test_json_request_retries_timeout(self) -> None:
+        client = RecordingClient()
+        client.token_store.set(client.account("access_token"), "user-token")
+        client.token_store.set(client.account("access_expires_at"), str(int(time.time()) + 3600))
+
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"code":0,"data":{"ok":true}}'
+        with patch(
+            "feishu_archive.feishu.urllib.request.urlopen",
+            side_effect=[TimeoutError("slow"), response],
+        ) as opener, patch("feishu_archive.feishu.time.sleep"):
+            result = FeishuClient._json_request(client, "GET", "/test")
+
+        self.assertEqual(result["data"]["ok"], True)
+        self.assertEqual(opener.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -4,11 +4,20 @@ import os
 import unittest
 from unittest.mock import patch
 
-from feishu_archive.cli import _app_config
+from feishu_archive.cli import _app_config, build_parser
 from feishu_archive.keychain import MemoryTokenStore
 
 
 class AppConfigTests(unittest.TestCase):
+    def test_sync_defaults_to_all_history(self) -> None:
+        args = build_parser().parse_args(["sync", "--all-discovered"])
+        self.assertTrue(args.all_discovered)
+        self.assertIsNone(args.days)
+
+    def test_attachment_resume_defaults_to_four_workers(self) -> None:
+        args = build_parser().parse_args(["attachments"])
+        self.assertEqual(args.workers, 4)
+
     def test_app_config_reads_credentials_from_keychain(self) -> None:
         store = MemoryTokenStore()
         store.set("app_id", "cli_keychain")

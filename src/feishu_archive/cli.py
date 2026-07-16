@@ -63,13 +63,27 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--oauth-port", type=int, default=DEFAULT_OAUTH_PORT)
     auth.add_argument("--no-open", action="store_true", help="只显示授权链接，不自动打开浏览器")
 
-    subparsers.add_parser("discover", help="发现用户令牌可见的群聊（不包含单聊）")
+    subparsers.add_parser("discover", help="发现用户令牌可见的群聊和有可见消息的单聊")
 
-    sync = subparsers.add_parser("sync", help="同步指定会话最近 N 天的消息")
-    sync.add_argument("--chat-id", action="append", required=True, help="可重复指定")
-    sync.add_argument("--days", type=int, default=30)
+    sync = subparsers.add_parser("sync", help="同步指定或全部已发现会话的历史消息")
+    sync_target = sync.add_mutually_exclusive_group(required=True)
+    sync_target.add_argument("--chat-id", action="append", help="可重复指定")
+    sync_target.add_argument(
+        "--all-discovered",
+        action="store_true",
+        help="同步本地档案库中全部已发现会话",
+    )
+    sync.add_argument("--days", type=int, default=None, help="只同步最近 N 天；默认同步全部可获取历史")
     sync.add_argument("--skip-attachments", action="store_true")
     sync.add_argument(
+        "--max-attachment-gib",
+        type=float,
+        default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
+    )
+
+    attachments = subparsers.add_parser("attachments", help="并发续传全部已发现会话的待处理附件")
+    attachments.add_argument("--workers", type=int, default=4, help="并发数，范围 1 到 8")
+    attachments.add_argument(
         "--max-attachment-gib",
         type=float,
         default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
@@ -113,10 +127,11 @@ def main(argv: list[str] | None = None) -> None:
             )
             chats = syncer.discover()
             if not chats:
-                print("未发现群聊。注意：该官方接口不返回单聊。")
+                print("未发现可见会话。")
             for item in chats:
                 print(f"{item.get('chat_id')}\t{item.get('name') or item.get('chat_name') or '(未命名)'}")
-            print(f"共发现 {len(chats)} 个群聊；单聊需要显式提供 chat_id。")
+            p2p_count = sum(1 for item in chats if item.get("chat_mode") == "p2p")
+            print(f"共发现 {len(chats)} 个会话，其中单聊 {p2p_count} 个。")
         elif args.command == "sync":
             max_bytes = int(args.max_attachment_gib * 1024**3)
             if max_bytes < 0:
@@ -127,14 +142,42 @@ def main(argv: list[str] | None = None) -> None:
                 paths,
                 max_attachment_bytes=max_bytes,
             )
+            chat_ids = database.conversation_ids() if args.all_discovered else (args.chat_id or [])
+            if not chat_ids:
+                raise ValueError("没有可同步的已发现会话，请先执行 discover")
             counts = syncer.sync(
-                args.chat_id,
+                chat_ids,
                 days=args.days,
                 skip_attachments=args.skip_attachments,
             )
             print(
                 f"同步完成：读取 {counts.messages_seen} 条，新增 {counts.messages_written} 条，"
                 f"下载附件 {counts.attachments_downloaded} 个，跳过 {counts.attachments_skipped} 个"
+            )
+            if counts.attachments_pruned:
+                print(
+                    f"已清理本人上传附件 {counts.attachments_pruned} 个，"
+                    f"释放 {counts.attachment_bytes_pruned / 1024**2:.1f} MiB"
+                )
+        elif args.command == "attachments":
+            max_bytes = int(args.max_attachment_gib * 1024**3)
+            if max_bytes < 0:
+                parser.error("--max-attachment-gib 不能小于 0")
+            if not 1 <= args.workers <= 8:
+                parser.error("--workers 必须在 1 到 8 之间")
+            chat_ids = database.conversation_ids()
+            if not chat_ids:
+                raise ValueError("没有已发现会话，请先执行 discover")
+            syncer = ArchiveSyncer(
+                database,
+                _client(),
+                paths,
+                max_attachment_bytes=max_bytes,
+            )
+            counts = syncer.download_pending_attachments(chat_ids, workers=args.workers)
+            print(
+                f"附件续传完成：下载 {counts.attachments_downloaded} 个，"
+                f"跳过 {counts.attachments_skipped} 个"
             )
         elif args.command == "serve":
             serve(database, paths, args.host, args.port)

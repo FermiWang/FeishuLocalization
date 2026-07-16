@@ -359,6 +359,29 @@ class ArchiveDatabase:
             ).fetchall()
         return {str(row["member_id"]): str(row["name"]) for row in rows}
 
+    def conversation_ids(self, chat_mode: str | None = None) -> list[str]:
+        with self.connection() as con:
+            if chat_mode is None:
+                rows = con.execute(
+                    "SELECT chat_id FROM conversations "
+                    "ORDER BY COALESCE(last_message_at, 0) DESC, chat_id"
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT chat_id FROM conversations WHERE chat_mode=? "
+                    "ORDER BY COALESCE(last_message_at, 0) DESC, chat_id",
+                    (chat_mode,),
+                ).fetchall()
+        return [str(row["chat_id"]) for row in rows]
+
+    def get_sync_state(self, container_type: str, container_id: str) -> dict[str, Any] | None:
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT * FROM sync_state WHERE container_type=? AND container_id=?",
+                (container_type, container_id),
+            ).fetchone()
+        return dict(row) if row else None
+
     def ensure_attachment(
         self,
         message_id: str,
@@ -425,6 +448,29 @@ class ArchiveDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_attachments_by_sender(self, sender_id: str) -> list[dict[str, Any]]:
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT a.*, m.chat_id FROM attachments a
+                JOIN messages m ON m.message_id=a.message_id
+                WHERE m.sender_id=?
+                ORDER BY a.id
+                """,
+                (sender_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_attachments(self, attachment_ids: list[int]) -> None:
+        if not attachment_ids:
+            return
+        placeholders = ",".join("?" for _ in attachment_ids)
+        with self.connection() as con:
+            con.execute(
+                f"DELETE FROM attachments WHERE id IN ({placeholders})",  # noqa: S608
+                attachment_ids,
+            )
+
     def list_conversations(self) -> list[dict[str, Any]]:
         with self.connection() as con:
             rows = con.execute(
@@ -461,6 +507,7 @@ class ArchiveDatabase:
         date_to_ms: int | None = None,
         limit: int = 200,
         offset: int = 0,
+        newest_first: bool = True,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
@@ -493,6 +540,7 @@ class ArchiveDatabase:
             where.append("m.created_at<?")
             params.append(date_to_ms)
         predicate = " AND ".join(where) if where else "1=1"
+        direction = "DESC" if newest_first else "ASC"
         sql = f"""
             SELECT m.*,
                    c.name AS chat_name,
@@ -501,7 +549,7 @@ class ArchiveDatabase:
             JOIN conversations c ON c.chat_id=m.chat_id
             {' '.join(joins)}
             WHERE {predicate}
-            ORDER BY m.created_at ASC, m.message_id ASC
+            ORDER BY m.created_at {direction}, m.message_id {direction}
             LIMIT ? OFFSET ?
         """
         params.extend((limit, offset))
@@ -578,7 +626,7 @@ class ArchiveDatabase:
                 ),
             )
 
-    def start_sync_run(self, chat_ids: list[str], requested_days: int) -> int:
+    def start_sync_run(self, chat_ids: list[str], requested_days: int | None) -> int:
         with self.connection() as con:
             cur = con.execute(
                 """

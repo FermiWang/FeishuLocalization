@@ -115,7 +115,12 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         messages: list[dict[str, Any]] = []
         offset = 0
         while True:
-            batch = self.server.database.query_messages(chat_id=chat_id, limit=500, offset=offset)
+            batch = self.server.database.query_messages(
+                chat_id=chat_id,
+                limit=500,
+                offset=offset,
+                newest_first=False,
+            )
             messages.extend(batch)
             if len(batch) < 500:
                 break

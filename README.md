@@ -73,6 +73,7 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 - `im:message.group_msg:get_as_user`
 - `im:chat:readonly` 或当前后台显示的等价群信息只读权限
 - `im:chat.members:read`（用于把消息发送者 ID 映射为成员姓名）
+- `search:message`（通过新版消息搜索接口补发现单聊 `chat_id`）
 - `offline_access`
 
 在安全设置中添加回调地址：
@@ -104,24 +105,31 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 ## 4. 发现与同步
 
 ```bash
-# 查看用户令牌能发现的群聊；官方群列表接口不返回单聊
+# 发现群聊，并通过空关键词消息搜索补发现有可见消息的单聊
 ./bin/feishu-archive discover
 
-# 同步指定会话最近 30 天；可重复传入 --chat-id
-./bin/feishu-archive sync --chat-id oc_xxx --days 30
+# 默认同步全部已发现会话的全部可获取历史
+./bin/feishu-archive sync --all-discovered
+
+# 也可只同步指定会话，或显式限制为最近 30 天
+./bin/feishu-archive sync --chat-id oc_xxx
+./bin/feishu-archive sync --all-discovered --days 30
 
 # 不下载附件，仅核对消息覆盖率
-./bin/feishu-archive sync --chat-id oc_xxx --days 30 --skip-attachments
+./bin/feishu-archive sync --all-discovered --skip-attachments
+
+# 只续传未完成或失败的收到附件（默认 4 路并发）
+./bin/feishu-archive attachments --workers 4
 ```
 
-推荐首轮分别选择一个已知单聊 `chat_id`、一个内部群和一个外部群。外部群、保密群或机器人不在群内时，程序会把接口错误写入同步运行记录，不会把它解释成空会话。
+附件只保存其他用户或机器人发送的资源；本人上传的附件不会下载，升级后首次同步还会删除此前已归档的本人附件。外部群、保密群或机器人不在群内时，程序会把接口错误写入同步运行记录，不会把它解释成空会话。
 
 ## 5. 容量控制
 
 附件默认总上限为 20 GiB，可在命令中调整：
 
 ```bash
-./bin/feishu-archive sync --chat-id oc_xxx --days 30 --max-attachment-gib 10
+./bin/feishu-archive sync --all-discovered --max-attachment-gib 10
 ```
 
 单个资源始终限制为 100 MB。达到总上限后，消息仍会保存，附件状态标记为 `skipped_capacity`。
@@ -136,7 +144,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ## 官方覆盖限制
 
 - 获取指定消息和资源仍要求应用开启机器人能力，机器人需要位于消息所属会话。
-- 群列表接口不包含单聊，因此单聊 PoC 需要从事件、已知链接或其他合规来源取得 `chat_id` 后显式同步。
+- 群列表接口不包含单聊；程序改用新版消息搜索接口的空查询结果补发现 `p2p` 会话。没有可见消息、已超出租户保留期或被搜索可见性限制的单聊仍无法发现。
 - 普通对话群中，按 `chat` 查询只能取得话题根消息；回复需要再按 `thread` 查询。
 - `thread` 查询不支持 `start_time` / `end_time`，程序拉取后会在本地按时间范围过滤。
 - 资源接口限制单文件不超过 100 MB，不支持部分卡片、合并转发子消息、表情包和防泄密资源。
@@ -147,6 +155,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - [获取会话历史消息](https://open.feishu.cn/document/server-docs/im-v1/message/list)
 - [话题概述](https://open.feishu.cn/document/im-v1/message/thread-introduction)
 - [获取用户或机器人所在的群列表](https://open.feishu.cn/document/server-docs/group/chat/list)
+- [搜索消息](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/search)
 - [获取消息中的资源文件](https://open.feishu.cn/document/server-docs/im-v1/message/get-2)
 - [浏览器网页授权接入指南](https://open.feishu.cn/document/sso/web-application-end-user-consent/guide)
 

@@ -16,6 +16,7 @@ DEFAULT_SCOPES = (
     "im:message.group_msg:get_as_user",
     "im:chat:readonly",
     "im:chat.members:read",
+    "search:message",
     "offline_access",
 )
 
