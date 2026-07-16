@@ -14,6 +14,10 @@
         <div><h1>Feishu Archive</h1><p>本机离线档案</p></div>
       </header>
       <div id="archive-status" class="status-card">正在读取档案…</div>
+      <section class="sync-card" aria-label="同步控制">
+        <button id="sync-now" class="button sync-button">立即同步</button>
+        <span id="sync-status" aria-live="polite">正在读取同步状态…</span>
+      </section>
       <label class="search-label" for="chat-search">筛选会话</label>
       <input id="chat-search" class="input" type="search" placeholder="输入会话名称">
       <nav id="conversation-list" class="conversation-list" aria-label="会话列表"></nav>

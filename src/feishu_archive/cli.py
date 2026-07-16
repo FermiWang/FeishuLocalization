@@ -16,10 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .automation import BackgroundSyncController, SyncBusyError, run_sync_cycle
 from .config import (
+    DEFAULT_INCREMENTAL_DAYS,
     DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_OAUTH_PORT,
     DEFAULT_READER_PORT,
+    DEFAULT_SYNC_HOUR,
+    DEFAULT_SYNC_MINUTE,
     FeishuAppConfig,
     archive_paths,
 )
@@ -87,6 +91,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-attachment-gib",
         type=float,
         default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
+    )
+
+    scheduled_sync = subparsers.add_parser(
+        "scheduled-sync",
+        help="发现新会话并执行每日增量同步",
+    )
+    scheduled_sync.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_INCREMENTAL_DAYS,
+        help="已有会话的重叠回看天数",
     )
 
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
@@ -179,8 +194,41 @@ def main(argv: list[str] | None = None) -> None:
                 f"附件续传完成：下载 {counts.attachments_downloaded} 个，"
                 f"跳过 {counts.attachments_skipped} 个"
             )
+        elif args.command == "scheduled-sync":
+            try:
+                result = run_sync_cycle(
+                    database,
+                    paths,
+                    _client,
+                    trigger="scheduled",
+                    overlap_days=args.days,
+                )
+            except SyncBusyError:
+                print("已有同步任务正在运行，本次计划任务无需重复启动。")
+            else:
+                print(
+                    f"计划同步完成：发现 {result['conversations_discovered']} 个会话，"
+                    f"新增会话 {result['new_conversations']} 个，"
+                    f"读取 {result['messages_seen']} 条消息，状态 {result['status']}"
+                )
         elif args.command == "serve":
-            serve(database, paths, args.host, args.port)
+            controller = BackgroundSyncController(database, paths, _client)
+            serve(
+                database,
+                paths,
+                args.host,
+                args.port,
+                sync_start=controller.start,
+                sync_schedule={
+                    "enabled": True,
+                    "hour": DEFAULT_SYNC_HOUR,
+                    "minute": DEFAULT_SYNC_MINUTE,
+                    "overlap_days": DEFAULT_INCREMENTAL_DAYS,
+                    "description": (
+                        f"每天 {DEFAULT_SYNC_HOUR:02d}:{DEFAULT_SYNC_MINUTE:02d} 自动同步"
+                    ),
+                },
+            )
         elif args.command == "doctor":
             failed = _doctor(database, paths.root)
             raise SystemExit(1 if failed else 0)

@@ -18,6 +18,10 @@ class AppConfigTests(unittest.TestCase):
         args = build_parser().parse_args(["attachments"])
         self.assertEqual(args.workers, 4)
 
+    def test_scheduled_sync_uses_two_day_overlap(self) -> None:
+        args = build_parser().parse_args(["scheduled-sync"])
+        self.assertEqual(args.days, 2)
+
     def test_app_config_reads_credentials_from_keychain(self) -> None:
         store = MemoryTokenStore()
         store.set("app_id", "cli_keychain")

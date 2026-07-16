@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import ArchivePaths
 from .database import ArchiveDatabase
@@ -43,9 +43,14 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         database: ArchiveDatabase,
         paths: ArchivePaths,
+        *,
+        sync_start: Callable[[], bool] | None = None,
+        sync_schedule: dict[str, Any] | None = None,
     ) -> None:
         self.database = database
         self.paths = paths
+        self.sync_start = sync_start
+        self.sync_schedule = sync_schedule or {"enabled": False}
         super().__init__(server_address, ArchiveRequestHandler)
 
 
@@ -58,6 +63,13 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/status":
                 self._json(self.server.database.status())
+            elif parsed.path == "/api/sync/status":
+                self._json(
+                    {
+                        "job": self.server.database.latest_sync_job(),
+                        "schedule": self.server.sync_schedule,
+                    }
+                )
             elif parsed.path == "/api/conversations":
                 self._json({"items": self.server.database.list_conversations()})
             elif parsed.path == "/api/senders":
@@ -79,6 +91,31 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception:
             self._json({"error": "本地阅读器处理请求失败"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path != "/api/sync":
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
+            if self.headers.get("X-Feishu-Archive-Action") != "sync":
+                self._json({"error": "缺少本机同步确认标头"}, status=HTTPStatus.FORBIDDEN)
+                return
+            origin = self.headers.get("Origin")
+            if origin:
+                origin_host = urllib.parse.urlparse(origin).hostname
+                if not origin_host or not is_loopback_host(origin_host):
+                    self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
+                    return
+            if self.server.sync_start is None:
+                self._json({"error": "当前阅读器未启用同步控制"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            if not self.server.sync_start():
+                self._json({"error": "已有同步任务正在运行"}, status=HTTPStatus.CONFLICT)
+                return
+            self._json({"status": "accepted"}, status=HTTPStatus.ACCEPTED)
+        except Exception:
+            self._json({"error": "启动同步失败"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _messages(self, query: dict[str, list[str]]) -> None:
         date_from = _date_to_ms(_first(query, "date_from"))
@@ -211,10 +248,24 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         print(f"[reader] {self.client_address[0]} {fmt % args}")
 
 
-def serve(database: ArchiveDatabase, paths: ArchivePaths, host: str, port: int) -> None:
+def serve(
+    database: ArchiveDatabase,
+    paths: ArchivePaths,
+    host: str,
+    port: int,
+    *,
+    sync_start: Callable[[], bool] | None = None,
+    sync_schedule: dict[str, Any] | None = None,
+) -> None:
     if not is_loopback_host(host):
         raise ValueError("安全限制：离线阅读器只能监听回环地址 127.0.0.1 或 localhost")
-    server = ArchiveHTTPServer((host, port), database, paths)
+    server = ArchiveHTTPServer(
+        (host, port),
+        database,
+        paths,
+        sync_start=sync_start,
+        sync_schedule=sync_schedule,
+    )
     print(f"Feishu Archive 阅读器：http://{host}:{port}")
     print("按 Ctrl+C 停止。阅读器不会监听局域网地址。")
     try:

@@ -10,6 +10,9 @@ DEFAULT_MAX_ATTACHMENT_BYTES = 20 * 1024**3
 MAX_SINGLE_ATTACHMENT_BYTES = 100 * 1024**2
 DEFAULT_READER_PORT = 8765
 DEFAULT_OAUTH_PORT = 8766
+DEFAULT_INCREMENTAL_DAYS = 2
+DEFAULT_SYNC_HOUR = 3
+DEFAULT_SYNC_MINUTE = 30
 DEFAULT_SCOPES = (
     "im:message:readonly",
     "im:message.p2p_msg:get_as_user",
@@ -36,6 +39,10 @@ class ArchivePaths:
     @property
     def exports(self) -> Path:
         return self.root / "exports"
+
+    @property
+    def sync_lock(self) -> Path:
+        return self.root / "sync.lock"
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)

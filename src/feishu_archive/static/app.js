@@ -1,8 +1,13 @@
-const state = { conversations: [], selectedChat: null };
+const state = {
+  conversations: [],
+  selectedChat: null,
+  syncWasRunning: false,
+  syncPollTimer: null,
+};
 const $ = (id) => document.getElementById(id);
 
-async function request(path) {
-  const response = await fetch(path, { cache: "no-store" });
+async function request(path, options = {}) {
+  const response = await fetch(path, { cache: "no-store", ...options });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || `请求失败：${response.status}`);
   return payload;
@@ -25,11 +30,63 @@ async function loadStatus() {
   $("archive-status").textContent = `${data.conversations} 个会话 · ${data.messages} 条消息 · 附件 ${formatBytes(data.attachment_bytes)}`;
 }
 
+async function loadSyncStatus() {
+  clearTimeout(state.syncPollTimer);
+  try {
+    const data = await request("/api/sync/status");
+    const job = data.job;
+    const running = job?.status === "running";
+    const schedule = data.schedule?.description || "自动同步未配置";
+    const button = $("sync-now");
+    button.disabled = running;
+    button.textContent = running ? "同步中…" : "立即同步";
+    if (!job) {
+      $("sync-status").textContent = schedule;
+    } else if (running) {
+      const trigger = job.trigger === "manual" ? "手工" : "自动";
+      $("sync-status").textContent = `${trigger}同步进行中 · ${schedule}`;
+    } else {
+      const labels = { success: "成功", partial: "部分完成", error: "失败" };
+      $("sync-status").textContent = `上次同步${labels[job.status] || job.status}：${formatTime(job.finished_at)} · ${schedule}`;
+    }
+    if (state.syncWasRunning && !running) {
+      await loadStatus();
+      await loadConversations();
+      if (state.selectedChat) await selectConversation(state.selectedChat);
+    }
+    state.syncWasRunning = running;
+    state.syncPollTimer = setTimeout(loadSyncStatus, running ? 2000 : 60000);
+  } catch (error) {
+    $("sync-status").textContent = error.message;
+    $("sync-now").disabled = false;
+    state.syncPollTimer = setTimeout(loadSyncStatus, 60000);
+  }
+}
+
+async function startSync() {
+  const button = $("sync-now");
+  button.disabled = true;
+  button.textContent = "正在启动…";
+  $("sync-status").textContent = "正在启动本机同步任务…";
+  try {
+    await request("/api/sync", {
+      method: "POST",
+      headers: { "X-Feishu-Archive-Action": "sync" },
+    });
+    state.syncWasRunning = true;
+    await loadSyncStatus();
+  } catch (error) {
+    $("sync-status").textContent = error.message;
+    button.disabled = false;
+    button.textContent = "立即同步";
+  }
+}
+
 async function loadConversations() {
   const data = await request("/api/conversations");
   state.conversations = data.items;
   renderConversations();
-  if (!state.selectedChat && data.items.length) selectConversation(data.items[0].chat_id);
+  if (!state.selectedChat && data.items.length) await selectConversation(data.items[0].chat_id);
 }
 
 function renderConversations() {
@@ -120,7 +177,8 @@ $("search").addEventListener("click", loadMessages);
 $("query").addEventListener("keydown", (event) => { if (event.key === "Enter") loadMessages(); });
 $("export-html").addEventListener("click", () => exportConversation("html"));
 $("export-json").addEventListener("click", () => exportConversation("json"));
+$("sync-now").addEventListener("click", startSync);
 
-Promise.all([loadStatus(), loadConversations()]).catch((error) => {
+Promise.all([loadStatus(), loadConversations(), loadSyncStatus()]).catch((error) => {
   $("archive-status").textContent = error.message;
 });

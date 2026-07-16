@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 
 SCHEMA = """
@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     attachments_downloaded INTEGER NOT NULL DEFAULT 0,
     attachments_skipped INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'running',
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sync_jobs (
+    id INTEGER PRIMARY KEY,
+    trigger TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    status TEXT NOT NULL DEFAULT 'running',
+    conversations_discovered INTEGER NOT NULL DEFAULT 0,
+    new_conversations INTEGER NOT NULL DEFAULT 0,
+    messages_seen INTEGER NOT NULL DEFAULT 0,
+    messages_written INTEGER NOT NULL DEFAULT 0,
+    attachments_downloaded INTEGER NOT NULL DEFAULT 0,
+    attachments_skipped INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
 """
@@ -661,6 +676,58 @@ class ArchiveDatabase:
                 (*values.values(), run_id),
             )
 
+    def start_sync_job(self, trigger: str) -> int:
+        now = int(time.time() * 1000)
+        with self.transaction() as con:
+            con.execute(
+                """
+                UPDATE sync_jobs
+                SET finished_at=?, status='error',
+                    error=COALESCE(error, '上次同步任务异常中断')
+                WHERE status='running'
+                """,
+                (now,),
+            )
+            cur = con.execute(
+                "INSERT INTO sync_jobs(trigger, started_at) VALUES (?, ?)",
+                (trigger, now),
+            )
+            return int(cur.lastrowid)
+
+    def finish_sync_job(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        error: str | None = None,
+        **counts: int,
+    ) -> None:
+        allowed = {
+            "conversations_discovered",
+            "new_conversations",
+            "messages_seen",
+            "messages_written",
+            "attachments_downloaded",
+            "attachments_skipped",
+        }
+        values: dict[str, Any] = {
+            "finished_at": int(time.time() * 1000),
+            "status": status,
+            "error": error,
+        }
+        values.update({key: value for key, value in counts.items() if key in allowed})
+        assignments = ", ".join(f"{key}=?" for key in values)
+        with self.connection() as con:
+            con.execute(
+                f"UPDATE sync_jobs SET {assignments} WHERE id=?",  # noqa: S608
+                (*values.values(), job_id),
+            )
+
+    def latest_sync_job(self) -> dict[str, Any] | None:
+        with self.connection() as con:
+            row = con.execute("SELECT * FROM sync_jobs ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
     def status(self) -> dict[str, Any]:
         with self.connection() as con:
             counts = {
@@ -676,7 +743,14 @@ class ArchiveDatabase:
             latest = con.execute(
                 "SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1"
             ).fetchone()
-        return {**counts, "latest_sync": dict(latest) if latest else None}
+            latest_job = con.execute(
+                "SELECT * FROM sync_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return {
+            **counts,
+            "latest_sync": dict(latest) if latest else None,
+            "latest_sync_job": dict(latest_job) if latest_job else None,
+        }
 
 
 def _fts_query(value: str) -> str:
