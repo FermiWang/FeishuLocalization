@@ -89,6 +89,25 @@ class TimeoutClient(FakeClient):
         return TimeoutResponse(b"offline attachment")
 
 
+class OwnImageClient(FakeClient):
+    def iter_message_pages(self, container_type, container_id, **kwargs):
+        self.calls.append((container_type, container_id, kwargs))
+        if container_type == "chat":
+            yield {
+                "items": [
+                    self.message(
+                        "om_self_image",
+                        content={"image_key": "img_self"},
+                        message_type="image",
+                        sender_id="ou_self",
+                    )
+                ],
+                "has_more": False,
+            }
+        else:
+            yield {"items": [], "has_more": False}
+
+
 class DiscoverClient(FakeClient):
     def iter_chat_pages(self):
         yield {
@@ -223,6 +242,32 @@ class SyncTests(unittest.TestCase):
             latest = database.status()["latest_sync"]
             self.assertIsNone(latest["requested_days"])
 
+    def test_own_images_are_recorded_and_downloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            client = OwnImageClient()
+            syncer = ArchiveSyncer(
+                database,
+                client,
+                paths,
+                max_attachment_bytes=1024 * 1024,
+            )
+
+            counts = syncer.sync(["oc_1"], days=30)
+
+            self.assertEqual(counts.attachments_downloaded, 1)
+            image = database.resources_for_messages(["om_self_image"])["om_self_image"][0]
+            self.assertEqual(image["resource_type"], "image")
+            self.assertEqual(image["status"], "downloaded")
+            self.assertTrue((paths.root / image["local_path"]).is_file())
+            self.assertIn(
+                ("resource", "om_self_image", "img_self", "image"),
+                client.calls,
+            )
+
     def test_sent_attachments_are_pruned_and_not_recreated(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))
@@ -252,6 +297,25 @@ class SyncTests(unittest.TestCase):
                 byte_size=4,
                 local_path=str(local_path),
             )
+            own_image = client.message(
+                "om_self_image",
+                content={"image_key": "img_self"},
+                message_type="image",
+                sender_id="ou_self",
+            )
+            database.upsert_message(normalize_message(own_image, "oc_1"))
+            image_id = database.ensure_attachment(
+                "om_self_image", "img_self", "image", None
+            )
+            image_path = Path("attachments") / "oc_1" / "mine.png"
+            image_target = paths.root / image_path
+            image_target.write_bytes(b"image")
+            database.update_attachment(
+                image_id,
+                status="downloaded",
+                byte_size=5,
+                local_path=str(image_path),
+            )
             syncer = ArchiveSyncer(
                 database,
                 client,
@@ -268,6 +332,10 @@ class SyncTests(unittest.TestCase):
                 "om_self_file",
                 database.attachments_for_messages(["om_self_file"]),
             )
+            self.assertTrue(image_target.exists())
+            preserved = database.resources_for_messages(["om_self_image"])["om_self_image"][0]
+            self.assertEqual(preserved["resource_type"], "image")
+            self.assertEqual(preserved["status"], "downloaded")
 
 
 if __name__ == "__main__":

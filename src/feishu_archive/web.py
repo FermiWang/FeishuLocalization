@@ -79,8 +79,10 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                 self._messages(query)
             elif parsed.path == "/api/export":
                 self._export(query)
+            elif parsed.path.startswith("/api/images/"):
+                self._resource(parsed.path, "/api/images/", "image", download=False)
             elif parsed.path.startswith("/api/attachments/"):
-                self._attachment(parsed.path)
+                self._resource(parsed.path, "/api/attachments/", "file", download=True)
             elif parsed.path == "/":
                 self._static("index.html")
             elif parsed.path.startswith("/static/"):
@@ -131,11 +133,11 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             limit=int(_first(query, "limit") or 200),
             offset=int(_first(query, "offset") or 0),
         )
-        attachments = self.server.database.attachments_for_messages(
+        resources = self.server.database.resources_for_messages(
             [str(item["message_id"]) for item in items]
         )
         for item in items:
-            item["attachments"] = attachments.get(str(item["message_id"]), [])
+            item["resources"] = resources.get(str(item["message_id"]), [])
         self._json({"items": items})
 
     def _export(self, query: dict[str, list[str]]) -> None:
@@ -164,6 +166,11 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             offset += len(batch)
         filename_base = _download_name(conversation.get("name") or chat_id)
         if export_format == "json":
+            resources = self.server.database.resources_for_messages(
+                [str(message["message_id"]) for message in messages]
+            )
+            for message in messages:
+                message["resources"] = resources.get(str(message["message_id"]), [])
             body = json.dumps(
                 {"conversation": conversation, "messages": messages},
                 ensure_ascii=False,
@@ -181,24 +188,36 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             return
         raise ValueError("format 必须是 json 或 html")
 
-    def _attachment(self, path: str) -> None:
-        raw_id = path.removeprefix("/api/attachments/")
+    def _resource(
+        self,
+        path: str,
+        prefix: str,
+        expected_type: str,
+        *,
+        download: bool,
+    ) -> None:
+        raw_id = path.removeprefix(prefix)
         if not raw_id.isdigit():
-            raise ValueError("附件 ID 无效")
+            raise ValueError("资源 ID 无效")
         attachment = self.server.database.get_attachment(int(raw_id))
-        if not attachment or attachment.get("status") != "downloaded" or not attachment.get("local_path"):
-            self.send_error(HTTPStatus.NOT_FOUND, "Attachment not found")
+        if (
+            not attachment
+            or attachment.get("resource_type") != expected_type
+            or attachment.get("status") != "downloaded"
+            or not attachment.get("local_path")
+        ):
+            self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
             return
         root = self.server.paths.root.resolve()
         target = (root / str(attachment["local_path"])).resolve()
         if root not in target.parents or not target.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND, "Attachment not found")
+            self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
             return
         content_type = attachment.get("mime_type") or mimetypes.guess_type(target.name)[0]
         self._bytes(
             target.read_bytes(),
             content_type or "application/octet-stream",
-            filename=attachment.get("filename") or target.name,
+            filename=(attachment.get("filename") or target.name) if download else None,
         )
 
     def _static(self, name: str) -> None:

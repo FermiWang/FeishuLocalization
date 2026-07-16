@@ -382,9 +382,9 @@ class ArchiveSyncer:
         sender_id: str | None,
         current_user_id: str,
     ) -> None:
-        if sender_id == current_user_id:
-            return
         for resource in resources:
+            if sender_id == current_user_id and resource.resource_type == "file":
+                continue
             self.database.ensure_attachment(
                 message_id,
                 resource.file_key,
@@ -393,7 +393,10 @@ class ArchiveSyncer:
             )
 
     def _prune_sent_attachments(self, current_user_id: str) -> tuple[int, int]:
-        attachments = self.database.list_attachments_by_sender(current_user_id)
+        attachments = self.database.list_attachments_by_sender(
+            current_user_id,
+            resource_type="file",
+        )
         if not attachments:
             return 0, 0
         root = self.paths.root.resolve()

@@ -55,9 +55,24 @@ class DatabaseTests(unittest.TestCase):
         self.database.upsert_message(self.message("om_1", "包含附件"))
         attachment_id = self.database.ensure_attachment("om_1", "file_1", "file", "说明.txt")
         self.database.update_attachment(attachment_id, status="downloaded", byte_size=12)
-        grouped = self.database.attachments_for_messages(["om_1"])
-        self.assertEqual(grouped["om_1"][0]["filename"], "说明.txt")
-        self.assertEqual(self.database.attachment_bytes(), 12)
+        image_id = self.database.ensure_attachment("om_1", "image_1", "image", None)
+        self.database.update_attachment(image_id, status="downloaded", byte_size=20)
+
+        grouped = self.database.resources_for_messages(["om_1"])
+        self.assertEqual(
+            {resource["resource_type"] for resource in grouped["om_1"]},
+            {"file", "image"},
+        )
+        message = self.database.query_messages(chat_id="oc_internal")[0]
+        self.assertEqual(message["image_count"], 1)
+        self.assertEqual(message["attachment_count"], 1)
+        status = self.database.status()
+        self.assertEqual(status["images"], 1)
+        self.assertEqual(status["image_bytes"], 20)
+        self.assertEqual(status["attachments"], 1)
+        self.assertEqual(status["attachment_bytes"], 12)
+        self.assertEqual(status["resource_bytes"], 32)
+        self.assertEqual(self.database.attachment_bytes(), 32)
 
 
 if __name__ == "__main__":

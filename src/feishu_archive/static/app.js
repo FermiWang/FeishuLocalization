@@ -27,7 +27,7 @@ function formatTime(value) {
 
 async function loadStatus() {
   const data = await request("/api/status");
-  $("archive-status").textContent = `${data.conversations} 个会话 · ${data.messages} 条消息 · 附件 ${formatBytes(data.attachment_bytes)}`;
+  $("archive-status").textContent = `${data.conversations} 个会话 · ${data.messages} 条消息 · 图片 ${data.images} 张 · 附件 ${data.attachments} 个 · 占用 ${formatBytes(data.resource_bytes)}`;
 }
 
 async function loadSyncStatus() {
@@ -143,6 +143,9 @@ async function loadMessages() {
 }
 
 function renderMessage(item) {
+  const resources = item.resources || [];
+  const images = resources.filter((resource) => resource.resource_type === "image");
+  const attachments = resources.filter((resource) => resource.resource_type === "file");
   const article = document.createElement("article");
   article.className = "message";
   const head = document.createElement("div"); head.className = "message-head";
@@ -150,12 +153,43 @@ function renderMessage(item) {
   const time = document.createElement("time"); time.textContent = formatTime(item.created_at);
   head.append(sender, time);
   const body = document.createElement("div"); body.className = "message-body";
-  body.textContent = item.body_text || `[${item.message_type}]`;
+  const bodyText = (item.body_text || "").trim();
+  const imageOnlyPlaceholder = item.message_type === "image" && /^\[图片\](\s*图片资源示例)?$/.test(bodyText);
+  body.textContent = imageOnlyPlaceholder && images.length ? "" : (bodyText || `[${item.message_type}]`);
   const meta = document.createElement("div"); meta.className = "message-meta";
-  [item.message_type, item.thread_id ? "话题" : null, item.deleted ? "已删除" : null, item.recalled ? "已撤回" : null, item.attachment_count ? `${item.attachment_count} 个附件` : null]
+  [item.message_type, item.thread_id ? "话题" : null, item.deleted ? "已删除" : null, item.recalled ? "已撤回" : null, item.image_count ? `${item.image_count} 张图片` : null, item.attachment_count ? `${item.attachment_count} 个附件` : null]
     .filter(Boolean).forEach((value) => { const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = value; meta.append(badge); });
-  article.append(head, body, meta);
-  (item.attachments || []).forEach((attachment) => {
+  article.append(head);
+  if (body.textContent) article.append(body);
+  if (images.length) {
+    const gallery = document.createElement("div");
+    gallery.className = "message-images";
+    images.forEach((image) => {
+      if (image.status === "downloaded") {
+        const link = document.createElement("a");
+        link.className = "message-image-link";
+        link.href = `/api/images/${image.id}`;
+        link.target = "_blank";
+        link.rel = "noopener";
+        const element = document.createElement("img");
+        element.className = "message-image";
+        element.src = `/api/images/${image.id}`;
+        element.loading = "lazy";
+        element.decoding = "async";
+        element.alt = `${item.sender_name || "未知发送者"}发送的图片`;
+        link.append(element);
+        gallery.append(link);
+      } else {
+        const placeholder = document.createElement("span");
+        placeholder.className = "image-placeholder";
+        placeholder.textContent = `图片未归档（${image.status}）`;
+        gallery.append(placeholder);
+      }
+    });
+    article.append(gallery);
+  }
+  article.append(meta);
+  attachments.forEach((attachment) => {
     const link = document.createElement(attachment.status === "downloaded" ? "a" : "span");
     link.className = "attachment-link";
     link.textContent = attachment.status === "downloaded"

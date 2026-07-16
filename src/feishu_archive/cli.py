@@ -85,7 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
     )
 
-    attachments = subparsers.add_parser("attachments", help="并发续传全部已发现会话的待处理附件")
+    attachments = subparsers.add_parser(
+        "attachments",
+        help="并发续传全部已发现会话的待处理图片和收到的文件",
+    )
     attachments.add_argument("--workers", type=int, default=4, help="并发数，范围 1 到 8")
     attachments.add_argument(
         "--max-attachment-gib",
@@ -167,7 +170,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             print(
                 f"同步完成：读取 {counts.messages_seen} 条，新增 {counts.messages_written} 条，"
-                f"下载附件 {counts.attachments_downloaded} 个，跳过 {counts.attachments_skipped} 个"
+                f"下载资源 {counts.attachments_downloaded} 个，跳过 {counts.attachments_skipped} 个"
             )
             if counts.attachments_pruned:
                 print(
@@ -191,7 +194,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             counts = syncer.download_pending_attachments(chat_ids, workers=args.workers)
             print(
-                f"附件续传完成：下载 {counts.attachments_downloaded} 个，"
+                f"资源续传完成：下载 {counts.attachments_downloaded} 个，"
                 f"跳过 {counts.attachments_skipped} 个"
             )
         elif args.command == "scheduled-sync":

@@ -463,17 +463,33 @@ class ArchiveDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_attachments_by_sender(self, sender_id: str) -> list[dict[str, Any]]:
+    def list_attachments_by_sender(
+        self,
+        sender_id: str,
+        *,
+        resource_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self.connection() as con:
-            rows = con.execute(
-                """
+            if resource_type is None:
+                rows = con.execute(
+                    """
+                    SELECT a.*, m.chat_id FROM attachments a
+                    JOIN messages m ON m.message_id=a.message_id
+                    WHERE m.sender_id=?
+                    ORDER BY a.id
+                    """,
+                    (sender_id,),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    """
                 SELECT a.*, m.chat_id FROM attachments a
                 JOIN messages m ON m.message_id=a.message_id
-                WHERE m.sender_id=?
+                WHERE m.sender_id=? AND a.resource_type=?
                 ORDER BY a.id
                 """,
-                (sender_id,),
-            ).fetchall()
+                    (sender_id, resource_type),
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def delete_attachments(self, attachment_ids: list[int]) -> None:
@@ -559,7 +575,10 @@ class ArchiveDatabase:
         sql = f"""
             SELECT m.*,
                    c.name AS chat_name,
-                   (SELECT COUNT(*) FROM attachments a WHERE a.message_id=m.message_id) AS attachment_count
+                   (SELECT COUNT(*) FROM attachments a
+                    WHERE a.message_id=m.message_id AND a.resource_type='image') AS image_count,
+                   (SELECT COUNT(*) FROM attachments a
+                    WHERE a.message_id=m.message_id AND a.resource_type='file') AS attachment_count
             FROM messages m
             JOIN conversations c ON c.chat_id=m.chat_id
             {' '.join(joins)}
@@ -584,7 +603,7 @@ class ArchiveDatabase:
             ).fetchone()
         return dict(row) if row else None
 
-    def attachments_for_messages(self, message_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    def resources_for_messages(self, message_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
         if not message_ids:
             return {}
         placeholders = ",".join("?" for _ in message_ids)
@@ -598,6 +617,9 @@ class ArchiveDatabase:
             item = dict(row)
             grouped.setdefault(str(item["message_id"]), []).append(item)
         return grouped
+
+    def attachments_for_messages(self, message_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        return self.resources_for_messages(message_ids)
 
     def set_sync_state(
         self,
@@ -733,10 +755,23 @@ class ArchiveDatabase:
             counts = {
                 "conversations": con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
                 "messages": con.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+                "images": con.execute(
+                    "SELECT COUNT(*) FROM attachments "
+                    "WHERE status='downloaded' AND resource_type='image'"
+                ).fetchone()[0],
+                "image_bytes": con.execute(
+                    "SELECT COALESCE(SUM(byte_size), 0) FROM attachments "
+                    "WHERE status='downloaded' AND resource_type='image'"
+                ).fetchone()[0],
                 "attachments": con.execute(
-                    "SELECT COUNT(*) FROM attachments WHERE status='downloaded'"
+                    "SELECT COUNT(*) FROM attachments "
+                    "WHERE status='downloaded' AND resource_type='file'"
                 ).fetchone()[0],
                 "attachment_bytes": con.execute(
+                    "SELECT COALESCE(SUM(byte_size), 0) FROM attachments "
+                    "WHERE status='downloaded' AND resource_type='file'"
+                ).fetchone()[0],
+                "resource_bytes": con.execute(
                     "SELECT COALESCE(SUM(byte_size), 0) FROM attachments WHERE status='downloaded'"
                 ).fetchone()[0],
             }

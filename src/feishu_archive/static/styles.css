@@ -51,6 +51,10 @@ button, input, select { font: inherit; }
 .message-head strong { font-size: 14px; }
 .message-head time { color: var(--muted); font-size: 11px; }
 .message-body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 10px; line-height: 1.65; }
+.message-images { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px; margin: 10px 0; }
+.message-image-link { display: block; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #f1f4f7; }
+.message-image { display: block; width: 100%; max-height: 560px; object-fit: contain; background: #f8fafc; }
+.image-placeholder { display: grid; min-height: 100px; place-items: center; border: 1px dashed #c7d0d9; border-radius: 10px; color: var(--muted); font-size: 12px; }
 .message-meta { display: flex; gap: 8px; color: var(--muted); font-size: 11px; }
 .badge { background: #f1f4f7; border-radius: 999px; padding: 2px 7px; }
 .attachment-link { display: block; margin-top: 9px; color: var(--accent); font-size: 12px; overflow-wrap: anywhere; }
