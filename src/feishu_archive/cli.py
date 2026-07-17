@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .automation import BackgroundSyncController, SyncBusyError, run_sync_cycle
+from .automation import (
+    BackgroundSyncController,
+    BackgroundWikiSyncController,
+    SyncBusyError,
+    run_sync_cycle,
+    run_wiki_sync_cycle,
+)
 from .config import (
     DEFAULT_INCREMENTAL_DAYS,
     DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -24,6 +30,9 @@ from .config import (
     DEFAULT_READER_PORT,
     DEFAULT_SYNC_HOUR,
     DEFAULT_SYNC_MINUTE,
+    DEFAULT_WIKI_SYNC_HOUR,
+    DEFAULT_WIKI_SYNC_MINUTE,
+    DEFAULT_SCOPES,
     FeishuAppConfig,
     archive_paths,
 )
@@ -33,12 +42,13 @@ from .feishu import FeishuAPIError, FeishuClient
 from .keychain import KeychainError, KeychainStore
 from .sync import ArchiveSyncer
 from .web import is_loopback_host, serve
+from .wiki import WikiSyncer
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="feishu-archive",
-        description="通过飞书官方接口建立本机离线消息档案",
+        description="通过飞书官方接口建立本机离线消息与知识库档案",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
@@ -105,6 +115,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_INCREMENTAL_DAYS,
         help="已有会话的重叠回看天数",
+    )
+
+    subparsers.add_parser("wiki-discover", help="发现用户令牌可见的知识空间")
+
+    wiki_sync = subparsers.add_parser("wiki-sync", help="同步知识空间目录、文档和附件")
+    wiki_sync.add_argument("--space-id", action="append", help="可重复指定；默认同步全部可见空间")
+    wiki_sync.add_argument("--force", action="store_true", help="忽略修改时间并重新同步正文")
+    wiki_sync.add_argument(
+        "--max-asset-gib",
+        type=float,
+        default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
+        help="知识库附件总容量上限",
+    )
+
+    wiki_scheduled_sync = subparsers.add_parser(
+        "wiki-scheduled-sync",
+        help="执行知识库每日增量同步",
+    )
+    wiki_scheduled_sync.add_argument(
+        "--max-asset-gib",
+        type=float,
+        default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
     )
 
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
@@ -214,14 +246,46 @@ def main(argv: list[str] | None = None) -> None:
                     f"新增会话 {result['new_conversations']} 个，"
                     f"读取 {result['messages_seen']} 条消息，状态 {result['status']}"
                 )
+        elif args.command == "wiki-discover":
+            spaces = WikiSyncer(database, _client(), paths).discover_spaces()
+            if not spaces:
+                print("未发现可见知识空间。")
+            for item in spaces:
+                print(f"{item.get('space_id')}\t{item.get('name') or '(未命名)'}")
+            print(f"共发现 {len(spaces)} 个知识空间。")
+        elif args.command in {"wiki-sync", "wiki-scheduled-sync"}:
+            max_bytes = int(args.max_asset_gib * 1024**3)
+            if max_bytes < 0:
+                parser.error("--max-asset-gib 不能小于 0")
+            try:
+                result = run_wiki_sync_cycle(
+                    database,
+                    paths,
+                    _client,
+                    trigger="scheduled" if args.command == "wiki-scheduled-sync" else "manual",
+                    space_ids=args.space_id if args.command == "wiki-sync" else None,
+                    force=args.force if args.command == "wiki-sync" else False,
+                    max_asset_bytes=max_bytes,
+                )
+            except SyncBusyError:
+                print("已有知识库同步任务正在运行，本次无需重复启动。")
+            else:
+                print(
+                    f"知识库同步完成：空间 {result['spaces_seen']} 个，"
+                    f"节点 {result['nodes_seen']} 个，"
+                    f"更新正文 {result['documents_written']} 篇，"
+                    f"下载附件 {result['assets_downloaded']} 个，状态 {result['status']}"
+                )
         elif args.command == "serve":
             controller = BackgroundSyncController(database, paths, _client)
+            wiki_controller = BackgroundWikiSyncController(database, paths, _client)
             serve(
                 database,
                 paths,
                 args.host,
                 args.port,
                 sync_start=controller.start,
+                wiki_sync_start=wiki_controller.start,
                 sync_schedule={
                     "enabled": True,
                     "hour": DEFAULT_SYNC_HOUR,
@@ -229,6 +293,15 @@ def main(argv: list[str] | None = None) -> None:
                     "overlap_days": DEFAULT_INCREMENTAL_DAYS,
                     "description": (
                         f"每天 {DEFAULT_SYNC_HOUR:02d}:{DEFAULT_SYNC_MINUTE:02d} 自动同步"
+                    ),
+                },
+                wiki_sync_schedule={
+                    "enabled": True,
+                    "hour": DEFAULT_WIKI_SYNC_HOUR,
+                    "minute": DEFAULT_WIKI_SYNC_MINUTE,
+                    "description": (
+                        f"每天 {DEFAULT_WIKI_SYNC_HOUR:02d}:"
+                        f"{DEFAULT_WIKI_SYNC_MINUTE:02d} 自动同步知识库"
                     ),
                 },
             )
@@ -379,6 +452,20 @@ def _doctor(database: ArchiveDatabase, root: Path) -> bool:
             checks.append(("飞书应用配置", secret_present, "已保存" if secret_present else "缺少 App Secret"))
             token_present = bool(store.get(f"{app_id}:refresh_token"))
             checks.append(("OAuth 刷新令牌", token_present, "已保存" if token_present else "未保存"))
+            granted = set((store.get(f"{app_id}:scope") or "").split())
+            required_knowledge = {
+                scope
+                for scope in DEFAULT_SCOPES
+                if scope.startswith(("wiki:", "docx:", "drive:", "sheets:", "bitable:"))
+            }
+            missing = sorted(required_knowledge - granted)
+            checks.append(
+                (
+                    "知识库 OAuth 权限",
+                    not missing,
+                    "已授权" if not missing else "需重新执行 auth：" + " ".join(missing),
+                )
+            )
         except KeychainError as exc:
             checks.append(("OAuth 刷新令牌", False, str(exc)))
     else:

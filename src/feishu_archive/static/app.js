@@ -3,6 +3,13 @@ const state = {
   selectedChat: null,
   syncWasRunning: false,
   syncPollTimer: null,
+  mode: "messages",
+  wikiSpaces: [],
+  wikiNodes: [],
+  selectedWikiSpace: null,
+  selectedWikiNode: null,
+  wikiSyncWasRunning: false,
+  wikiPollTimer: null,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +30,23 @@ function formatBytes(value) {
 function formatTime(value) {
   if (!value) return "时间未知";
   return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+}
+
+function formatSourceTime(value) {
+  if (!value) return "时间未知";
+  const milliseconds = Number(value) < 1e12 ? Number(value) * 1000 : Number(value);
+  return formatTime(milliseconds);
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  const wiki = mode === "wiki";
+  $("message-sidebar").hidden = wiki;
+  $("wiki-sidebar").hidden = !wiki;
+  $("message-view").hidden = wiki;
+  $("wiki-view").hidden = !wiki;
+  $("mode-messages").classList.toggle("active", !wiki);
+  $("mode-wiki").classList.toggle("active", wiki);
 }
 
 async function loadStatus() {
@@ -61,6 +85,190 @@ async function loadSyncStatus() {
     $("sync-now").disabled = false;
     state.syncPollTimer = setTimeout(loadSyncStatus, 60000);
   }
+}
+
+async function loadWikiStatus() {
+  clearTimeout(state.wikiPollTimer);
+  try {
+    const data = await request("/api/wiki/status");
+    $("wiki-status").textContent = `${data.spaces} 个空间 · ${data.nodes} 个节点 · ${data.synced_documents} 篇正文 · 附件 ${data.assets} 个 · 占用 ${formatBytes(data.asset_bytes)}`;
+    const job = data.latest_sync;
+    const running = job?.status === "running";
+    const schedule = data.schedule?.description || "自动同步未配置";
+    const button = $("wiki-sync-now");
+    button.disabled = running;
+    button.textContent = running ? "同步中…" : "同步知识库";
+    if (!job) {
+      $("wiki-sync-status").textContent = schedule;
+    } else if (running) {
+      $("wiki-sync-status").textContent = `知识库同步进行中 · ${schedule}`;
+    } else {
+      const labels = { success: "成功", partial: "部分完成", error: "失败" };
+      const detail = job.error ? ` · ${String(job.error).split("\n")[0]}` : "";
+      $("wiki-sync-status").textContent = `上次同步${labels[job.status] || job.status}：${formatTime(job.finished_at)}${detail} · ${schedule}`;
+    }
+    if (state.wikiSyncWasRunning && !running) {
+      await loadWikiSpaces(true);
+      if (state.selectedWikiSpace) await selectWikiSpace(state.selectedWikiSpace, false);
+      if (state.selectedWikiNode) await selectWikiNode(state.selectedWikiNode);
+    }
+    state.wikiSyncWasRunning = running;
+    state.wikiPollTimer = setTimeout(loadWikiStatus, running ? 2000 : 60000);
+  } catch (error) {
+    $("wiki-sync-status").textContent = error.message;
+    $("wiki-sync-now").disabled = false;
+    state.wikiPollTimer = setTimeout(loadWikiStatus, 60000);
+  }
+}
+
+async function startWikiSync() {
+  const button = $("wiki-sync-now");
+  button.disabled = true;
+  button.textContent = "正在启动…";
+  $("wiki-sync-status").textContent = "正在启动本机知识库同步任务…";
+  try {
+    await request("/api/wiki/sync", {
+      method: "POST",
+      headers: { "X-Feishu-Archive-Action": "wiki-sync" },
+    });
+    state.wikiSyncWasRunning = true;
+    await loadWikiStatus();
+  } catch (error) {
+    $("wiki-sync-status").textContent = error.message;
+    button.disabled = false;
+    button.textContent = "同步知识库";
+  }
+}
+
+async function loadWikiSpaces(keepSelection = false) {
+  const data = await request("/api/wiki/spaces");
+  state.wikiSpaces = data.items;
+  renderWikiSpaces();
+  if (!keepSelection && !state.selectedWikiSpace && data.items.length) {
+    await selectWikiSpace(data.items[0].space_id);
+  }
+}
+
+function renderWikiSpaces() {
+  const root = $("wiki-space-list");
+  root.replaceChildren();
+  state.wikiSpaces.forEach((item) => {
+    const button = document.createElement("button");
+    button.className = `wiki-space${item.space_id === state.selectedWikiSpace ? " active" : ""}`;
+    const name = document.createElement("span");
+    name.textContent = item.name || item.space_id;
+    const meta = document.createElement("small");
+    meta.textContent = `${item.node_count || 0} 个节点`;
+    button.append(name, meta);
+    button.addEventListener("click", () => selectWikiSpace(item.space_id));
+    root.append(button);
+  });
+}
+
+async function selectWikiSpace(spaceId, resetNode = true) {
+  state.selectedWikiSpace = spaceId;
+  if (resetNode) state.selectedWikiNode = null;
+  renderWikiSpaces();
+  const space = state.wikiSpaces.find((item) => item.space_id === spaceId);
+  $("wiki-title").textContent = space?.name || spaceId;
+  $("wiki-eyebrow").textContent = "知识空间目录";
+  $("wiki-document-meta").textContent = space?.description || "选择左侧文档开始离线阅读。";
+  const data = await request(`/api/wiki/nodes?space_id=${encodeURIComponent(spaceId)}`);
+  state.wikiNodes = data.items;
+  renderWikiNodes();
+  if (resetNode) {
+    $("wiki-results").hidden = true;
+    $("wiki-document").innerHTML = '<div class="empty-state"><strong>选择左侧文档开始阅读</strong><span>目录与正文均来自本机档案。</span></div>';
+  }
+}
+
+function renderWikiNodes() {
+  const needle = $("wiki-query").value.trim().toLowerCase();
+  const root = $("wiki-node-list");
+  root.replaceChildren();
+  state.wikiNodes
+    .filter((item) => !needle || `${item.title || ""} ${item.path || ""}`.toLowerCase().includes(needle))
+    .forEach((item) => {
+      const button = document.createElement("button");
+      button.className = `wiki-node${item.node_token === state.selectedWikiNode ? " active" : ""}`;
+      const depth = Math.max(0, String(item.path || "").split("/").length - 1);
+      button.style.paddingLeft = `${12 + Math.min(depth, 8) * 14}px`;
+      const title = document.createElement("span");
+      title.textContent = item.title || item.obj_token;
+      const meta = document.createElement("small");
+      const labels = { synced: "已离线", metadata_only: "仅目录", error: "同步失败", syncing: "同步中" };
+      meta.textContent = `${item.obj_type || "unknown"} · ${labels[item.document_status] || "待同步"}`;
+      button.append(title, meta);
+      button.addEventListener("click", () => selectWikiNode(item.node_token));
+      root.append(button);
+    });
+}
+
+async function selectWikiNode(nodeToken) {
+  state.selectedWikiNode = nodeToken;
+  renderWikiNodes();
+  const root = $("wiki-document");
+  root.innerHTML = '<div class="empty-state"><span>正在从本机档案读取…</span></div>';
+  try {
+    const item = await request(`/api/wiki/document?node_token=${encodeURIComponent(nodeToken)}`);
+    $("wiki-title").textContent = item.title || item.obj_token || "未命名文档";
+    $("wiki-eyebrow").textContent = item.path || "知识库离线阅读";
+    const labels = { synced: "正文已离线", metadata_only: "已保存目录元数据", error: "上次同步失败", syncing: "正在同步" };
+    $("wiki-document-meta").textContent = `${labels[item.status] || item.status || "待同步"} · 源文档更新 ${formatSourceTime(item.source_edit_time || item.obj_edit_time)} · 本机同步 ${formatTime(item.last_synced_at)}`;
+    root.replaceChildren();
+    if (item.error) {
+      const warning = document.createElement("div");
+      warning.className = "wiki-warning";
+      warning.textContent = item.error;
+      root.append(warning);
+    }
+    const body = document.createElement("div");
+    body.className = "wiki-document-body";
+    if (item.rendered_html) {
+      body.innerHTML = item.rendered_html;
+    } else {
+      const pre = document.createElement("pre");
+      pre.textContent = item.content_text || "本地尚无可显示的正文。";
+      body.append(pre);
+    }
+    root.append(body);
+  } catch (error) {
+    root.innerHTML = '<div class="empty-state"><strong>读取失败</strong><span></span></div>';
+    root.querySelector("span").textContent = error.message;
+  }
+}
+
+async function searchWiki() {
+  const query = $("wiki-query").value.trim();
+  if (!query) {
+    $("wiki-results").hidden = true;
+    renderWikiNodes();
+    return;
+  }
+  const params = new URLSearchParams({ q: query, limit: "100" });
+  const data = await request(`/api/wiki/search?${params}`);
+  const root = $("wiki-results");
+  root.replaceChildren();
+  const summary = document.createElement("strong");
+  summary.textContent = `找到 ${data.items.length} 篇本地文档`;
+  root.append(summary);
+  data.items.forEach((item) => {
+    const button = document.createElement("button");
+    button.className = "wiki-search-result";
+    const title = document.createElement("strong");
+    title.textContent = item.title || item.obj_token;
+    const path = document.createElement("small");
+    path.textContent = item.path || item.space_id;
+    const excerpt = document.createElement("span");
+    excerpt.textContent = String(item.excerpt || "").replace(/\s+/g, " ").slice(0, 180);
+    button.append(title, path, excerpt);
+    button.addEventListener("click", async () => {
+      if (state.selectedWikiSpace !== item.space_id) await selectWikiSpace(item.space_id, false);
+      await selectWikiNode(item.node_token);
+    });
+    root.append(button);
+  });
+  root.hidden = false;
 }
 
 async function startSync() {
@@ -212,7 +420,13 @@ $("query").addEventListener("keydown", (event) => { if (event.key === "Enter") l
 $("export-html").addEventListener("click", () => exportConversation("html"));
 $("export-json").addEventListener("click", () => exportConversation("json"));
 $("sync-now").addEventListener("click", startSync);
+$("mode-messages").addEventListener("click", () => setMode("messages"));
+$("mode-wiki").addEventListener("click", () => setMode("wiki"));
+$("wiki-sync-now").addEventListener("click", startWikiSync);
+$("wiki-search").addEventListener("click", searchWiki);
+$("wiki-query").addEventListener("input", renderWikiNodes);
+$("wiki-query").addEventListener("keydown", (event) => { if (event.key === "Enter") searchWiki(); });
 
-Promise.all([loadStatus(), loadConversations(), loadSyncStatus()]).catch((error) => {
+Promise.all([loadStatus(), loadConversations(), loadSyncStatus(), loadWikiStatus(), loadWikiSpaces()]).catch((error) => {
   $("archive-status").textContent = error.message;
 });

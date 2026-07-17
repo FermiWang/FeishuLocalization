@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feishu-archive"
-version = "0.1.0"
-description = "Official-API-based local offline archive and reader for Feishu"
+version = "0.2.0"
+description = "Official-API-based local offline message and knowledge-base reader for Feishu"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Proprietary - no license granted"}

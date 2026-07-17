@@ -13,17 +13,37 @@
         <div class="brand-mark">FA</div>
         <div><h1>Feishu Archive</h1><p>本机离线档案</p></div>
       </header>
-      <div id="archive-status" class="status-card">正在读取档案…</div>
-      <section class="sync-card" aria-label="同步控制">
-        <button id="sync-now" class="button sync-button">立即同步</button>
-        <span id="sync-status" aria-live="polite">正在读取同步状态…</span>
+      <nav class="mode-switch" aria-label="档案类型">
+        <button id="mode-messages" class="mode-button active">聊天记录</button>
+        <button id="mode-wiki" class="mode-button">知识库</button>
+      </nav>
+      <section id="message-sidebar">
+        <div id="archive-status" class="status-card">正在读取档案…</div>
+        <section class="sync-card" aria-label="同步控制">
+          <button id="sync-now" class="button sync-button">立即同步</button>
+          <span id="sync-status" aria-live="polite">正在读取同步状态…</span>
+        </section>
+        <label class="search-label" for="chat-search">筛选会话</label>
+        <input id="chat-search" class="input" type="search" placeholder="输入会话名称">
+        <nav id="conversation-list" class="conversation-list" aria-label="会话列表"></nav>
       </section>
-      <label class="search-label" for="chat-search">筛选会话</label>
-      <input id="chat-search" class="input" type="search" placeholder="输入会话名称">
-      <nav id="conversation-list" class="conversation-list" aria-label="会话列表"></nav>
+      <section id="wiki-sidebar" hidden>
+        <div id="wiki-status" class="status-card">正在读取知识库档案…</div>
+        <section class="sync-card" aria-label="知识库同步控制">
+          <button id="wiki-sync-now" class="button sync-button">同步知识库</button>
+          <span id="wiki-sync-status" aria-live="polite">正在读取同步状态…</span>
+        </section>
+        <label class="search-label" for="wiki-query">搜索知识库</label>
+        <div class="wiki-search-row">
+          <input id="wiki-query" class="input" type="search" placeholder="标题或正文关键词">
+          <button id="wiki-search" class="button">搜索</button>
+        </div>
+        <nav id="wiki-space-list" class="wiki-space-list" aria-label="知识空间列表"></nav>
+        <nav id="wiki-node-list" class="wiki-node-list" aria-label="知识库目录"></nav>
+      </section>
     </aside>
 
-    <main class="content">
+    <main id="message-view" class="content">
       <header class="content-header">
         <div><p class="eyebrow">离线阅读</p><h2 id="chat-title">请选择会话</h2></div>
         <div class="export-actions">
@@ -48,6 +68,20 @@
       <section id="messages" class="messages" aria-live="polite">
         <div class="empty-state"><strong>选择左侧会话开始阅读</strong><span>所有内容均从本机档案加载。</span></div>
       </section>
+    </main>
+
+    <main id="wiki-view" class="content wiki-content" hidden>
+      <header class="content-header wiki-header">
+        <div>
+          <p id="wiki-eyebrow" class="eyebrow">知识库离线阅读</p>
+          <h2 id="wiki-title">请选择知识空间</h2>
+          <p id="wiki-document-meta" class="wiki-document-meta">目录、正文和附件均从本机档案加载。</p>
+        </div>
+      </header>
+      <section id="wiki-results" class="wiki-results" hidden></section>
+      <article id="wiki-document" class="wiki-document" aria-live="polite">
+        <div class="empty-state"><strong>选择左侧文档开始阅读</strong><span>离线阅读不需要访问飞书服务器。</span></div>
+      </article>
     </main>
   </div>
   <script src="/static/app.js" defer></script>

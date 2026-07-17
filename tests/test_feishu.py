@@ -75,6 +75,41 @@ class FeishuClientTests(unittest.TestCase):
         self.assertIn("offline_access", url)
         self.assertIn("safe-state", url)
         self.assertIn("client_id=cli_test", url)
+        self.assertIn("wiki%3Awiki%3Areadonly", url)
+        self.assertIn("docx%3Adocument%3Areadonly", url)
+
+    def test_wiki_and_docx_paging_use_documented_paths(self) -> None:
+        client = RecordingClient()
+        pages = list(client.iter_wiki_node_pages("spc_1", parent_node_token="wik_parent"))
+        self.assertEqual(len(pages), 2)
+        method, path, kwargs = client.calls[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(path, "/wiki/v2/spaces/spc_1/nodes")
+        self.assertEqual(kwargs["params"]["parent_node_token"], "wik_parent")
+        self.assertEqual(kwargs["params"]["page_size"], 50)
+
+        client.calls.clear()
+        pages = list(client.iter_docx_block_pages("doc_1"))
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(client.calls[0][1], "/docx/v1/documents/doc_1/blocks")
+        self.assertEqual(client.calls[0][2]["params"]["page_size"], 500)
+
+    def test_oauth_result_persists_granted_scopes(self) -> None:
+        client = RecordingClient()
+        result = client._save_token_result(
+            {
+                "access_token": "token",
+                "expires_in": 3600,
+                "refresh_token": "refresh",
+                "refresh_token_expires_in": 7200,
+                "scope": "wiki:wiki:readonly docx:document:readonly",
+            }
+        )
+        self.assertIn("wiki:wiki:readonly", result.scope)
+        self.assertEqual(
+            client.authorized_scopes(),
+            {"wiki:wiki:readonly", "docx:document:readonly"},
+        )
 
     def test_resource_download_uses_user_access_token(self) -> None:
         client = RecordingClient()

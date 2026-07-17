@@ -46,11 +46,15 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         *,
         sync_start: Callable[[], bool] | None = None,
         sync_schedule: dict[str, Any] | None = None,
+        wiki_sync_start: Callable[[], bool] | None = None,
+        wiki_sync_schedule: dict[str, Any] | None = None,
     ) -> None:
         self.database = database
         self.paths = paths
         self.sync_start = sync_start
         self.sync_schedule = sync_schedule or {"enabled": False}
+        self.wiki_sync_start = wiki_sync_start
+        self.wiki_sync_schedule = wiki_sync_schedule or {"enabled": False}
         super().__init__(server_address, ArchiveRequestHandler)
 
 
@@ -72,6 +76,45 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/conversations":
                 self._json({"items": self.server.database.list_conversations()})
+            elif parsed.path == "/api/wiki/status":
+                self._json(
+                    {
+                        **self.server.database.wiki_status(),
+                        "schedule": self.server.wiki_sync_schedule,
+                    }
+                )
+            elif parsed.path == "/api/wiki/spaces":
+                self._json({"items": self.server.database.list_wiki_spaces()})
+            elif parsed.path == "/api/wiki/nodes":
+                space_id = _first(query, "space_id")
+                if not space_id:
+                    raise ValueError("缺少 space_id")
+                self._json({"items": self.server.database.list_wiki_nodes(space_id)})
+            elif parsed.path == "/api/wiki/document":
+                node_token = _first(query, "node_token")
+                if not node_token:
+                    raise ValueError("缺少 node_token")
+                document = self.server.database.wiki_document_for_node(node_token)
+                if not document:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Document not found")
+                else:
+                    document["assets"] = self.server.database.list_wiki_assets(
+                        str(document.get("obj_token") or "")
+                    )
+                    self._json(document)
+            elif parsed.path == "/api/wiki/search":
+                query_value = _first(query, "q") or ""
+                self._json(
+                    {
+                        "items": self.server.database.search_wiki_documents(
+                            query_value,
+                            space_id=_first(query, "space_id"),
+                            limit=int(_first(query, "limit") or 100),
+                        )
+                    }
+                )
+            elif parsed.path.startswith("/api/wiki/assets/"):
+                self._wiki_resource(parsed.path)
             elif parsed.path == "/api/senders":
                 chat_id = _first(query, "chat_id")
                 self._json({"items": self.server.database.list_senders(chat_id)})
@@ -97,10 +140,16 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         try:
-            if parsed.path != "/api/sync":
+            actions = {
+                "/api/sync": ("sync", self.server.sync_start),
+                "/api/wiki/sync": ("wiki-sync", self.server.wiki_sync_start),
+            }
+            action = actions.get(parsed.path)
+            if action is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
-            if self.headers.get("X-Feishu-Archive-Action") != "sync":
+            action_name, starter = action
+            if self.headers.get("X-Feishu-Archive-Action") != action_name:
                 self._json({"error": "缺少本机同步确认标头"}, status=HTTPStatus.FORBIDDEN)
                 return
             origin = self.headers.get("Origin")
@@ -109,10 +158,10 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                 if not origin_host or not is_loopback_host(origin_host):
                     self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
                     return
-            if self.server.sync_start is None:
+            if starter is None:
                 self._json({"error": "当前阅读器未启用同步控制"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            if not self.server.sync_start():
+            if not starter():
                 self._json({"error": "已有同步任务正在运行"}, status=HTTPStatus.CONFLICT)
                 return
             self._json({"status": "accepted"}, status=HTTPStatus.ACCEPTED)
@@ -220,6 +269,32 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             filename=(attachment.get("filename") or target.name) if download else None,
         )
 
+    def _wiki_resource(self, path: str) -> None:
+        raw_id = path.removeprefix("/api/wiki/assets/")
+        if not raw_id.isdigit():
+            raise ValueError("资源 ID 无效")
+        asset = self.server.database.get_wiki_asset(int(raw_id))
+        if (
+            not asset
+            or asset.get("status") != "downloaded"
+            or not asset.get("local_path")
+        ):
+            self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
+            return
+        root = self.server.paths.root.resolve()
+        target = Path(str(asset["local_path"])).resolve()
+        if root not in target.parents or not target.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
+            return
+        content_type = asset.get("mime_type") or mimetypes.guess_type(target.name)[0]
+        self._bytes(
+            target.read_bytes(),
+            content_type or "application/octet-stream",
+            filename=(asset.get("filename") or target.name)
+            if asset.get("asset_type") == "file"
+            else None,
+        )
+
     def _static(self, name: str) -> None:
         if not name or "/" in name or "\\" in name or name.startswith("."):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -275,6 +350,8 @@ def serve(
     *,
     sync_start: Callable[[], bool] | None = None,
     sync_schedule: dict[str, Any] | None = None,
+    wiki_sync_start: Callable[[], bool] | None = None,
+    wiki_sync_schedule: dict[str, Any] | None = None,
 ) -> None:
     if not is_loopback_host(host):
         raise ValueError("安全限制：离线阅读器只能监听回环地址 127.0.0.1 或 localhost")
@@ -284,6 +361,8 @@ def serve(
         paths,
         sync_start=sync_start,
         sync_schedule=sync_schedule,
+        wiki_sync_start=wiki_sync_start,
+        wiki_sync_schedule=wiki_sync_schedule,
     )
     print(f"Feishu Archive 阅读器：http://{host}:{port}")
     print("按 Ctrl+C 停止。阅读器不会监听局域网地址。")

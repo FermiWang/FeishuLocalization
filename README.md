@@ -1,6 +1,6 @@
 # Feishu Archive
 
-Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书官方授权接口同步用户可见的消息，将消息、同步状态、图片与文件保存在本机，并通过只监听 `127.0.0.1` 的阅读器进行搜索和导出。
+Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书官方授权接口同步用户可见的聊天记录与知识库，将消息、知识空间目录、文档正文、同步状态、图片与文件保存在本机，并通过只监听 `127.0.0.1` 的阅读器进行搜索和查看。
 
 > 项目不会读取、复制或尝试解密 `LarkShell`、`messages.db`、`im.db`、`Core.db` 等飞书客户端私有数据。
 
@@ -11,9 +11,13 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 - 普通群消息包含 `thread_id` 时，自动二次同步话题回复。
 - SQLite 保存会话、成员、消息、编辑/删除状态、资源清单与同步运行记录。
 - SQLite FTS5 全文搜索，支持会话、日期、人员和消息类型筛选。
+- 同步用户可见的知识空间与完整目录树；新版文档（`docx`）保存正文、文档块、内嵌图片和附件，普通文件节点保存文件本体。
+- 知识库正文使用独立的 SQLite FTS5 索引，支持跨空间全文搜索；每篇新版文档另生成可直接打开的本地 HTML 副本。
+- 旧版文档、表格、多维表格、思维笔记、幻灯片等尚未适配的节点会保留目录元数据并明确标记为“仅目录”，不会静默遗漏。
 - 完整归档本人和其他人发送的图片，并在消息页面中直接显示；普通文件只归档其他人或机器人发送的文件。
 - 下载前检查单个资源 100 MB 上限和本地总容量上限。
 - 每天 03:30 自动执行增量同步，阅读器也提供“立即同步”按钮。
+- 每天 03:45 独立执行知识库增量同步，也可以从阅读器手工触发。
 - 完全本地的离线网页阅读器；不加载 CDN、字体、统计或其他网络资源。
 - 单个会话导出为 JSON 或自包含 HTML。
 - 示例数据模式，无飞书应用凭据也能验证完整阅读闭环。
@@ -58,9 +62,9 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 ./scripts/install-local.sh
 ```
 
-安装后会在当前 macOS 用户登录时自动启动，只监听 <http://127.0.0.1:8765>。另一个 LaunchAgent 每天 03:30 自动发现会话并同步；新发现会话完整回溯，已有会话重叠同步最近 2 天。稳定运行副本位于档案目录的 `runtime/`，阅读器和同步日志均位于 `logs/`。
+安装后会在当前 macOS 用户登录时自动启动，只监听 <http://127.0.0.1:8765>。消息 LaunchAgent 每天 03:30 自动发现会话并同步；新发现会话完整回溯，已有会话重叠同步最近 2 天。知识库 LaunchAgent 每天 03:45 同步可见空间、目录以及发生变化的正文和附件。稳定运行副本位于档案目录的 `runtime/`，阅读器和同步日志均位于 `logs/`。
 
-阅读器左侧的“立即同步”按钮执行同一套增量流程，并在界面显示进行中、成功、部分完成或失败状态。跨进程锁会阻止手工同步与计划任务重复运行。
+阅读器左侧可在“聊天记录”和“知识库”之间切换。两类“立即同步”按钮分别执行对应的增量流程，并显示进行中、成功、部分完成或失败状态。消息和知识库各自使用跨进程锁，避免同类计划任务重复运行，同时允许两类同步互不阻塞。
 
 移除后台服务但保留档案数据：
 
@@ -78,6 +82,9 @@ Feishu Archive 是一个面向 macOS 的飞书离线归档 PoC：只通过飞书
 - `im:chat:readonly` 或当前后台显示的等价群信息只读权限
 - `im:chat.members:read`（用于把消息发送者 ID 映射为成员姓名）
 - `search:message`（通过新版消息搜索接口补发现单聊 `chat_id`）
+- `wiki:wiki:readonly`（读取用户可见的知识空间与目录树）
+- `docx:document:readonly`（读取新版文档元数据、纯文本与文档块）
+- `drive:drive:readonly`（下载文档内资源和普通文件节点）
 - `offline_access`
 
 在安全设置中添加回调地址：
@@ -104,6 +111,8 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 ./bin/feishu-archive auth
 ```
 
+从旧版本升级时必须在开放平台发布上述新增权限，然后重新执行一次 `auth`。`doctor` 会列出当前令牌缺少的知识库权限。
+
 授权完成后，应用凭据和用户令牌均不会写入仓库或档案数据库。
 
 ## 4. 发现与同步
@@ -127,16 +136,30 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 
 # 手工执行与每日计划任务相同的增量流程
 ./bin/feishu-archive scheduled-sync --days 2
+
+# 发现当前用户令牌可见的知识空间
+./bin/feishu-archive wiki-discover
+
+# 同步全部可见知识空间；也可以重复使用 --space-id 精确限定
+./bin/feishu-archive wiki-sync
+./bin/feishu-archive wiki-sync --space-id spc_xxx
+
+# 忽略源文档修改时间，重新生成本地正文与附件映射
+./bin/feishu-archive wiki-sync --force
+
+# 手工执行与每天 03:45 相同的知识库计划任务
+./bin/feishu-archive wiki-scheduled-sync
 ```
 
 图片会保存所有发送者的资源，包括本人发送的图片，并在离线阅读器的消息卡片中直接显示。普通文件只保存其他用户或机器人发送的文件；本人上传的普通文件不会下载，升级后首次同步还会删除此前已归档的本人普通文件。外部群、保密群或机器人不在群内时，程序会把接口错误写入同步运行记录，不会把它解释成空会话。
 
 ## 5. 容量控制
 
-图片与普通文件的总容量默认上限为 20 GiB，可在命令中调整：
+消息资源与知识库资源分别使用默认 20 GiB 的总容量上限，可在命令中调整：
 
 ```bash
 ./bin/feishu-archive sync --all-discovered --max-attachment-gib 10
+./bin/feishu-archive wiki-sync --max-asset-gib 10
 ```
 
 单个资源始终限制为 100 MB。达到总上限后，消息仍会保存，资源状态标记为 `skipped_capacity`。
@@ -156,6 +179,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - `thread` 查询不支持 `start_time` / `end_time`，程序拉取后会在本地按时间范围过滤。
 - 资源接口限制单文件不超过 100 MB，不支持部分卡片、合并转发子消息、表情包和防泄密资源。
 - 被删除、撤回、超过租户保留期限或因历史消息可见性设置不可见的内容无法补救性恢复。
+- 知识库只保存 OAuth 用户当前可见的空间和节点；本次同步不可见的旧节点标记为 `missing`，本地历史正文不会因一次权限变化被静默删除。
+- 当前完整正文适配覆盖新版文档和普通文件。旧版文档、电子表格、多维表格、思维笔记、幻灯片及第三方组件只保存目录元数据，并在阅读器中明确显示为“仅目录”。
+- 知识库附件也限制单文件不超过 100 MB；超限或受防泄密策略限制的资源会记录失败或跳过原因，文档正文仍会保留。
 
 参考：
 
@@ -165,7 +191,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - [搜索消息](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/search)
 - [获取消息中的资源文件](https://open.feishu.cn/document/server-docs/im-v1/message/get-2)
 - [浏览器网页授权接入指南](https://open.feishu.cn/document/sso/web-application-end-user-consent/guide)
+- [获取知识空间列表](https://open.feishu.cn/document/server-docs/docs/wiki-v2/space/list)
+- [获取知识空间子节点列表](https://open.feishu.cn/document/server-docs/docs/wiki-v2/space-node/list)
+- [获取新版文档纯文本内容](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/raw_content)
+- [获取新版文档所有块](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document-block/list)
 
 ## 项目阶段
 
-当前是已完成真实全历史回溯和每日增量调度的本机 PoC。后续阶段可继续增加应用级加密、签名安装包和企业级集中管理。
+当前已完成聊天真实全历史回溯、知识库新版文档与文件节点离线化，以及两类每日增量调度。后续阶段可继续增加表格/多维表格正文渲染、应用级加密、签名安装包和企业级集中管理。

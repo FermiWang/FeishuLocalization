@@ -3,12 +3,14 @@ set -eu
 
 SERVICE_LABEL="com.fermiwang.feishu-archive"
 SYNC_LABEL="com.fermiwang.feishu-archive-sync"
+WIKI_SYNC_LABEL="com.fermiwang.feishu-archive-wiki-sync"
 PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ARCHIVE_DIR=${FEISHU_ARCHIVE_DIR:-"$HOME/Library/Application Support/Feishu Archive"}
 RUNTIME_DIR="$ARCHIVE_DIR/runtime"
 LOG_DIR="$ARCHIVE_DIR/logs"
 SERVICE_PLIST_PATH="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
 SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$SYNC_LABEL.plist"
+WIKI_SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$WIKI_SYNC_LABEL.plist"
 PYTHON_BIN=$(command -v python3)
 USER_DOMAIN="gui/$(id -u)"
 
@@ -29,8 +31,9 @@ chmod 600 "$ARCHIVE_DIR/archive.sqlite3"
 
 TEMP_SERVICE_PLIST=$(mktemp)
 TEMP_SYNC_PLIST=$(mktemp)
-rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST"
-trap 'rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST"' EXIT
+TEMP_WIKI_SYNC_PLIST=$(mktemp)
+rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST"
+trap 'rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST"' EXIT
 
 /usr/libexec/PlistBuddy -c "Add :Label string $SERVICE_LABEL" "$TEMP_SERVICE_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$TEMP_SERVICE_PLIST"
@@ -74,18 +77,41 @@ trap 'rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST"' EXIT
 /usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/sync.log" "$TEMP_SYNC_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/sync.error.log" "$TEMP_SYNC_PLIST"
 
+/usr/libexec/PlistBuddy -c "Add :Label string $WIKI_SYNC_LABEL" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $RUNTIME_DIR/bin/feishu-archive" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:1 string --archive-dir" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $ARCHIVE_DIR" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:3 string wiki-scheduled-sync" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $RUNTIME_DIR" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StartCalendarInterval dict" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StartCalendarInterval:Hour integer 3" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StartCalendarInterval:Minute integer 45" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProcessType string Background" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer 60" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :Umask integer 63" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/wiki-sync.log" "$TEMP_WIKI_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/wiki-sync.error.log" "$TEMP_WIKI_SYNC_PLIST"
+
 plutil -lint "$TEMP_SERVICE_PLIST" >/dev/null
 plutil -lint "$TEMP_SYNC_PLIST" >/dev/null
+plutil -lint "$TEMP_WIKI_SYNC_PLIST" >/dev/null
 install -m 600 "$TEMP_SERVICE_PLIST" "$SERVICE_PLIST_PATH"
 install -m 600 "$TEMP_SYNC_PLIST" "$SYNC_PLIST_PATH"
+install -m 600 "$TEMP_WIKI_SYNC_PLIST" "$WIKI_SYNC_PLIST_PATH"
 
 launchctl bootout "$USER_DOMAIN/$SERVICE_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 || true
+launchctl bootout "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 || true
 sleep 0.5
 launchctl enable "$USER_DOMAIN/$SERVICE_LABEL"
 launchctl enable "$USER_DOMAIN/$SYNC_LABEL"
+launchctl enable "$USER_DOMAIN/$WIKI_SYNC_LABEL"
 launchctl bootstrap "$USER_DOMAIN" "$SERVICE_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$SYNC_PLIST_PATH"
+launchctl bootstrap "$USER_DOMAIN" "$WIKI_SYNC_PLIST_PATH"
 
 ATTEMPT=0
 while [ "$ATTEMPT" -lt 20 ]; do
@@ -94,6 +120,7 @@ while [ "$ATTEMPT" -lt 20 ]; do
     echo "档案目录：$ARCHIVE_DIR"
     echo "阅读器服务：$SERVICE_LABEL"
     echo "每日同步：${SYNC_LABEL}（每天 03:30）"
+    echo "知识库同步：${WIKI_SYNC_LABEL}（每天 03:45）"
     exit 0
   fi
   ATTEMPT=$((ATTEMPT + 1))

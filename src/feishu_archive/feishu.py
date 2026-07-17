@@ -117,13 +117,19 @@ class FeishuClient:
                 self.account("refresh_expires_at"),
                 str(now + int(refresh_expires or 0)),
             )
+        scope = str(result.get("scope") or "")
+        if scope:
+            self.token_store.set(self.account("scope"), scope)
         return TokenResult(
             access_token=access_token,
             expires_in=expires_in,
             refresh_token=str(refresh_token) if refresh_token else None,
             refresh_token_expires_in=int(refresh_expires) if refresh_expires else None,
-            scope=str(result.get("scope") or ""),
+            scope=scope,
         )
+
+    def authorized_scopes(self) -> set[str]:
+        return set((self.token_store.get(self.account("scope")) or "").split())
 
     def user_access_token(self) -> str:
         token = self.token_store.get(self.account("access_token"))
@@ -270,6 +276,89 @@ class FeishuClient:
                 raise FeishuAPIError("群成员分页返回了无效 page_token")
             page_token = str(next_token)
 
+    def iter_wiki_space_pages(self) -> Iterator[dict[str, Any]]:
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {"page_size": 50}
+            if page_token:
+                params["page_token"] = page_token
+            result = self._json_request("GET", "/wiki/v2/spaces", params=params)
+            data = result.get("data") or {}
+            yield data
+            if not data.get("has_more"):
+                return
+            next_token = data.get("page_token")
+            if not next_token or next_token == page_token:
+                raise FeishuAPIError("知识空间分页返回了无效 page_token")
+            page_token = str(next_token)
+
+    def iter_wiki_node_pages(
+        self,
+        space_id: str,
+        *,
+        parent_node_token: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        page_token: str | None = None
+        encoded_space_id = urllib.parse.quote(space_id, safe="")
+        while True:
+            params: dict[str, Any] = {"page_size": 50}
+            if parent_node_token:
+                params["parent_node_token"] = parent_node_token
+            if page_token:
+                params["page_token"] = page_token
+            result = self._json_request(
+                "GET",
+                f"/wiki/v2/spaces/{encoded_space_id}/nodes",
+                params=params,
+            )
+            data = result.get("data") or {}
+            yield data
+            if not data.get("has_more"):
+                return
+            next_token = data.get("page_token")
+            if not next_token or next_token == page_token:
+                raise FeishuAPIError("知识库节点分页返回了无效 page_token")
+            page_token = str(next_token)
+
+    def get_docx_document(self, document_id: str) -> dict[str, Any]:
+        encoded = urllib.parse.quote(document_id, safe="")
+        result = self._json_request("GET", f"/docx/v1/documents/{encoded}")
+        data = result.get("data") or {}
+        return dict(data.get("document") or data)
+
+    def get_docx_raw_content(self, document_id: str) -> str:
+        encoded = urllib.parse.quote(document_id, safe="")
+        result = self._json_request("GET", f"/docx/v1/documents/{encoded}/raw_content")
+        data = result.get("data") or {}
+        return str(data.get("content") or "")
+
+    def iter_docx_block_pages(self, document_id: str) -> Iterator[dict[str, Any]]:
+        page_token: str | None = None
+        encoded = urllib.parse.quote(document_id, safe="")
+        while True:
+            params: dict[str, Any] = {"page_size": 500}
+            if page_token:
+                params["page_token"] = page_token
+            result = self._json_request(
+                "GET", f"/docx/v1/documents/{encoded}/blocks", params=params
+            )
+            data = result.get("data") or {}
+            yield data
+            if not data.get("has_more"):
+                return
+            next_token = data.get("page_token")
+            if not next_token or next_token == page_token:
+                raise FeishuAPIError("新版文档块分页返回了无效 page_token")
+            page_token = str(next_token)
+
+    def open_drive_file(self, file_token: str):
+        encoded = urllib.parse.quote(file_token, safe="")
+        return self._open_binary(f"/drive/v1/files/{encoded}/download")
+
+    def open_drive_media(self, file_token: str):
+        encoded = urllib.parse.quote(file_token, safe="")
+        return self._open_binary(f"/drive/v1/medias/{encoded}/download")
+
     def open_resource(self, message_id: str, file_key: str, resource_type: str):
         if resource_type not in {"image", "file"}:
             raise ValueError("resource_type 必须是 image 或 file")
@@ -277,13 +366,16 @@ class FeishuClient:
             f"/im/v1/messages/{urllib.parse.quote(message_id, safe='')}/resources/"
             f"{urllib.parse.quote(file_key, safe='')}"
         )
-        url = f"{API_BASE}{path}?{urllib.parse.urlencode({'type': resource_type})}"
+        return self._open_binary(path, params={"type": resource_type})
+
+    def _open_binary(self, path: str, *, params: dict[str, Any] | None = None):
+        url = f"{API_BASE}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(
             url,
             method="GET",
-            # Keep resource visibility aligned with the OAuth user's message
-            # access. Feishu still requires the matching app-identity message
-            # scope to be enabled for this endpoint.
+            # Keep resource visibility aligned with the OAuth user's access.
             headers={"Authorization": f"Bearer {self.user_access_token()}"},
         )
         try:

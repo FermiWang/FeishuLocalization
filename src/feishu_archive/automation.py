@@ -12,6 +12,7 @@ from typing import Any, Callable
 from .config import DEFAULT_INCREMENTAL_DAYS, DEFAULT_MAX_ATTACHMENT_BYTES, ArchivePaths
 from .database import ArchiveDatabase
 from .sync import ArchiveSyncer, SyncCounts
+from .wiki import WikiSyncCounts, WikiSyncer
 
 
 class SyncBusyError(RuntimeError):
@@ -45,6 +46,11 @@ class SyncFileLock:
 def acquire_sync_lock(paths: ArchivePaths) -> SyncFileLock:
     paths.ensure()
     return SyncFileLock(paths.sync_lock)
+
+
+def acquire_wiki_sync_lock(paths: ArchivePaths) -> SyncFileLock:
+    paths.ensure()
+    return SyncFileLock(paths.wiki_sync_lock)
 
 
 def run_sync_cycle(
@@ -169,6 +175,104 @@ class BackgroundSyncController:
             )
         except Exception as exc:
             print(f"[sync] 手工同步失败：{exc}", file=sys.stderr)
+
+
+def run_wiki_sync_cycle(
+    database: ArchiveDatabase,
+    paths: ArchivePaths,
+    client_factory: Callable[[], Any],
+    *,
+    trigger: str,
+    space_ids: list[str] | None = None,
+    force: bool = False,
+    max_asset_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    lock: SyncFileLock | None = None,
+    syncer_factory: Callable[..., WikiSyncer] = WikiSyncer,
+) -> dict[str, Any]:
+    active_lock = lock or acquire_wiki_sync_lock(paths)
+    requested = space_ids or []
+    run_id: int | None = None
+    counts = WikiSyncCounts()
+    try:
+        run_id = database.start_wiki_sync_run(trigger, requested)
+        syncer = syncer_factory(
+            database,
+            client_factory(),
+            paths,
+            max_asset_bytes=max_asset_bytes,
+        )
+        counts, errors = syncer.sync(space_ids, force=force)
+        status = "success"
+        if errors:
+            status = "partial" if counts.nodes_seen else "error"
+        database.finish_wiki_sync_run(
+            run_id,
+            status=status,
+            error="\n".join(errors) or None,
+            **counts.as_dict(),
+        )
+        result = database.latest_wiki_sync_run()
+        if result is None:
+            raise RuntimeError("知识库同步作业状态未保存")
+        return result
+    except Exception as exc:
+        if run_id is not None:
+            database.finish_wiki_sync_run(
+                run_id,
+                status="error",
+                error=str(exc),
+                **counts.as_dict(),
+            )
+        raise
+    finally:
+        active_lock.release()
+
+
+class BackgroundWikiSyncController:
+    def __init__(
+        self,
+        database: ArchiveDatabase,
+        paths: ArchivePaths,
+        client_factory: Callable[[], Any],
+        *,
+        max_asset_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    ) -> None:
+        self.database = database
+        self.paths = paths
+        self.client_factory = client_factory
+        self.max_asset_bytes = max_asset_bytes
+        self._guard = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        with self._guard:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            try:
+                lock = acquire_wiki_sync_lock(self.paths)
+            except SyncBusyError:
+                return False
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(lock,),
+                name="feishu-wiki-manual-sync",
+                daemon=True,
+            )
+            self._thread.start()
+            return True
+
+    def _run(self, lock: SyncFileLock) -> None:
+        try:
+            run_wiki_sync_cycle(
+                self.database,
+                self.paths,
+                self.client_factory,
+                trigger="manual",
+                max_asset_bytes=self.max_asset_bytes,
+                lock=lock,
+            )
+        except Exception as exc:
+            print(f"[wiki-sync] 手工同步失败：{exc}", file=sys.stderr)
 
 
 def _add_counts(total: SyncCounts, value: SyncCounts) -> None:
