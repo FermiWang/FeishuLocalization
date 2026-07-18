@@ -55,7 +55,7 @@ SUPPORTED_METADATA_ONLY_TYPES = {
     "board",
     "file",
 }
-WIKI_RENDER_VERSION = "2"
+WIKI_RENDER_VERSION = "3"
 
 
 @dataclass
@@ -764,6 +764,9 @@ def _safe_external_url(value: Any) -> str | None:
     if not url:
         return None
     parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme:
+        url = urllib.parse.unquote(url)
+        parsed = urllib.parse.urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
     return url

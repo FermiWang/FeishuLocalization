@@ -221,13 +221,15 @@ class WikiSyncTests(unittest.TestCase):
                     {
                         "text_run": {
                             "content": "安全链接",
-                            "text_element_style": {"link": {"url": "https://example.com/a?b=1"}},
+                            "text_element_style": {
+                                "link": {"url": "https%3A%2F%2Fexample.com%2Fa%3Fb%3D1"}
+                            },
                         }
                     },
                     {
                         "text_run": {
                             "content": "危险链接",
-                            "text_element_style": {"link": {"url": "javascript:alert(1)"}},
+                            "text_element_style": {"link": {"url": "javascript%3Aalert%281%29"}},
                         }
                     },
                     {"mention_doc": {"title": "飞书文档", "url": "https://example.com/doc"}},
