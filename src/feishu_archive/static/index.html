@@ -38,8 +38,8 @@
           <input id="wiki-query" class="input" type="search" placeholder="标题或正文关键词">
           <button id="wiki-search" class="button">搜索</button>
         </div>
+        <p class="wiki-space-heading">知识空间</p>
         <nav id="wiki-space-list" class="wiki-space-list" aria-label="知识空间列表"></nav>
-        <nav id="wiki-node-list" class="wiki-node-list" aria-label="知识库目录"></nav>
       </section>
     </aside>
 
@@ -77,11 +77,17 @@
           <h2 id="wiki-title">请选择知识空间</h2>
           <p id="wiki-document-meta" class="wiki-document-meta">目录、正文和附件均从本机档案加载。</p>
         </div>
+        <button id="wiki-back" class="button secondary wiki-back" hidden>返回节点列表</button>
       </header>
       <section id="wiki-results" class="wiki-results" hidden></section>
-      <article id="wiki-document" class="wiki-document" aria-live="polite">
-        <div class="empty-state"><strong>选择左侧文档开始阅读</strong><span>离线阅读不需要访问飞书服务器。</span></div>
-      </article>
+      <section id="wiki-node-view" class="wiki-node-view" aria-live="polite">
+        <div class="wiki-node-view-heading">
+          <div><p class="eyebrow">空间目录</p><h3 id="wiki-node-heading">请选择左侧知识空间</h3></div>
+          <span id="wiki-node-count">0 个节点</span>
+        </div>
+        <nav id="wiki-node-list" class="wiki-node-list" aria-label="知识库目录"></nav>
+      </section>
+      <article id="wiki-document" class="wiki-document" aria-live="polite" hidden></article>
     </main>
   </div>
   <script src="/static/app.js" defer></script>

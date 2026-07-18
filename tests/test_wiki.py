@@ -7,7 +7,7 @@ from pathlib import Path
 
 from feishu_archive.config import ArchivePaths
 from feishu_archive.database import ArchiveDatabase
-from feishu_archive.wiki import WikiSyncer, block_text, render_blocks
+from feishu_archive.wiki import WIKI_RENDER_VERSION, WikiSyncer, block_text, render_blocks
 
 
 class FakeResponse(io.BytesIO):
@@ -91,7 +91,19 @@ class FakeWikiClient:
                     "block_id": "text_1",
                     "parent_id": "root",
                     "block_type": 2,
-                    "text": {"elements": [{"text_run": {"content": "正文可以本机全文搜索"}}]},
+                    "text": {
+                        "elements": [
+                            {"text_run": {"content": "正文可以本机全文搜索，"}},
+                            {
+                                "text_run": {
+                                    "content": "打开参考网页",
+                                    "text_element_style": {
+                                        "link": {"url": "https://example.com/reference"}
+                                    },
+                                }
+                            },
+                        ]
+                    },
                 },
                 {
                     "block_id": "image_1",
@@ -148,6 +160,8 @@ class WikiSyncTests(unittest.TestCase):
 
         document = self.database.wiki_document_for_node("wik_doc")
         self.assertIn("/api/wiki/assets/", document["rendered_html"])
+        self.assertIn('href="https://example.com/reference"', document["rendered_html"])
+        self.assertIn('target="_blank"', document["rendered_html"])
         export_path = Path(document["local_export_path"])
         self.assertTrue(export_path.is_file())
         export_text = export_path.read_text(encoding="utf-8")
@@ -155,12 +169,37 @@ class WikiSyncTests(unittest.TestCase):
         self.assertNotIn("/api/wiki/assets/", export_text)
         for asset in self.database.list_wiki_assets("doc_1"):
             self.assertTrue(Path(asset["local_path"]).is_file())
+        file_document = self.database.wiki_document_for_node("wik_file")
+        self.assertIn("/api/wiki/preview/", file_document["rendered_html"])
+        self.assertIn('target="_blank"', file_document["rendered_html"])
 
         second_counts, second_errors = syncer.sync()
         self.assertEqual(second_errors, [])
         self.assertEqual(second_counts.documents_written, 0)
         self.assertEqual(self.client.media_opens, 1)
         self.assertEqual(self.client.file_opens, 1)
+
+    def test_local_rebuild_uses_saved_blocks_without_api_calls(self) -> None:
+        syncer = WikiSyncer(self.database, self.client, self.paths)
+        syncer.sync()
+        self.database.update_wiki_rendered_view("doc_1", "<p>旧正文</p>")
+        media_opens = self.client.media_opens
+        file_opens = self.client.file_opens
+
+        result = WikiSyncer(self.database, None, self.paths).rebuild_views(force=True)
+
+        self.assertEqual(result["render_version"], WIKI_RENDER_VERSION)
+        self.assertEqual(result["documents_seen"], 2)
+        self.assertEqual(result["documents_skipped"], 1)
+        self.assertGreaterEqual(result["documents_updated"], 1)
+        rebuilt = self.database.get_wiki_document("doc_1")
+        self.assertIn('href="https://example.com/reference"', rebuilt["rendered_html"])
+        self.assertEqual(self.database.get_metadata("wiki_render_version"), WIKI_RENDER_VERSION)
+        self.assertEqual(self.client.media_opens, media_opens)
+        self.assertEqual(self.client.file_opens, file_opens)
+
+        unchanged = WikiSyncer(self.database, None, self.paths).rebuild_views()
+        self.assertEqual(unchanged["documents_seen"], 0)
 
     def test_rendering_escapes_document_text(self) -> None:
         block = {
@@ -172,6 +211,58 @@ class WikiSyncTests(unittest.TestCase):
         rendered = render_blocks([block], {})
         self.assertIn("&lt;script&gt;", rendered)
         self.assertNotIn("<script>", rendered)
+
+    def test_rendering_preserves_only_safe_links_and_resource_states(self) -> None:
+        block = {
+            "block_id": "text",
+            "block_type": 2,
+            "text": {
+                "elements": [
+                    {
+                        "text_run": {
+                            "content": "安全链接",
+                            "text_element_style": {"link": {"url": "https://example.com/a?b=1"}},
+                        }
+                    },
+                    {
+                        "text_run": {
+                            "content": "危险链接",
+                            "text_element_style": {"link": {"url": "javascript:alert(1)"}},
+                        }
+                    },
+                    {"mention_doc": {"title": "飞书文档", "url": "https://example.com/doc"}},
+                ]
+            },
+        }
+        image = {
+            "block_id": "image",
+            "block_type": 27,
+            "image": {"token": "image_token", "name": "示意图.png"},
+        }
+        missing_file = {
+            "block_id": "file",
+            "block_type": 23,
+            "file": {"token": "file_token", "name": "证据.pdf"},
+        }
+
+        rendered = render_blocks(
+            [block, image, missing_file],
+            {("image_token", "image"): 7, ("file_token", "file"): 8},
+            {
+                ("image_token", "image"): {"status": "downloaded"},
+                ("file_token", "file"): {"status": "error", "error": "资源不可见"},
+            },
+        )
+
+        self.assertIn('href="https://example.com/a?b=1"', rendered)
+        self.assertIn('rel="noopener noreferrer"', rendered)
+        self.assertIn('href="https://example.com/doc"', rendered)
+        self.assertNotIn("javascript:", rendered)
+        self.assertIn("危险链接", rendered)
+        self.assertIn('href="/api/wiki/assets/7"', rendered)
+        self.assertIn('decoding="async"', rendered)
+        self.assertIn("证据.pdf：资源不可见", rendered)
+        self.assertNotIn("/api/wiki/preview/8", rendered)
 
 
 if __name__ == "__main__":

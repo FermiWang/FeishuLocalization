@@ -345,6 +345,18 @@ class ArchiveDatabase:
         with self.connection() as con:
             return str(con.execute("PRAGMA integrity_check").fetchone()[0])
 
+    def get_metadata(self, key: str) -> str | None:
+        with self.connection() as con:
+            row = con.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def set_metadata(self, key: str, value: str) -> None:
+        with self.connection() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
     def upsert_conversation(self, item: dict[str, Any]) -> None:
         chat_id = str(item.get("chat_id") or "").strip()
         if not chat_id:
@@ -935,6 +947,72 @@ class ArchiveDatabase:
                 "SELECT * FROM wiki_documents WHERE obj_token=?", (obj_token,)
             ).fetchone()
         return dict(row) if row else None
+
+    def list_wiki_documents_for_render(self) -> list[dict[str, Any]]:
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM wiki_documents
+                WHERE status IN ('synced', 'metadata_only')
+                ORDER BY id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_wiki_blocks(self, obj_token: str) -> list[dict[str, Any]]:
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT block_id, parent_id, block_type, position, text, raw_json
+                FROM wiki_blocks WHERE obj_token=? ORDER BY position, block_id
+                """,
+                (obj_token,),
+            ).fetchall()
+        blocks: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                value = json.loads(str(row["raw_json"] or "{}"))
+            except json.JSONDecodeError:
+                value = {}
+            if not isinstance(value, dict):
+                value = {}
+            value.setdefault("block_id", row["block_id"])
+            value.setdefault("parent_id", row["parent_id"])
+            value.setdefault("block_type", row["block_type"])
+            blocks.append(value)
+        return blocks
+
+    def update_wiki_rendered_view(
+        self,
+        obj_token: str,
+        rendered_html: str,
+        *,
+        local_export_path: str | None = None,
+    ) -> bool:
+        with self.connection() as con:
+            previous = con.execute(
+                "SELECT rendered_html, local_export_path FROM wiki_documents WHERE obj_token=?",
+                (obj_token,),
+            ).fetchone()
+            if not previous:
+                return False
+            changed = (
+                str(previous["rendered_html"] or "") != rendered_html
+                or (
+                    local_export_path is not None
+                    and str(previous["local_export_path"] or "") != local_export_path
+                )
+            )
+            if changed:
+                con.execute(
+                    """
+                    UPDATE wiki_documents
+                    SET rendered_html=?, local_export_path=COALESCE(?, local_export_path)
+                    WHERE obj_token=?
+                    """,
+                    (rendered_html, local_export_path, obj_token),
+                )
+        return changed
 
     def upsert_wiki_document(self, item: dict[str, Any]) -> bool:
         obj_token = str(item.get("obj_token") or "").strip()

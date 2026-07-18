@@ -8,6 +8,7 @@ const state = {
   wikiNodes: [],
   selectedWikiSpace: null,
   selectedWikiNode: null,
+  wikiView: "nodes",
   wikiSyncWasRunning: false,
   wikiPollTimer: null,
 };
@@ -47,6 +48,24 @@ function setMode(mode) {
   $("wiki-view").hidden = !wiki;
   $("mode-messages").classList.toggle("active", !wiki);
   $("mode-wiki").classList.toggle("active", wiki);
+}
+
+function writeWikiLocation(nodeToken = null, replace = false) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("mode", "wiki");
+  if (state.selectedWikiSpace) url.searchParams.set("space_id", state.selectedWikiSpace);
+  else url.searchParams.delete("space_id");
+  if (nodeToken) url.searchParams.set("node_token", nodeToken);
+  else url.searchParams.delete("node_token");
+  history[replace ? "replaceState" : "pushState"]({}, "", url);
+}
+
+function writeMessageLocation() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("mode");
+  url.searchParams.delete("space_id");
+  url.searchParams.delete("node_token");
+  history.pushState({}, "", url);
 }
 
 async function loadStatus() {
@@ -109,8 +128,9 @@ async function loadWikiStatus() {
     }
     if (state.wikiSyncWasRunning && !running) {
       await loadWikiSpaces(true);
-      if (state.selectedWikiSpace) await selectWikiSpace(state.selectedWikiSpace, false);
-      if (state.selectedWikiNode) await selectWikiNode(state.selectedWikiNode);
+      const selectedNode = state.selectedWikiNode;
+      if (state.selectedWikiSpace) await selectWikiSpace(state.selectedWikiSpace, false, false);
+      if (selectedNode) await selectWikiNode(selectedNode, false);
     }
     state.wikiSyncWasRunning = running;
     state.wikiPollTimer = setTimeout(loadWikiStatus, running ? 2000 : 60000);
@@ -143,10 +163,11 @@ async function startWikiSync() {
 async function loadWikiSpaces(keepSelection = false) {
   const data = await request("/api/wiki/spaces");
   state.wikiSpaces = data.items;
-  renderWikiSpaces();
-  if (!keepSelection && !state.selectedWikiSpace && data.items.length) {
-    await selectWikiSpace(data.items[0].space_id);
+  if (!keepSelection && state.selectedWikiSpace && !data.items.some((item) => item.space_id === state.selectedWikiSpace)) {
+    state.selectedWikiSpace = null;
+    state.selectedWikiNode = null;
   }
+  renderWikiSpaces();
 }
 
 function renderWikiSpaces() {
@@ -165,49 +186,102 @@ function renderWikiSpaces() {
   });
 }
 
-async function selectWikiSpace(spaceId, resetNode = true) {
+async function selectWikiSpace(spaceId, resetNode = true, updateHistory = true) {
   state.selectedWikiSpace = spaceId;
   if (resetNode) state.selectedWikiNode = null;
   renderWikiSpaces();
-  const space = state.wikiSpaces.find((item) => item.space_id === spaceId);
-  $("wiki-title").textContent = space?.name || spaceId;
-  $("wiki-eyebrow").textContent = "知识空间目录";
-  $("wiki-document-meta").textContent = space?.description || "选择左侧文档开始离线阅读。";
+  $("wiki-node-list").innerHTML = '<div class="empty-state"><span>正在从本机档案读取节点…</span></div>';
   const data = await request(`/api/wiki/nodes?space_id=${encodeURIComponent(spaceId)}`);
   state.wikiNodes = data.items;
-  renderWikiNodes();
-  if (resetNode) {
-    $("wiki-results").hidden = true;
-    $("wiki-document").innerHTML = '<div class="empty-state"><strong>选择左侧文档开始阅读</strong><span>目录与正文均来自本机档案。</span></div>';
-  }
+  showWikiNodeList(updateHistory);
 }
 
 function renderWikiNodes() {
   const needle = $("wiki-query").value.trim().toLowerCase();
   const root = $("wiki-node-list");
   root.replaceChildren();
-  state.wikiNodes
-    .filter((item) => !needle || `${item.title || ""} ${item.path || ""}`.toLowerCase().includes(needle))
-    .forEach((item) => {
+  const ordered = orderWikiNodes(state.wikiNodes);
+  const visible = ordered.filter(({ item }) => !needle || `${item.title || ""} ${item.path || ""}`.toLowerCase().includes(needle));
+  $("wiki-node-count").textContent = needle ? `${visible.length} / ${ordered.length} 个节点` : `${ordered.length} 个节点`;
+  if (!visible.length) {
+    root.innerHTML = '<div class="empty-state"><strong>没有匹配的节点</strong><span>可清除搜索词查看空间中的全部节点。</span></div>';
+    return;
+  }
+  visible.forEach(({ item, depth }) => {
       const button = document.createElement("button");
       button.className = `wiki-node${item.node_token === state.selectedWikiNode ? " active" : ""}`;
-      const depth = Math.max(0, String(item.path || "").split("/").length - 1);
-      button.style.paddingLeft = `${12 + Math.min(depth, 8) * 14}px`;
+      button.style.paddingLeft = `${15 + Math.min(depth, 6) * 22}px`;
       const title = document.createElement("span");
+      title.className = "wiki-node-title";
       title.textContent = item.title || item.obj_token;
-      const meta = document.createElement("small");
+      const path = document.createElement("small");
+      path.className = "wiki-node-path";
+      path.textContent = item.path || item.title || item.obj_token;
+      const status = document.createElement("span");
       const labels = { synced: "已离线", metadata_only: "仅目录", error: "同步失败", syncing: "同步中" };
-      meta.textContent = `${item.obj_type || "unknown"} · ${labels[item.document_status] || "待同步"}`;
-      button.append(title, meta);
+      const statusName = item.document_status || "pending";
+      status.className = `wiki-node-status ${statusName}`;
+      status.textContent = `${item.obj_type || "unknown"} · ${labels[statusName] || "待同步"}`;
+      button.append(title, path, status);
       button.addEventListener("click", () => selectWikiNode(item.node_token));
       root.append(button);
     });
 }
 
-async function selectWikiNode(nodeToken) {
+function orderWikiNodes(items) {
+  const byParent = new Map();
+  const known = new Set(items.map((item) => item.node_token));
+  items.forEach((item) => {
+    const parent = item.parent_node_token && known.has(item.parent_node_token) ? item.parent_node_token : "";
+    if (!byParent.has(parent)) byParent.set(parent, []);
+    byParent.get(parent).push(item);
+  });
+  byParent.forEach((children) => children.sort((left, right) => {
+    const position = Number(left.position || 0) - Number(right.position || 0);
+    return position || String(left.title || "").localeCompare(String(right.title || ""), "zh-CN");
+  }));
+  const result = [];
+  const visited = new Set();
+  function visit(parent, depth) {
+    (byParent.get(parent) || []).forEach((item) => {
+      if (visited.has(item.node_token)) return;
+      visited.add(item.node_token);
+      result.push({ item, depth });
+      visit(item.node_token, depth + 1);
+    });
+  }
+  visit("", 0);
+  items.forEach((item) => {
+    if (!visited.has(item.node_token)) result.push({ item, depth: 0 });
+  });
+  return result;
+}
+
+function showWikiNodeList(updateHistory = true) {
+  state.wikiView = "nodes";
+  state.selectedWikiNode = null;
+  const space = state.wikiSpaces.find((item) => item.space_id === state.selectedWikiSpace);
+  $("wiki-title").textContent = space?.name || state.selectedWikiSpace || "请选择知识空间";
+  $("wiki-node-heading").textContent = space?.name || state.selectedWikiSpace || "请选择左侧知识空间";
+  $("wiki-eyebrow").textContent = "知识空间目录";
+  $("wiki-document-meta").textContent = space?.description || "点击下方节点，在右侧区域阅读本地正文。";
+  $("wiki-results").hidden = true;
+  $("wiki-node-view").hidden = false;
+  $("wiki-document").hidden = true;
+  $("wiki-back").hidden = true;
+  renderWikiNodes();
+  if (updateHistory) writeWikiLocation();
+}
+
+async function selectWikiNode(nodeToken, updateHistory = true) {
   state.selectedWikiNode = nodeToken;
+  state.wikiView = "document";
   renderWikiNodes();
   const root = $("wiki-document");
+  $("wiki-results").hidden = true;
+  $("wiki-node-view").hidden = true;
+  root.hidden = false;
+  $("wiki-back").hidden = false;
   root.innerHTML = '<div class="empty-state"><span>正在从本机档案读取…</span></div>';
   try {
     const item = await request(`/api/wiki/document?node_token=${encodeURIComponent(nodeToken)}`);
@@ -232,6 +306,7 @@ async function selectWikiNode(nodeToken) {
       body.append(pre);
     }
     root.append(body);
+    if (updateHistory) writeWikiLocation(nodeToken);
   } catch (error) {
     root.innerHTML = '<div class="empty-state"><strong>读取失败</strong><span></span></div>';
     root.querySelector("span").textContent = error.message;
@@ -241,13 +316,19 @@ async function selectWikiNode(nodeToken) {
 async function searchWiki() {
   const query = $("wiki-query").value.trim();
   if (!query) {
-    $("wiki-results").hidden = true;
-    renderWikiNodes();
+    if (state.selectedWikiSpace) showWikiNodeList(false);
     return;
   }
   const params = new URLSearchParams({ q: query, limit: "100" });
   const data = await request(`/api/wiki/search?${params}`);
   const root = $("wiki-results");
+  state.wikiView = "search";
+  $("wiki-title").textContent = `搜索：${query}`;
+  $("wiki-eyebrow").textContent = "本地知识库搜索";
+  $("wiki-document-meta").textContent = "搜索结果来自已离线保存的标题和正文。";
+  $("wiki-node-view").hidden = true;
+  $("wiki-document").hidden = true;
+  $("wiki-back").hidden = !state.selectedWikiSpace;
   root.replaceChildren();
   const summary = document.createElement("strong");
   summary.textContent = `找到 ${data.items.length} 篇本地文档`;
@@ -263,7 +344,7 @@ async function searchWiki() {
     excerpt.textContent = String(item.excerpt || "").replace(/\s+/g, " ").slice(0, 180);
     button.append(title, path, excerpt);
     button.addEventListener("click", async () => {
-      if (state.selectedWikiSpace !== item.space_id) await selectWikiSpace(item.space_id, false);
+      if (state.selectedWikiSpace !== item.space_id) await selectWikiSpace(item.space_id, true, false);
       await selectWikiNode(item.node_token);
     });
     root.append(button);
@@ -420,13 +501,44 @@ $("query").addEventListener("keydown", (event) => { if (event.key === "Enter") l
 $("export-html").addEventListener("click", () => exportConversation("html"));
 $("export-json").addEventListener("click", () => exportConversation("json"));
 $("sync-now").addEventListener("click", startSync);
-$("mode-messages").addEventListener("click", () => setMode("messages"));
-$("mode-wiki").addEventListener("click", () => setMode("wiki"));
+$("mode-messages").addEventListener("click", () => { setMode("messages"); writeMessageLocation(); });
+$("mode-wiki").addEventListener("click", async () => {
+  setMode("wiki");
+  if (state.selectedWikiSpace) showWikiNodeList(true);
+  else if (state.wikiSpaces.length) await selectWikiSpace(state.wikiSpaces[0].space_id);
+});
 $("wiki-sync-now").addEventListener("click", startWikiSync);
 $("wiki-search").addEventListener("click", searchWiki);
-$("wiki-query").addEventListener("input", renderWikiNodes);
+$("wiki-query").addEventListener("input", () => { if (state.wikiView === "nodes") renderWikiNodes(); });
 $("wiki-query").addEventListener("keydown", (event) => { if (event.key === "Enter") searchWiki(); });
+$("wiki-back").addEventListener("click", () => showWikiNodeList(true));
 
-Promise.all([loadStatus(), loadConversations(), loadSyncStatus(), loadWikiStatus(), loadWikiSpaces()]).catch((error) => {
-  $("archive-status").textContent = error.message;
-});
+async function restoreLocation() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("mode") !== "wiki") {
+    setMode("messages");
+    return;
+  }
+  setMode("wiki");
+  const requestedSpace = params.get("space_id");
+  const spaceId = state.wikiSpaces.some((item) => item.space_id === requestedSpace)
+    ? requestedSpace
+    : state.wikiSpaces[0]?.space_id;
+  if (!spaceId) return;
+  await selectWikiSpace(spaceId, true, false);
+  const nodeToken = params.get("node_token");
+  if (nodeToken && state.wikiNodes.some((item) => item.node_token === nodeToken)) {
+    await selectWikiNode(nodeToken, false);
+  }
+}
+
+window.addEventListener("popstate", () => restoreLocation().catch((error) => {
+  $("wiki-document-meta").textContent = error.message;
+}));
+
+async function initialize() {
+  await Promise.all([loadStatus(), loadConversations(), loadSyncStatus(), loadWikiStatus(), loadWikiSpaces()]);
+  await restoreLocation();
+}
+
+initialize().catch((error) => { $("archive-status").textContent = error.message; });
