@@ -119,6 +119,7 @@ class WebTests(unittest.TestCase):
                     self.assertIn('id="wiki-back"', body)
                     self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
                     self.assertIn("frame-src 'self'", response.headers["Content-Security-Policy"])
+                    self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/messages?chat_id=demo_internal", timeout=2
                 ) as response:
@@ -191,12 +192,14 @@ class WebTests(unittest.TestCase):
                 ) as response:
                     self.assertEqual(response.headers["Content-Type"], "application/pdf")
                     self.assertIsNone(response.headers["Content-Disposition"])
+                    self.assertIn("frame-ancestors 'self'", response.headers["Content-Security-Policy"])
                     self.assertEqual(response.read(), wiki_file_payload)
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/wiki/assets/{wiki_file_asset_id}?download=1",
                     timeout=2,
                 ) as response:
                     self.assertIn("attachment", response.headers["Content-Disposition"])
+                    self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
                     self.assertEqual(response.read(), wiki_file_payload)
                 sync_request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/sync",

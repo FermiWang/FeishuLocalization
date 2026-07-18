@@ -298,10 +298,12 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         content_type = asset.get("mime_type") or mimetypes.guess_type(target.name)[0]
         download = _first(query, "download") == "1"
         filename = asset.get("filename") or target.name
+        inline = _inline_wiki_mime(content_type)
         self._bytes(
             target.read_bytes(),
             content_type or "application/octet-stream",
-            filename=filename if download or not _inline_wiki_mime(content_type) else None,
+            filename=filename if download or not inline else None,
+            allow_same_origin_frame=inline and not download,
         )
 
     def _wiki_preview(self, path: str) -> None:
@@ -372,6 +374,7 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         *,
         status: HTTPStatus = HTTPStatus.OK,
         filename: str | None = None,
+        allow_same_origin_frame: bool = False,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -380,10 +383,12 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        frame_ancestors = "'self'" if allow_same_origin_frame else "'none'"
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-            "media-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            "media-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; "
+            f"frame-ancestors {frame_ancestors}",
         )
         if filename:
             encoded = urllib.parse.quote(filename)
