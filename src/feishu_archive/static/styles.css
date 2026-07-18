@@ -1,0 +1,103 @@
+:root {
+  color-scheme: light;
+  --bg: #eef2f5;
+  --panel: #ffffff;
+  --ink: #17212b;
+  --muted: #687786;
+  --line: #dfe5ea;
+  --accent: #2563eb;
+  --accent-soft: #eaf0ff;
+  --sidebar: #172536;
+  --sidebar-muted: #9fb0c2;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); }
+button, input, select { font: inherit; }
+.app-shell { min-height: 100vh; display: grid; grid-template-columns: 310px minmax(0, 1fr); }
+.sidebar { background: var(--sidebar); color: white; padding: 24px 18px; display: flex; flex-direction: column; min-height: 100vh; }
+.brand { display: flex; align-items: center; gap: 12px; padding: 0 6px 22px; }
+.brand h1 { font-size: 18px; margin: 0 0 2px; }
+.brand p { margin: 0; color: var(--sidebar-muted); font-size: 12px; }
+.brand-mark { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; background: linear-gradient(135deg, #60a5fa, #4f46e5); font-weight: 800; }
+.mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin: -6px 0 18px; border-radius: 11px; background: rgba(255,255,255,.08); }
+.mode-button { border: 0; border-radius: 8px; padding: 8px 6px; background: transparent; color: var(--sidebar-muted); cursor: pointer; font-weight: 650; font-size: 12px; }
+.mode-button.active { background: white; color: #1d4ed8; }
+#message-sidebar, #wiki-sidebar { min-height: 0; display: flex; flex: 1; flex-direction: column; }
+.status-card { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.1); border-radius: 12px; color: var(--sidebar-muted); padding: 12px; font-size: 12px; line-height: 1.6; margin-bottom: 18px; }
+.sync-card { display: grid; gap: 8px; margin: -6px 0 18px; }
+.sync-card span { color: var(--sidebar-muted); font-size: 11px; line-height: 1.5; }
+.sync-button { width: 100%; background: #3b82f6; }
+.search-label { color: var(--sidebar-muted); font-size: 12px; margin: 0 4px 6px; }
+.input { width: 100%; border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--ink); padding: 9px 11px; outline: none; }
+.input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+.sidebar .input { border-color: transparent; background: rgba(255,255,255,.12); color: white; }
+.sidebar .input::placeholder { color: #91a2b5; }
+.conversation-list { margin-top: 12px; overflow: auto; display: grid; gap: 4px; }
+.conversation { border: 0; border-radius: 10px; background: transparent; color: white; padding: 11px 12px; text-align: left; cursor: pointer; display: grid; gap: 3px; }
+.conversation:hover, .conversation.active { background: rgba(255,255,255,.11); }
+.conversation span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation small { color: var(--sidebar-muted); }
+.wiki-search-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
+.wiki-search-row .button { padding-inline: 11px; }
+.wiki-space-list { display: grid; gap: 4px; margin-top: 12px; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,.12); }
+.wiki-space, .wiki-node { border: 0; border-radius: 9px; background: transparent; color: white; padding: 9px 11px; text-align: left; cursor: pointer; display: grid; gap: 2px; min-width: 0; }
+.wiki-space:hover, .wiki-space.active, .wiki-node:hover, .wiki-node.active { background: rgba(255,255,255,.11); }
+.wiki-space span, .wiki-node span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wiki-space small, .wiki-node small { color: var(--sidebar-muted); font-size: 10px; }
+.wiki-node-list { min-height: 100px; overflow: auto; display: grid; align-content: start; gap: 2px; margin-top: 8px; }
+.content { min-width: 0; padding: 30px clamp(20px, 4vw, 56px) 60px; }
+.content-header { display: flex; justify-content: space-between; gap: 20px; align-items: flex-end; }
+.content-header h2 { margin: 3px 0 0; font-size: clamp(24px, 3vw, 36px); }
+.eyebrow { color: var(--accent); font-weight: 700; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; margin: 0; }
+.export-actions { display: flex; gap: 8px; }
+.button { border: 0; border-radius: 9px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font-weight: 650; white-space: nowrap; }
+.button.secondary { background: var(--accent-soft); color: var(--accent); }
+.button:disabled { opacity: .45; cursor: not-allowed; }
+.filters { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: grid; grid-template-columns: minmax(190px, 2fr) repeat(4, minmax(120px, 1fr)) auto; gap: 10px; align-items: end; margin: 26px 0 12px; box-shadow: 0 8px 30px rgba(30,45,60,.04); }
+.filters label { color: var(--muted); font-size: 11px; display: grid; gap: 5px; }
+.result-summary { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; padding: 4px 2px 12px; }
+.messages { display: grid; gap: 10px; }
+.message { background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 14px 16px; }
+.message-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.message-head strong { font-size: 14px; }
+.message-head time { color: var(--muted); font-size: 11px; }
+.message-body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 10px; line-height: 1.65; }
+.message-images { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px; margin: 10px 0; }
+.message-image-link { display: block; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #f1f4f7; }
+.message-image { display: block; width: 100%; max-height: 560px; object-fit: contain; background: #f8fafc; }
+.image-placeholder { display: grid; min-height: 100px; place-items: center; border: 1px dashed #c7d0d9; border-radius: 10px; color: var(--muted); font-size: 12px; }
+.message-meta { display: flex; gap: 8px; color: var(--muted); font-size: 11px; }
+.badge { background: #f1f4f7; border-radius: 999px; padding: 2px 7px; }
+.attachment-link { display: block; margin-top: 9px; color: var(--accent); font-size: 12px; overflow-wrap: anywhere; }
+span.attachment-link { color: var(--muted); }
+.empty-state { min-height: 340px; border: 1px dashed #c7d0d9; border-radius: 16px; display: grid; place-content: center; justify-items: center; gap: 6px; color: var(--muted); }
+.empty-state strong { color: var(--ink); }
+.wiki-content { background: #f7f8fa; }
+.wiki-header { align-items: flex-start; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.wiki-document-meta { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+.wiki-results { margin: 18px 0; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); display: grid; gap: 8px; }
+.wiki-search-result { border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); padding: 10px 12px; text-align: left; cursor: pointer; display: grid; gap: 3px; }
+.wiki-search-result:hover { border-color: #9eb6ff; background: #f7f9ff; }
+.wiki-search-result small, .wiki-search-result span { color: var(--muted); font-size: 11px; }
+.wiki-document { max-width: 980px; margin: 24px auto 0; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: clamp(20px, 4vw, 48px); box-shadow: 0 8px 30px rgba(30,45,60,.04); }
+.wiki-document-body { font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; overflow-wrap: anywhere; }
+.wiki-document-body h1, .wiki-document-body h2, .wiki-document-body h3 { line-height: 1.35; margin-top: 1.6em; }
+.wiki-document-body img { display: block; max-width: 100%; height: auto; margin: 0 auto; border-radius: 9px; }
+.wiki-document-body figure { margin: 24px 0; }
+.wiki-document-body figcaption { color: var(--muted); font-size: 12px; text-align: center; margin-top: 7px; }
+.wiki-document-body pre { padding: 16px; border-radius: 10px; background: #f3f5f7; white-space: pre-wrap; overflow: auto; }
+.wiki-document-body blockquote { margin-left: 0; padding-left: 16px; border-left: 4px solid #c8d1dc; color: #52606d; }
+.wiki-document-body .kb-callout { padding: 13px 15px; border-radius: 10px; background: #f0f5ff; }
+.wiki-document-body .kb-file { color: var(--accent); font-weight: 650; }
+.wiki-note { color: var(--muted); }
+.wiki-warning { margin-bottom: 18px; padding: 12px 14px; border: 1px solid #f2c48d; border-radius: 10px; background: #fff8ed; color: #8a4b08; font-size: 13px; }
+@media (max-width: 1100px) { .filters { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 760px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .sidebar { min-height: auto; max-height: 44vh; }
+  .content-header { align-items: flex-start; flex-direction: column; }
+  .filters { grid-template-columns: 1fr 1fr; }
+  .result-summary { gap: 8px; flex-direction: column; }
+}
