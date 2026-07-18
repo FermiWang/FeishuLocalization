@@ -14,6 +14,11 @@ WIKI_SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$WIKI_SYNC_LABEL.plist"
 PYTHON_BIN=$(command -v python3)
 USER_DOMAIN="gui/$(id -u)"
 
+# Stop readers and scheduled writers before replacing runtime files or rebuilding views.
+launchctl bootout "$USER_DOMAIN/$SERVICE_LABEL" >/dev/null 2>&1 || true
+launchctl bootout "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 || true
+launchctl bootout "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 || true
+
 if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
   echo "Feishu Archive 需要 Python 3.11 或更高版本。" >&2
   exit 1
@@ -27,6 +32,7 @@ install -m 755 "$PROJECT_ROOT/bin/feishu-archive" "$RUNTIME_DIR/bin/feishu-archi
 install -m 644 "$PROJECT_ROOT/pyproject.toml" "$RUNTIME_DIR/pyproject.toml"
 
 "$RUNTIME_DIR/bin/feishu-archive" --archive-dir "$ARCHIVE_DIR" init
+"$RUNTIME_DIR/bin/feishu-archive" --archive-dir "$ARCHIVE_DIR" wiki-rebuild
 chmod 600 "$ARCHIVE_DIR/archive.sqlite3"
 
 TEMP_SERVICE_PLIST=$(mktemp)
@@ -102,10 +108,6 @@ install -m 600 "$TEMP_SERVICE_PLIST" "$SERVICE_PLIST_PATH"
 install -m 600 "$TEMP_SYNC_PLIST" "$SYNC_PLIST_PATH"
 install -m 600 "$TEMP_WIKI_SYNC_PLIST" "$WIKI_SYNC_PLIST_PATH"
 
-launchctl bootout "$USER_DOMAIN/$SERVICE_LABEL" >/dev/null 2>&1 || true
-launchctl bootout "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 || true
-launchctl bootout "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 || true
-sleep 0.5
 launchctl enable "$USER_DOMAIN/$SERVICE_LABEL"
 launchctl enable "$USER_DOMAIN/$SYNC_LABEL"
 launchctl enable "$USER_DOMAIN/$WIKI_SYNC_LABEL"

@@ -113,8 +113,10 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                         )
                     }
                 )
+            elif parsed.path.startswith("/api/wiki/preview/"):
+                self._wiki_preview(parsed.path)
             elif parsed.path.startswith("/api/wiki/assets/"):
-                self._wiki_resource(parsed.path)
+                self._wiki_resource(parsed.path, query)
             elif parsed.path == "/api/senders":
                 chat_id = _first(query, "chat_id")
                 self._json({"items": self.server.database.list_senders(chat_id)})
@@ -269,8 +271,7 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             filename=(attachment.get("filename") or target.name) if download else None,
         )
 
-    def _wiki_resource(self, path: str) -> None:
-        raw_id = path.removeprefix("/api/wiki/assets/")
+    def _wiki_asset_target(self, raw_id: str) -> tuple[dict[str, Any], Path] | None:
         if not raw_id.isdigit():
             raise ValueError("资源 ID 无效")
         asset = self.server.database.get_wiki_asset(int(raw_id))
@@ -280,20 +281,73 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             or not asset.get("local_path")
         ):
             self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
-            return
+            return None
         root = self.server.paths.root.resolve()
         target = Path(str(asset["local_path"])).resolve()
         if root not in target.parents or not target.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
+            return None
+        return asset, target
+
+    def _wiki_resource(self, path: str, query: dict[str, list[str]]) -> None:
+        raw_id = path.removeprefix("/api/wiki/assets/")
+        resolved = self._wiki_asset_target(raw_id)
+        if not resolved:
             return
+        asset, target = resolved
         content_type = asset.get("mime_type") or mimetypes.guess_type(target.name)[0]
+        download = _first(query, "download") == "1"
+        filename = asset.get("filename") or target.name
+        inline = _inline_wiki_mime(content_type)
         self._bytes(
             target.read_bytes(),
             content_type or "application/octet-stream",
-            filename=(asset.get("filename") or target.name)
-            if asset.get("asset_type") == "file"
-            else None,
+            filename=filename if download or not inline else None,
+            allow_same_origin_frame=inline and not download,
         )
+
+    def _wiki_preview(self, path: str) -> None:
+        raw_id = path.removeprefix("/api/wiki/preview/")
+        resolved = self._wiki_asset_target(raw_id)
+        if not resolved:
+            return
+        asset, target = resolved
+        filename = str(asset.get("filename") or target.name)
+        content_type = str(asset.get("mime_type") or mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        asset_url = f"/api/wiki/assets/{raw_id}"
+        download_url = f"{asset_url}?download=1"
+        safe_name = html.escape(filename)
+        safe_type = html.escape(content_type)
+        size_text = html.escape(_format_bytes(int(asset.get("byte_size") or target.stat().st_size)))
+        kind = _wiki_preview_kind(content_type)
+        if kind == "frame":
+            preview = (
+                f'<iframe class="asset-preview-frame" src="{asset_url}" '
+                f'title="{safe_name}"></iframe>'
+            )
+        elif kind == "image":
+            preview = f'<img class="asset-preview-media" src="{asset_url}" alt="{safe_name}">'
+        elif kind == "audio":
+            preview = f'<audio class="asset-preview-media" controls src="{asset_url}"></audio>'
+        elif kind == "video":
+            preview = f'<video class="asset-preview-media" controls src="{asset_url}"></video>'
+        else:
+            preview = (
+                '<div class="asset-preview-empty">当前浏览器不能直接预览此格式。'
+                '文件已经保存在本机，可使用右上角按钮下载并用系统应用打开。</div>'
+            )
+        body = (
+            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{safe_name} - Feishu Archive</title>'
+            '<link rel="stylesheet" href="/static/styles.css"></head>'
+            '<body><main class="asset-preview"><section class="asset-preview-card">'
+            '<header class="asset-preview-head"><div>'
+            f'<h1>{safe_name}</h1><p>{safe_type} · {size_text} · 本机离线文件</p></div>'
+            f'<a class="button" href="{download_url}">下载文件</a></header>{preview}'
+            '</section></main></body></html>'
+        ).encode("utf-8")
+        self._bytes(body, "text/html; charset=utf-8")
 
     def _static(self, name: str) -> None:
         if not name or "/" in name or "\\" in name or name.startswith("."):
@@ -320,6 +374,7 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         *,
         status: HTTPStatus = HTTPStatus.OK,
         filename: str | None = None,
+        allow_same_origin_frame: bool = False,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -328,9 +383,12 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        frame_ancestors = "'self'" if allow_same_origin_frame else "'none'"
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "media-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; "
+            f"frame-ancestors {frame_ancestors}",
         )
         if filename:
             encoded = urllib.parse.quote(filename)
@@ -393,6 +451,39 @@ def _date_to_ms(value: str | None, *, end_of_day: bool = False) -> int | None:
 def _download_name(value: str) -> str:
     allowed = "".join(ch if ch.isalnum() or ch in "-_. " else "_" for ch in value)
     return allowed.strip(" .")[:100] or "feishu-conversation"
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _inline_wiki_mime(content_type: str | None) -> bool:
+    value = str(content_type or "").lower().split(";", 1)[0]
+    return (
+        value.startswith("image/")
+        or value.startswith("audio/")
+        or value.startswith("video/")
+        or value == "application/pdf"
+        or value in {"text/plain", "text/csv", "application/json"}
+    )
+
+
+def _wiki_preview_kind(content_type: str) -> str | None:
+    value = content_type.lower().split(";", 1)[0]
+    if value == "application/pdf" or value in {"text/plain", "text/csv", "application/json"}:
+        return "frame"
+    if value.startswith("image/"):
+        return "image"
+    if value.startswith("audio/"):
+        return "audio"
+    if value.startswith("video/"):
+        return "video"
+    return None
 
 
 def _conversation_html(conversation: dict[str, Any], messages: list[dict[str, Any]]) -> str:

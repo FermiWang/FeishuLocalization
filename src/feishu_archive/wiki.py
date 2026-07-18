@@ -55,6 +55,7 @@ SUPPORTED_METADATA_ONLY_TYPES = {
     "board",
     "file",
 }
+WIKI_RENDER_VERSION = "3"
 
 
 @dataclass
@@ -296,7 +297,11 @@ class WikiSyncer:
             }
             for block in blocks
         ]
-        rendered = render_blocks(blocks, asset_ids)
+        asset_states = {
+            key: self.database.get_wiki_asset(asset_id) or {}
+            for key, asset_id in asset_ids.items()
+        }
+        rendered = render_blocks(blocks, asset_ids, asset_states)
         export_path = self._write_export(obj_token, title, rendered)
         changed = self.database.upsert_wiki_document(
             {
@@ -350,8 +355,8 @@ class WikiSyncer:
         asset = self.database.get_wiki_asset(asset_id) or {}
         downloaded_ok = asset.get("status") == "downloaded"
         rendered = (
-            f'<p><a class="kb-file" href="/api/wiki/assets/{asset_id}">'
-            f'{html.escape(title)}</a></p>'
+            f'<p><a class="kb-file" href="/api/wiki/preview/{asset_id}" '
+            f'target="_blank" rel="noopener">{html.escape(title)}</a></p>'
             if downloaded_ok
             else '<p class="kb-note">文件元数据已保存，但文件内容尚未下载。</p>'
         )
@@ -371,6 +376,62 @@ class WikiSyncer:
                 "raw_json": node,
             }
         )
+
+    def rebuild_views(self, *, force: bool = False) -> dict[str, int | str]:
+        current_version = self.database.get_metadata("wiki_render_version")
+        if current_version == WIKI_RENDER_VERSION and not force:
+            return {
+                "documents_seen": 0,
+                "documents_updated": 0,
+                "documents_skipped": 0,
+                "render_version": WIKI_RENDER_VERSION,
+            }
+        seen = 0
+        updated = 0
+        skipped = 0
+        for document in self.database.list_wiki_documents_for_render():
+            obj_token = str(document["obj_token"])
+            obj_type = str(document.get("obj_type") or "unknown").lower()
+            title = str(document.get("title") or obj_token)
+            assets = self.database.list_wiki_assets(obj_token)
+            asset_ids = {
+                (str(asset["file_token"]), str(asset["asset_type"])): int(asset["id"])
+                for asset in assets
+            }
+            asset_states = {
+                (str(asset["file_token"]), str(asset["asset_type"])): asset
+                for asset in assets
+            }
+            if obj_type == "docx":
+                blocks = self.database.list_wiki_blocks(obj_token)
+                if not blocks:
+                    skipped += 1
+                    continue
+                rendered = render_blocks(blocks, asset_ids, asset_states)
+            elif obj_type == "file":
+                asset = next(
+                    (item for item in assets if item.get("asset_type") == "file"),
+                    None,
+                )
+                rendered = render_file_asset(title, asset)
+            else:
+                skipped += 1
+                continue
+            seen += 1
+            export_path = self._write_export(obj_token, title, rendered)
+            if self.database.update_wiki_rendered_view(
+                obj_token,
+                rendered,
+                local_export_path=str(export_path),
+            ):
+                updated += 1
+        self.database.set_metadata("wiki_render_version", WIKI_RENDER_VERSION)
+        return {
+            "documents_seen": seen,
+            "documents_updated": updated,
+            "documents_skipped": skipped,
+            "render_version": WIKI_RENDER_VERSION,
+        }
 
     def _download_asset(
         self,
@@ -481,6 +542,10 @@ class WikiSyncer:
                 f'/api/wiki/assets/{asset["id"]}',
                 html.escape(relative, quote=True),
             )
+            export_rendered = export_rendered.replace(
+                f'/api/wiki/preview/{asset["id"]}',
+                html.escape(relative, quote=True),
+            )
         page = (
             "<!doctype html><meta charset=\"utf-8\">"
             f"<title>{html.escape(title)}</title>"
@@ -555,12 +620,14 @@ def block_text(block: dict[str, Any]) -> str:
 def render_blocks(
     blocks: Iterable[dict[str, Any]],
     asset_ids: dict[tuple[str, str], int],
+    asset_states: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> str:
+    asset_states = asset_states or {}
     parts: list[str] = []
     ordered_number = 0
     for block in blocks:
         block_type = _optional_int(block.get("block_type")) or 0
-        text_value = html.escape(block_text(block)).replace("\n", "<br>")
+        text_value = _block_rich_text(block)
         if block_type == 1:
             continue
         if block_type == 22:
@@ -569,21 +636,34 @@ def render_blocks(
             payload = block.get("image") or {}
             token = str(payload.get("token") or payload.get("file_token") or "")
             asset_id = asset_ids.get((token, "image"))
-            if asset_id:
-                caption = html.escape(str(payload.get("name") or ""))
+            state = asset_states.get((token, "image"))
+            downloaded = bool(asset_id and (state is None or state.get("status") == "downloaded"))
+            caption = html.escape(str(payload.get("name") or ""))
+            if downloaded:
                 parts.append(
-                    f'<figure><img loading="lazy" src="/api/wiki/assets/{asset_id}" '
-                    f'alt="{caption}">{f"<figcaption>{caption}</figcaption>" if caption else ""}</figure>'
+                    f'<figure><a class="kb-image-link" href="/api/wiki/assets/{asset_id}" '
+                    f'target="_blank" rel="noopener"><img loading="lazy" decoding="async" '
+                    f'src="/api/wiki/assets/{asset_id}" alt="{caption}"></a>'
+                    f'{f"<figcaption>{caption}</figcaption>" if caption else ""}</figure>'
                 )
+            else:
+                detail = html.escape(str((state or {}).get("error") or (state or {}).get("status") or "未下载"))
+                parts.append(f'<div class="kb-resource-placeholder">图片未归档：{detail}</div>')
         elif block_type == 23:
             payload = block.get("file") or {}
             token = str(payload.get("token") or payload.get("file_token") or "")
             asset_id = asset_ids.get((token, "file"))
+            state = asset_states.get((token, "file"))
             label = html.escape(str(payload.get("name") or payload.get("file_name") or "附件"))
-            if asset_id:
+            downloaded = bool(asset_id and (state is None or state.get("status") == "downloaded"))
+            if downloaded:
                 parts.append(
-                    f'<p><a class="kb-file" href="/api/wiki/assets/{asset_id}">{label}</a></p>'
+                    f'<p><a class="kb-file" href="/api/wiki/preview/{asset_id}" '
+                    f'target="_blank" rel="noopener">{label}</a></p>'
                 )
+            else:
+                detail = html.escape(str((state or {}).get("error") or (state or {}).get("status") or "未下载"))
+                parts.append(f'<div class="kb-resource-placeholder">{label}：{detail}</div>')
         elif 3 <= block_type <= 11:
             level = min(block_type - 2, 6)
             if text_value:
@@ -611,6 +691,85 @@ def render_blocks(
             ordered_number = 0
             parts.append(f"<p>{text_value}</p>")
     return "\n".join(parts)
+
+
+def render_file_asset(title: str, asset: dict[str, Any] | None) -> str:
+    label = html.escape(title or "附件")
+    if asset and asset.get("status") == "downloaded":
+        return (
+            f'<p><a class="kb-file" href="/api/wiki/preview/{int(asset["id"])}" '
+            f'target="_blank" rel="noopener">{label}</a></p>'
+        )
+    detail = html.escape(str((asset or {}).get("error") or (asset or {}).get("status") or "未下载"))
+    return f'<div class="kb-resource-placeholder">{label}：{detail}</div>'
+
+
+def _block_rich_text(block: dict[str, Any]) -> str:
+    block_type = _optional_int(block.get("block_type"))
+    name = BLOCK_NAMES.get(block_type or 0)
+    payload = block.get(name) if name else None
+    if not isinstance(payload, dict):
+        return ""
+    elements = payload.get("elements")
+    if isinstance(elements, list):
+        return "".join(_render_element(element) for element in elements)
+    if name == "page":
+        return html.escape(str(payload.get("elements") or payload.get("title") or ""))
+    return ""
+
+
+def _render_element(element: Any) -> str:
+    if not isinstance(element, dict):
+        return ""
+    text_run = element.get("text_run")
+    if isinstance(text_run, dict):
+        content = html.escape(str(text_run.get("content") or "")).replace("\n", "<br>")
+        style = text_run.get("text_element_style") or {}
+        if not isinstance(style, dict):
+            style = {}
+        if style.get("inline_code"):
+            content = f"<code>{content}</code>"
+        if style.get("bold"):
+            content = f"<strong>{content}</strong>"
+        if style.get("italic"):
+            content = f"<em>{content}</em>"
+        if style.get("strikethrough"):
+            content = f"<s>{content}</s>"
+        if style.get("underline"):
+            content = f"<u>{content}</u>"
+        link = style.get("link") or {}
+        url = link.get("url") if isinstance(link, dict) else None
+        safe_url = _safe_external_url(url)
+        if safe_url:
+            content = (
+                f'<a class="kb-external-link" href="{html.escape(safe_url, quote=True)}" '
+                f'target="_blank" rel="noopener noreferrer">{content or html.escape(safe_url)}</a>'
+            )
+        return content
+    mention_doc = element.get("mention_doc")
+    if isinstance(mention_doc, dict):
+        label = html.escape(str(mention_doc.get("title") or mention_doc.get("url") or "知识库文档"))
+        safe_url = _safe_external_url(mention_doc.get("url"))
+        if safe_url:
+            return (
+                f'<a class="kb-external-link" href="{html.escape(safe_url, quote=True)}" '
+                f'target="_blank" rel="noopener noreferrer">{label}</a>'
+            )
+        return label
+    return html.escape(_element_text(element)).replace("\n", "<br>")
+
+
+def _safe_external_url(value: Any) -> str | None:
+    url = str(value or "").strip()
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme:
+        url = urllib.parse.unquote(url)
+        parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return url
 
 
 def _element_text(element: Any) -> str:

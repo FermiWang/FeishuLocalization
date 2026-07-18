@@ -139,6 +139,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ATTACHMENT_BYTES / 1024**3,
     )
 
+    wiki_rebuild = subparsers.add_parser(
+        "wiki-rebuild",
+        help="使用本地原始内容块重建知识库正文，无需访问飞书",
+    )
+    wiki_rebuild.add_argument("--force", action="store_true", help="即使渲染版本未变化也重新生成")
+
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
     reader.add_argument("--host", default="127.0.0.1")
     reader.add_argument("--port", type=int, default=DEFAULT_READER_PORT)
@@ -253,6 +259,14 @@ def main(argv: list[str] | None = None) -> None:
             for item in spaces:
                 print(f"{item.get('space_id')}\t{item.get('name') or '(未命名)'}")
             print(f"共发现 {len(spaces)} 个知识空间。")
+        elif args.command == "wiki-rebuild":
+            result = WikiSyncer(database, None, paths).rebuild_views(force=args.force)
+            print(
+                f"知识库正文重建完成：检查 {result['documents_seen']} 篇，"
+                f"更新 {result['documents_updated']} 篇，"
+                f"跳过 {result['documents_skipped']} 篇，"
+                f"渲染版本 {result['render_version']}"
+            )
         elif args.command in {"wiki-sync", "wiki-scheduled-sync"}:
             max_bytes = int(args.max_asset_gib * 1024**3)
             if max_bytes < 0:

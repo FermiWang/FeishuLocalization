@@ -82,6 +82,19 @@ class WebTests(unittest.TestCase):
                 byte_size=len(image_payload),
                 local_path=str(wiki_asset_path),
             )
+            wiki_file_asset_id = database.ensure_wiki_asset(
+                "doc_1", "asset_pdf", "file", filename="证据清单.pdf"
+            )
+            wiki_file_payload = b"%PDF-1.4\n% offline test"
+            wiki_file_path = paths.knowledge_assets / "evidence.pdf"
+            wiki_file_path.write_bytes(wiki_file_payload)
+            database.update_wiki_asset(
+                wiki_file_asset_id,
+                status="downloaded",
+                mime_type="application/pdf",
+                byte_size=len(wiki_file_payload),
+                local_path=str(wiki_file_path),
+            )
             starts = []
             wiki_starts = []
             server = ArchiveHTTPServer(
@@ -102,7 +115,11 @@ class WebTests(unittest.TestCase):
                     self.assertIn("Feishu Archive", body)
                     self.assertIn("立即同步", body)
                     self.assertIn("知识库", body)
+                    self.assertIn('id="wiki-node-view"', body)
+                    self.assertIn('id="wiki-back"', body)
                     self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
+                    self.assertIn("frame-src 'self'", response.headers["Content-Security-Policy"])
+                    self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/messages?chat_id=demo_internal", timeout=2
                 ) as response:
@@ -130,6 +147,7 @@ class WebTests(unittest.TestCase):
                     script = response.read().decode()
                     self.assertIn("message-image", script)
                     self.assertIn("/api/images/", script)
+                    self.assertIn("showWikiNodeList", script)
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/sync/status", timeout=2
                 ) as response:
@@ -162,6 +180,27 @@ class WebTests(unittest.TestCase):
                 ) as response:
                     self.assertEqual(response.headers["Content-Type"], "image/png")
                     self.assertEqual(response.read(), image_payload)
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/wiki/preview/{wiki_file_asset_id}", timeout=2
+                ) as response:
+                    preview = response.read().decode()
+                    self.assertIn("证据清单.pdf", preview)
+                    self.assertIn("asset-preview-frame", preview)
+                    self.assertIn(f"/api/wiki/assets/{wiki_file_asset_id}", preview)
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/wiki/assets/{wiki_file_asset_id}", timeout=2
+                ) as response:
+                    self.assertEqual(response.headers["Content-Type"], "application/pdf")
+                    self.assertIsNone(response.headers["Content-Disposition"])
+                    self.assertIn("frame-ancestors 'self'", response.headers["Content-Security-Policy"])
+                    self.assertEqual(response.read(), wiki_file_payload)
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/wiki/assets/{wiki_file_asset_id}?download=1",
+                    timeout=2,
+                ) as response:
+                    self.assertIn("attachment", response.headers["Content-Disposition"])
+                    self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+                    self.assertEqual(response.read(), wiki_file_payload)
                 sync_request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/sync",
                     method="POST",

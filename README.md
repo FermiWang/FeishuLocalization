@@ -38,6 +38,7 @@ Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞�
 - SQLite FTS5 支持按会话、日期、人员、消息类型和正文搜索。
 - 同步用户可见的知识空间与目录树；新版文档保存正文、文档块、内嵌图片和附件，普通文件节点保存文件本体。
 - 为知识库建立独立 FTS5 索引，并为每篇新版文档生成本地 HTML 副本。
+- 知识库阅读采用“左侧空间、右侧节点目录、点击节点查看正文”的三级导航；图片在正文内显示，网页和文件从新窗口打开。
 - 未适配的旧版文档、表格、多维表格、思维笔记、幻灯片等保留目录元数据并标记为“仅目录”。
 - 保存本人和其他人发送的图片并直接显示；普通文件只归档其他人或机器人发送的文件。
 - 单个资源限制为 100 MB；消息资源和知识库资源分别设置本地总容量上限。
@@ -201,7 +202,16 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 # 只同步一个知识空间，或强制重新生成文档
 ./bin/feishu-archive wiki-sync --space-id spc_xxx
 ./bin/feishu-archive wiki-sync --force
+
+# 只使用本地原始内容块升级正文显示，不访问飞书也不重新下载附件
+./bin/feishu-archive wiki-rebuild
+
+# 排查或开发时强制重建，即使渲染版本未变化
+./bin/feishu-archive wiki-rebuild --force
 ```
+
+`wiki-rebuild` 用于阅读器升级后的本地迁移。它会保留已有消息、知识空间、正文原始块和资源文件，只重新生成正文 HTML 与离线导出。
+macOS 的 `scripts/install-local.sh` 会在启动新版阅读器前自动执行一次；渲染版本没有变化时会直接跳过。
 
 ### 6. 安装 macOS 后台服务
 
@@ -405,6 +415,7 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 | OAuth 后仍提示缺少权限 | 在开放平台发布新增权限后重新执行 `auth`；旧令牌不会自动获得新权限。 |
 | 单聊数量明显少于飞书客户端 | 群列表接口不返回单聊；需要 `search:message`，且超出租户保留期或不可搜索的单聊仍无法发现。 |
 | 图片或附件缺失 | 检查机器人是否在会话内、资源是否超过 100 MB、是否受防泄密策略限制，并运行 `attachments --workers 4`。 |
+| 知识空间有节点数量但正文显示方式仍旧 | 运行 `wiki-rebuild`，使用已保存的原始内容块重建正文；无需执行 `wiki-sync --force`。 |
 | `Address already in use` | `8765` 或 `8766` 已被占用；停止旧进程，或为前台测试指定其他端口并同步修改飞书回调地址。 |
 | Linux 提示找不到 `/usr/bin/security` | 当前真实 OAuth 不支持 Linux；只能运行演示或阅读器，不能用明文脚本伪造钥匙串。 |
 | Windows 提示没有 `fcntl` | 原生 Windows 尚未支持；改用 WSL2 运行演示，或先完成跨平台锁改造。 |
