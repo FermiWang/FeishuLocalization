@@ -7,6 +7,7 @@ from pathlib import Path
 
 from feishu_archive.config import ArchivePaths
 from feishu_archive.database import ArchiveDatabase
+from feishu_archive.feishu import FeishuAPIError
 from feishu_archive.sync import ArchiveSyncer
 
 
@@ -146,6 +147,27 @@ class DiscoverClient(FakeClient):
         }
 
 
+class ExpiredSearchTokenClient(DiscoverClient):
+    def iter_message_search_pages(self, *, chat_type, page_token=None):
+        self.calls.append(("search", chat_type, page_token))
+        if page_token:
+            raise FeishuAPIError(
+                "飞书 API /im/v1/messages/search 返回错误："
+                "page_token is invalid or expired, please start a new search"
+            )
+        yield {
+            "items": [
+                {
+                    "meta_data": {
+                        "chat_id": "oc_p2p",
+                        "is_p2p_chat": True,
+                    }
+                }
+            ],
+            "has_more": False,
+        }
+
+
 class SyncTests(unittest.TestCase):
     def test_discover_combines_groups_and_p2p_search(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -166,6 +188,45 @@ class SyncTests(unittest.TestCase):
             conversations = {item["chat_id"]: item for item in database.list_conversations()}
             self.assertEqual(conversations["oc_p2p"]["name"], "对方用户")
             self.assertEqual(conversations["oc_p2p"]["chat_mode"], "p2p")
+
+    def test_discover_restarts_search_when_saved_page_token_expired(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            database.set_sync_state(
+                "discovery",
+                "p2p_message_search",
+                window_start=None,
+                window_end=None,
+                page_token="expired-token",
+                status="error",
+                error="previous request failed",
+            )
+            client = ExpiredSearchTokenClient()
+            syncer = ArchiveSyncer(
+                database,
+                client,
+                paths,
+                max_attachment_bytes=1024 * 1024,
+            )
+
+            chats = syncer.discover()
+
+            search_calls = [call for call in client.calls if call[0] == "search"]
+            self.assertEqual(
+                search_calls,
+                [
+                    ("search", "p2p", "expired-token"),
+                    ("search", "p2p", None),
+                ],
+            )
+            self.assertIn("oc_p2p", {item["chat_id"] for item in chats})
+            state = database.get_sync_state("discovery", "p2p_message_search")
+            self.assertEqual(state["status"], "success")
+            self.assertIsNone(state["page_token"])
+            self.assertIsNone(state["error"])
 
     def test_chat_thread_and_attachment_vertical_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
