@@ -64,53 +64,85 @@ class ArchiveSyncer:
             resume_token = str(discovery_state.get("page_token") or "").strip() or None
 
         p2p_chat_ids = dict.fromkeys(self.database.conversation_ids("p2p"))
-        try:
-            for page in self.client.iter_message_search_pages(
-                chat_type="p2p",
-                page_token=resume_token,
-            ):
-                for item in page.get("items") or []:
-                    metadata = item.get("meta_data") or {}
-                    chat_id = str(metadata.get("chat_id") or "").strip()
-                    if not chat_id or not bool(metadata.get("is_p2p_chat")):
-                        continue
-                    if chat_id not in p2p_chat_ids:
-                        p2p_chat_ids[chat_id] = None
-                        self.database.upsert_conversation(
-                            {
-                                "chat_id": chat_id,
-                                "name": f"单聊 {chat_id[-8:]}",
-                                "chat_mode": "p2p",
-                                "chat_type": "private",
-                                "status": "active",
-                                "discovered_via": "message_search",
-                            }
-                        )
-                has_more = bool(page.get("has_more"))
-                resume_token = (
-                    str(page.get("page_token") or "").strip() or None
-                    if has_more
-                    else None
-                )
+        restarted_search = False
+        while True:
+            try:
+                for page in self.client.iter_message_search_pages(
+                    chat_type="p2p",
+                    page_token=resume_token,
+                ):
+                    for item in page.get("items") or []:
+                        metadata = item.get("meta_data") or {}
+                        chat_id = str(metadata.get("chat_id") or "").strip()
+                        if not chat_id or not bool(metadata.get("is_p2p_chat")):
+                            continue
+                        if chat_id not in p2p_chat_ids:
+                            p2p_chat_ids[chat_id] = None
+                            self.database.upsert_conversation(
+                                {
+                                    "chat_id": chat_id,
+                                    "name": f"单聊 {chat_id[-8:]}",
+                                    "chat_mode": "p2p",
+                                    "chat_type": "private",
+                                    "status": "active",
+                                    "discovered_via": "message_search",
+                                }
+                            )
+                    has_more = bool(page.get("has_more"))
+                    resume_token = (
+                        str(page.get("page_token") or "").strip() or None
+                        if has_more
+                        else None
+                    )
+                    self.database.set_sync_state(
+                        discovery_type,
+                        discovery_id,
+                        window_start=None,
+                        window_end=None,
+                        page_token=resume_token,
+                        status="running" if has_more else "success",
+                    )
+                break
+            except FeishuAPIError as exc:
+                if (
+                    resume_token
+                    and not restarted_search
+                    and self._is_invalid_page_token_error(exc)
+                ):
+                    # Feishu search cursors are short lived. A cursor retained after a
+                    # network/rate-limit failure may be expired by the next scheduled run.
+                    resume_token = None
+                    restarted_search = True
+                    self.database.set_sync_state(
+                        discovery_type,
+                        discovery_id,
+                        window_start=None,
+                        window_end=None,
+                        page_token=None,
+                        status="running",
+                    )
+                    continue
                 self.database.set_sync_state(
                     discovery_type,
                     discovery_id,
                     window_start=None,
                     window_end=None,
                     page_token=resume_token,
-                    status="running" if has_more else "success",
+                    status="error",
+                    error=str(exc),
                 )
-        except Exception as exc:
-            self.database.set_sync_state(
-                discovery_type,
-                discovery_id,
-                window_start=None,
-                window_end=None,
-                page_token=resume_token,
-                status="error",
-                error=str(exc),
-            )
-            raise
+                raise
+            except Exception as exc:
+                self.database.set_sync_state(
+                    discovery_type,
+                    discovery_id,
+                    window_start=None,
+                    window_end=None,
+                    page_token=resume_token,
+                    status="error",
+                    error=str(exc),
+                )
+                raise
 
         for chat_id in p2p_chat_ids:
             self.database.ensure_conversation(chat_id)
@@ -131,6 +163,13 @@ class ArchiveSyncer:
             self.database.upsert_conversation(item)
             chats.append(item)
         return chats
+
+    @staticmethod
+    def _is_invalid_page_token_error(exc: FeishuAPIError) -> bool:
+        message = str(exc).lower()
+        return "page_token" in message and any(
+            marker in message for marker in ("invalid", "expired", "无效", "过期")
+        )
 
     def sync(
         self,

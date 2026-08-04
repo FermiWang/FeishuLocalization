@@ -1,5 +1,7 @@
+import io
 import time
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 from feishu_archive.config import FeishuAppConfig
@@ -138,6 +140,31 @@ class FeishuClientTests(unittest.TestCase):
 
         self.assertEqual(result["data"]["ok"], True)
         self.assertEqual(opener.call_count, 2)
+
+    def test_json_request_retries_http_400_rate_limit(self) -> None:
+        client = RecordingClient()
+        client.token_store.set(client.account("access_token"), "user-token")
+        client.token_store.set(client.account("access_expires_at"), str(int(time.time()) + 3600))
+
+        rate_limit = urllib.error.HTTPError(
+            "https://open.feishu.cn/open-apis/test",
+            400,
+            "Bad Request",
+            {"Retry-After": "0"},
+            io.BytesIO(b'{"code":99991400,"msg":"too many request"}'),
+        )
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"code":0,"data":{"ok":true}}'
+        with patch(
+            "feishu_archive.feishu.urllib.request.urlopen",
+            side_effect=[rate_limit, response],
+        ) as opener, patch("feishu_archive.feishu.time.sleep") as sleeper:
+            result = FeishuClient._json_request(client, "GET", "/test")
+
+        self.assertEqual(result["data"]["ok"], True)
+        self.assertEqual(opener.call_count, 2)
+        sleeper.assert_called_once_with(0.0)
 
 
 if __name__ == "__main__":

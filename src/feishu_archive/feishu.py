@@ -418,18 +418,30 @@ class FeishuClient:
                 ) as response:
                     result = json.loads(response.read().decode("utf-8"))
                 if int(result.get("code") or 0) != 0:
-                    raise FeishuAPIError(
+                    error = FeishuAPIError(
                         f"飞书 API {path} 返回错误：{result.get('msg') or 'unknown'}",
                         code=int(result.get("code") or 0),
                     )
+                    if self._is_rate_limit_error(error) and attempt < 3:
+                        time.sleep(min(2**attempt, 10))
+                        continue
+                    raise error
                 return result
             except urllib.error.HTTPError as exc:
-                if exc.code == 429 or 500 <= exc.code < 600:
-                    if attempt < 3:
-                        delay = min(float(exc.headers.get("Retry-After") or 2**attempt), 10)
-                        time.sleep(delay)
-                        continue
-                raise self._http_error(exc) from exc
+                error = self._http_error(exc)
+                if (
+                    exc.code == 429
+                    or 500 <= exc.code < 600
+                    or self._is_rate_limit_error(error)
+                ) and attempt < 3:
+                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                    try:
+                        delay = float(retry_after) if retry_after else float(2**attempt)
+                    except ValueError:
+                        delay = float(2**attempt)
+                    time.sleep(min(delay, 10))
+                    continue
+                raise error from exc
             except urllib.error.URLError as exc:
                 if attempt < 3:
                     time.sleep(min(2**attempt, 5))
@@ -441,6 +453,14 @@ class FeishuClient:
                     continue
                 raise FeishuAPIError("飞书 API 网络请求失败：请求超时") from exc
         raise FeishuAPIError("飞书 API 请求重试次数已用尽")
+
+    @staticmethod
+    def _is_rate_limit_error(exc: FeishuAPIError) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in ("too many request", "rate limit", "frequency limit", "频率限制")
+        )
 
     @staticmethod
     def _http_error(exc: urllib.error.HTTPError) -> FeishuAPIError:
