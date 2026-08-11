@@ -416,6 +416,7 @@ class FeishuClient:
         if auth:
             headers["Authorization"] = f"Bearer {self.user_access_token()}"
 
+        refreshed_after_unauthorized = False
         for attempt in range(4):
             request = urllib.request.Request(url, data=body, method=method, headers=headers)
             try:
@@ -437,6 +438,17 @@ class FeishuClient:
                 return result
             except urllib.error.HTTPError as exc:
                 error = self._http_error(exc)
+                if (
+                    exc.code == 401
+                    and auth
+                    and not refreshed_after_unauthorized
+                    and attempt < 3
+                ):
+                    headers["Authorization"] = (
+                        f"Bearer {self.refresh_user_token().access_token}"
+                    )
+                    refreshed_after_unauthorized = True
+                    continue
                 if (
                     exc.code == 429
                     or 500 <= exc.code < 600

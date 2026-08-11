@@ -222,6 +222,41 @@ class FeishuClientTests(unittest.TestCase):
         self.assertEqual(opener.call_count, 2)
         sleeper.assert_called_once_with(0.0)
 
+    def test_json_request_refreshes_once_after_http_401(self) -> None:
+        client = RecordingClient()
+        client.token_store.set(client.account("access_token"), "expired-token")
+        client.token_store.set(client.account("access_expires_at"), str(int(time.time()) + 3600))
+
+        unauthorized = urllib.error.HTTPError(
+            "https://open.feishu.cn/open-apis/test",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(
+                b'{"code":99991663,"msg":"Authentication token expired"}'
+            ),
+        )
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"code":0,"data":{"ok":true}}'
+        refreshed = MagicMock(access_token="fresh-token")
+        with patch(
+            "feishu_archive.feishu.urllib.request.urlopen",
+            side_effect=[unauthorized, response],
+        ) as opener, patch.object(
+            client, "refresh_user_token", return_value=refreshed
+        ) as refresh:
+            result = FeishuClient._json_request(client, "GET", "/test")
+
+        self.assertEqual(result["data"]["ok"], True)
+        refresh.assert_called_once_with()
+        self.assertEqual(opener.call_count, 2)
+        retried_request = opener.call_args_list[1].args[0]
+        self.assertEqual(
+            retried_request.get_header("Authorization"),
+            "Bearer fresh-token",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
