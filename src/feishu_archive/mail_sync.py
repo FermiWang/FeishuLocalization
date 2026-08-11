@@ -36,6 +36,7 @@ MAIL_BATCH_RETRY_DELAYS = (0.25, 1.0)
 MAIL_LIST_MIN_INTERVAL_SECONDS = 0.11
 MAIL_BATCH_MIN_INTERVAL_SECONDS = 0.11
 MAIL_ATTACHMENT_URL_MIN_INTERVAL_SECONDS = 1.05
+MAIL_ATTACHMENT_URL_BATCH_SIZE = 20
 
 SYSTEM_MAIL_FOLDERS = (
     ("INBOX", "收件箱", "inbox"),
@@ -200,6 +201,7 @@ class MailSyncer:
                         "run_id": run_id,
                         "label_id": folder.list_label_id,
                     }
+                    listed_message_ids = 0
                     self.database.set_sync_state(
                         mailbox_row_id,
                         scope,
@@ -208,7 +210,7 @@ class MailSyncer:
                         extra=state_extra,
                     )
                     try:
-                        self._scan_folder_pages(
+                        listed_message_ids = self._scan_folder_pages(
                             mailbox_row_id,
                             mailbox_address,
                             folder,
@@ -246,6 +248,7 @@ class MailSyncer:
                             **state_extra,
                             "pages": counts.pages_scanned - pages_before,
                             "message_ids": counts.message_ids_seen - ids_before,
+                            "listed_message_ids": listed_message_ids,
                         },
                     )
             else:
@@ -305,7 +308,7 @@ class MailSyncer:
         page_budget: list[int],
         *,
         skip_attachments: bool,
-    ) -> None:
+    ) -> int:
         try:
             self._scan_window_pages(
                 mailbox_row_id,
@@ -423,7 +426,7 @@ class MailSyncer:
         page_budget: list[int],
         *,
         skip_attachments: bool,
-    ) -> None:
+    ) -> int:
         page_token: str | None = None
         folder_message_ids: list[str] = []
         folder_seen_ids: set[str] = set()
@@ -473,6 +476,7 @@ class MailSyncer:
                 fallback_folder_id=folder.provider_folder_id,
                 skip_attachments=skip_attachments,
             )
+        return len(folder_message_ids)
 
     def _ingest_message_ids(
         self,
@@ -726,11 +730,18 @@ class MailSyncer:
             )
             return
         attachment_ids = [str(item[1].get("attachment_id") or "") for item in pending]
-        urls = self._attachment_download_urls(
-            mailbox_address,
-            provider_message_id,
-            [item for item in attachment_ids if item],
-        )
+        urls: dict[str, str] = {}
+        requested_attachment_ids = [item for item in attachment_ids if item]
+        for offset in range(0, len(requested_attachment_ids), MAIL_ATTACHMENT_URL_BATCH_SIZE):
+            urls.update(
+                self._attachment_download_urls(
+                    mailbox_address,
+                    provider_message_id,
+                    requested_attachment_ids[
+                        offset : offset + MAIL_ATTACHMENT_URL_BATCH_SIZE
+                    ],
+                )
+            )
         for attachment_row_id, metadata in pending:
             attachment_id = str(metadata.get("attachment_id") or "")
             url = urls.get(attachment_id)

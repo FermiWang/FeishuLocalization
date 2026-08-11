@@ -473,6 +473,21 @@ class MailSyncTests(unittest.TestCase):
             [(item["folder_id"], item["page_token"]) for item in listings],
             [("folder-a", None), ("folder-a", "20"), ("folder-b", None)],
         )
+        list_and_batch_calls = [
+            name
+            for name, _arguments in self.provider.calls
+            if name in {"list_message_ids", "batch_get_messages"}
+        ]
+        self.assertEqual(
+            list_and_batch_calls,
+            [
+                "list_message_ids",
+                "list_message_ids",
+                "batch_get_messages",
+                "batch_get_messages",
+                "list_message_ids",
+            ],
+        )
         batch_calls = [
             arguments
             for name, arguments in self.provider.calls
@@ -489,6 +504,11 @@ class MailSyncTests(unittest.TestCase):
         self.assertEqual(counts.messages_seen, 21)
         self.assertEqual(counts.messages_written, 21)
         self.assertEqual(self.database.status()["messages"], 21)
+        mailbox = self.database.list_mailboxes()[0]
+        folder_b_state = self.database.get_sync_state(mailbox["id"], "folder:folder-b")
+        folder_b_extra = json.loads(folder_b_state["extra_json"])
+        self.assertEqual(folder_b_extra["listed_message_ids"], 2)
+        self.assertEqual(folder_b_extra["message_ids"], 0)
 
     def test_full_history_uses_enumerated_folder_when_message_detail_omits_folder(self) -> None:
         self.provider.folders = [
@@ -550,6 +570,46 @@ class MailSyncTests(unittest.TestCase):
             [item["provider_folder_id"] for item in detail["folders"]],
             ["SCHEDULED"],
         )
+
+    def test_attachment_url_requests_are_paced_in_batches_of_twenty(self) -> None:
+        attachments = [
+            {"id": f"attachment-{index:02d}", "filename": f"file-{index:02d}.bin"}
+            for index in range(21)
+        ]
+        self.provider.messages["msg-1"]["attachments"] = attachments
+        self.provider.attachment_urls["msg-1"] = {
+            item["id"]: f"https://download.example.com/{item['id']}"
+            for item in attachments
+        }
+        self.provider.downloads = {
+            url: attachment_id.encode("ascii")
+            for attachment_id, url in self.provider.attachment_urls["msg-1"].items()
+        }
+
+        with (
+            patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage),
+            patch.object(MailSyncer, "_pace_request") as pace_request,
+        ):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["INBOX"], days=1
+            )
+
+        url_calls = [
+            arguments
+            for name, arguments in self.provider.calls
+            if name == "attachment_download_urls"
+        ]
+        self.assertEqual(
+            [len(arguments["attachment_ids"]) for arguments in url_calls],
+            [20, 1],
+        )
+        attachment_pacing = [
+            call
+            for call in pace_request.call_args_list
+            if call.args[0] == "_last_attachment_url_request_at"
+        ]
+        self.assertEqual(len(attachment_pacing), 2)
+        self.assertEqual(counts.attachments_downloaded, 21)
 
     def test_full_history_ignores_unrelated_invalid_folder_tree_for_explicit_id(self) -> None:
         self.provider.folders = [
