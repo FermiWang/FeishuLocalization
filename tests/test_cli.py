@@ -112,8 +112,13 @@ class AppConfigTests(unittest.TestCase):
     def test_mail_lane_has_independent_sync_and_reader_commands(self) -> None:
         sync_args = build_parser().parse_args(["mail-sync"])
         self.assertEqual(sync_args.days, 30)
+        self.assertEqual(sync_args.max_pages, 5000)
         self.assertIsNone(sync_args.folder)
         self.assertFalse(sync_args.skip_attachments)
+        scoped_args = build_parser().parse_args(
+            ["mail-sync", "--folder", "DRAFT", "--folder", "7421369296749756417"]
+        )
+        self.assertEqual(scoped_args.folder, ["DRAFT", "7421369296749756417"])
         reader_args = build_parser().parse_args(["mail-reader-url", "--open"])
         self.assertTrue(reader_args.open)
 

@@ -131,7 +131,19 @@ class MailSyncTests(unittest.TestCase):
             self.assertEqual(oct(blob_path.stat().st_mode & 0o777), "0o600")
 
         folder_ids = {item["provider_folder_id"] for item in self.database.list_folders(mailbox["id"])}
-        self.assertEqual(folder_ids, {"projects", "INBOX", "SENT"})
+        self.assertEqual(
+            folder_ids,
+            {
+                "projects",
+                "INBOX",
+                "SENT",
+                "DRAFT",
+                "SCHEDULED",
+                "TRASH",
+                "SPAM",
+                "ARCHIVED",
+            },
+        )
         status = self.database.status()
         self.assertEqual(status["downloaded_attachments"], 2)
         self.assertEqual(status["latest_sync"]["status"], "success")
@@ -154,6 +166,23 @@ class MailSyncTests(unittest.TestCase):
             sum(name == "open_download_url" for name, _ in self.provider.calls),
             download_calls_after_first,
         )
+
+    def test_duplicate_message_ids_in_one_page_are_ingested_once(self) -> None:
+        self.provider.search_message_ids = ["msg-1", "msg-1"]
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["INBOX"], days=1
+            )
+
+        batch_calls = [
+            arguments
+            for name, arguments in self.provider.calls
+            if name == "batch_get_messages"
+        ]
+        self.assertEqual(batch_calls[0]["message_ids"], ["msg-1"])
+        self.assertEqual(counts.messages_seen, 1)
+        self.assertEqual(self.database.status()["messages"], 1)
 
     def test_overlap_sync_repairs_same_size_corrupted_cas_attachment(self) -> None:
         with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
@@ -228,7 +257,9 @@ class MailSyncTests(unittest.TestCase):
             "message_state": 2,
         }
         with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
-            MailSyncer(self.database, self.provider, self.paths).sync(folders=[""], days=1)
+            MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["INBOX"], days=1
+            )
 
         after = self.database.get_message(message_id)
         for key in (
@@ -271,6 +302,161 @@ class MailSyncTests(unittest.TestCase):
         latest = self.database.latest_sync_run()
         self.assertEqual(latest["status"], "partial")
         self.assertIn("未返回下载地址", latest["error"])
+
+    def test_default_sync_searches_every_system_and_nested_custom_folder(self) -> None:
+        self.provider.folders = [
+            {
+                "id": "project-root",
+                "name": "ProjectX",
+                "parent_folder_id": "0",
+                "folder_type": 2,
+            },
+            {
+                "id": "project-year",
+                "name": "FY2026",
+                "parent_folder_id": "project-root",
+                "folder_type": 2,
+            },
+        ]
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(days=1)
+
+        searches = [
+            arguments for name, arguments in self.provider.calls if name == "search_messages"
+        ]
+        self.assertEqual(
+            [arguments["folder"] for arguments in searches],
+            [
+                "inbox",
+                "sent",
+                "draft",
+                "scheduled",
+                "trash",
+                "spam",
+                "archive",
+                "ProjectX",
+                "ProjectX/FY2026",
+            ],
+        )
+        self.assertEqual(counts.windows_scanned, 9)
+        self.assertEqual(counts.folders_seen, 9)
+        mailbox = self.database.list_mailboxes()[0]
+        self.assertEqual(
+            {item["provider_folder_id"] for item in self.database.list_folders(mailbox["id"])},
+            {
+                "INBOX",
+                "SENT",
+                "DRAFT",
+                "SCHEDULED",
+                "TRASH",
+                "SPAM",
+                "ARCHIVED",
+                "project-root",
+                "project-year",
+            },
+        )
+
+    def test_explicit_custom_folder_id_resolves_to_name_and_unknown_id_fails(self) -> None:
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["DRAFT", "projects"], days=1
+            )
+
+        searches = [
+            arguments for name, arguments in self.provider.calls if name == "search_messages"
+        ]
+        self.assertEqual(
+            [arguments["folder"] for arguments in searches],
+            ["draft", "Projects"],
+        )
+        self.assertEqual(counts.messages_seen, 0)
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            with self.assertRaisesRegex(ValueError, "未找到邮件文件夹"):
+                MailSyncer(self.database, self.provider, self.paths).sync(
+                    folders=["missing-folder"], days=1
+                )
+
+    def test_exact_mixed_case_custom_name_wins_over_system_alias(self) -> None:
+        self.provider.folders.append(
+            {
+                "id": "custom-inbox",
+                "name": "Inbox",
+                "parent_folder_id": "0",
+                "folder_type": 2,
+            }
+        )
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["Inbox"], days=1
+            )
+
+        search = next(
+            arguments for name, arguments in self.provider.calls if name == "search_messages"
+        )
+        self.assertEqual(search["folder"], "Inbox")
+
+    def test_custom_folder_named_like_uppercase_system_id_uses_its_exact_name(self) -> None:
+        self.provider.folders.append(
+            {
+                "id": "custom-uppercase-inbox",
+                "name": "INBOX",
+                "parent_folder_id": "0",
+                "folder_type": 2,
+            }
+        )
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["custom-uppercase-inbox"], days=1
+            )
+
+        search = next(
+            arguments for name, arguments in self.provider.calls if name == "search_messages"
+        )
+        self.assertEqual(search["folder"], "INBOX")
+
+    def test_unavailable_message_id_is_retried_immediately_in_the_same_window(self) -> None:
+        recovered_message = dict(self.provider.messages["msg-1"])
+        with (
+            patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage),
+            patch("feishu_archive.mail_sync.time.sleep"),
+            patch.object(
+                self.provider,
+                "batch_get_messages",
+                side_effect=[
+                    {"messages": [], "unavailable_message_ids": ["msg-1"]},
+                    {"messages": [recovered_message], "unavailable_message_ids": []},
+                ],
+            ) as batch_get,
+        ):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["INBOX"], days=1
+            )
+
+        self.assertEqual(batch_get.call_count, 2)
+        self.assertEqual(counts.messages_written, 1)
+        self.assertEqual(self.database.status()["messages"], 1)
+        self.assertEqual(self.database.latest_sync_run()["status"], "success")
+
+    def test_invalid_custom_folder_tree_fails_before_database_writes(self) -> None:
+        self.provider.folders = [
+            {
+                "id": "orphan",
+                "name": "Child",
+                "parent_folder_id": "missing-parent",
+                "folder_type": 2,
+            }
+        ]
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            with self.assertRaisesRegex(ValueError, "父文件夹不存在"):
+                MailSyncer(self.database, self.provider, self.paths).sync(days=1)
+
+        self.assertEqual(self.database.list_mailboxes(), [])
+        self.assertIsNone(self.database.latest_sync_run())
 
 
 if __name__ == "__main__":

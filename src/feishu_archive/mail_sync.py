@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from .config import (
     DEFAULT_MAIL_INITIAL_DAYS,
+    DEFAULT_MAIL_MAX_PAGES,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
     MAIL_SCOPES,
@@ -31,6 +32,17 @@ MAIL_SEARCH_PAGE_LIMIT = 1231022
 MAIL_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 MAIL_HARD_STOP_FREE_BYTES = 75 * 1024**3
 MAIL_ATTACHMENT_STOP_FREE_BYTES = 100 * 1024**3
+MAIL_BATCH_RETRY_DELAYS = (0.25, 1.0)
+
+SYSTEM_MAIL_FOLDERS = (
+    ("INBOX", "收件箱", "inbox"),
+    ("SENT", "已发送", "sent"),
+    ("DRAFT", "草稿", "draft"),
+    ("SCHEDULED", "定时发送", "scheduled"),
+    ("TRASH", "垃圾箱", "trash"),
+    ("SPAM", "垃圾邮件", "spam"),
+    ("ARCHIVED", "已归档", "archive"),
+)
 
 
 class MailSyncPartialError(RuntimeError):
@@ -102,7 +114,7 @@ class MailSyncer:
         days: int = DEFAULT_MAIL_INITIAL_DAYS,
         skip_attachments: bool = False,
         trigger: str = "manual",
-        max_pages: int = 500,
+        max_pages: int = DEFAULT_MAIL_MAX_PAGES,
     ) -> MailSyncCounts:
         if days < 1:
             raise ValueError("days 必须大于 0")
@@ -124,23 +136,28 @@ class MailSyncer:
                 "primary_email_address": mailbox_address,
             }
         )
-        mailbox_row_id = self.database.upsert_mailbox(profile)
-
-        folder_items = [dict(item) for item in self.provider.list_folders(mailbox_address)]
-        known_folder_ids = {str(item.get("id") or "").upper() for item in folder_items}
-        for folder_id, name in (("INBOX", "收件箱"), ("SENT", "已发送")):
-            if folder_id not in known_folder_ids:
+        folder_items = _deduplicate_folder_items(
+            dict(item) for item in self.provider.list_folders(mailbox_address)
+        )
+        known_folder_ids = {
+            str(item.get("id") or "").strip().casefold() for item in folder_items
+        }
+        for folder_id, name, _search_name in SYSTEM_MAIL_FOLDERS:
+            if folder_id.casefold() not in known_folder_ids:
                 folder_items.append(
                     {
                         "id": folder_id,
                         "name": name,
-                        "folder_type": "system",
+                        "folder_type": 1,
                         "local_system_folder": True,
                     }
                 )
+                known_folder_ids.add(folder_id.casefold())
+        selected_folders = _selected_folder_search_values(folder_items, folders)
+
+        mailbox_row_id = self.database.upsert_mailbox(profile)
         self.database.replace_folders(mailbox_row_id, folder_items)
         counts = MailSyncCounts(folders_seen=len(folder_items))
-        selected_folders = tuple(dict.fromkeys(item.upper() for item in (folders or ("INBOX", "SENT"))))
 
         now = datetime.now().astimezone().replace(microsecond=0)
         start = now - timedelta(days=days)
@@ -272,7 +289,7 @@ class MailSyncer:
             try:
                 page = self.provider.search_messages(
                     mailbox_address,
-                    folder=folder.casefold(),
+                    folder=folder,
                     start_time=start.isoformat(timespec="seconds"),
                     end_time=end.isoformat(timespec="seconds"),
                     page_token=page_token,
@@ -294,19 +311,19 @@ class MailSyncer:
             message_ids = [str(item) for item in page.get("message_ids") or [] if item]
             if not message_ids:
                 message_ids = _message_ids_from_items(page.get("items") or [])
-            unique_ids = [item for item in message_ids if item not in seen_ids]
+            unique_ids = [
+                item for item in dict.fromkeys(message_ids) if item not in seen_ids
+            ]
             counts.message_ids_seen += len(unique_ids)
             if unique_ids:
-                seen_ids.update(unique_ids)
-                batch = self.provider.batch_get_messages(
+                messages, unavailable = self._batch_get_messages_with_retry(
                     mailbox_address,
                     unique_ids,
-                    format="full",
                 )
-                unavailable = [str(item) for item in batch.get("unavailable_message_ids") or []]
                 if unavailable:
                     errors.append(f"{len(unavailable)} 个邮件 ID 未返回详情")
-                for message in batch.get("messages") or []:
+                for message in messages:
+                    returned_message_id = str(message.get("message_id") or "").strip()
                     self._ingest_message(
                         mailbox_row_id,
                         mailbox_address,
@@ -315,12 +332,44 @@ class MailSyncer:
                         errors,
                         skip_attachments=skip_attachments,
                     )
+                    if returned_message_id:
+                        seen_ids.add(returned_message_id)
             if not page.get("has_more"):
                 return
             next_token = str(page.get("page_token") or "")
             if not next_token or next_token == page_token:
                 raise MailSyncPartialError("邮件搜索返回无效 page_token")
             page_token = next_token
+
+    def _batch_get_messages_with_retry(
+        self,
+        mailbox_address: str,
+        message_ids: list[str],
+    ) -> tuple[list[MailMessage], list[str]]:
+        requested = list(dict.fromkeys(message_ids))
+        remaining = list(requested)
+        messages_by_id: dict[str, MailMessage] = {}
+        for attempt in range(len(MAIL_BATCH_RETRY_DELAYS) + 1):
+            batch = self.provider.batch_get_messages(
+                mailbox_address,
+                remaining,
+                format="full",
+            )
+            remaining_set = set(remaining)
+            for source in batch.get("messages") or []:
+                message = dict(source)
+                message_id = str(message.get("message_id") or "").strip()
+                if message_id in remaining_set:
+                    messages_by_id[message_id] = message
+            remaining = [item for item in requested if item not in messages_by_id]
+            if not remaining:
+                break
+            if attempt < len(MAIL_BATCH_RETRY_DELAYS):
+                time.sleep(MAIL_BATCH_RETRY_DELAYS[attempt])
+        return (
+            [messages_by_id[item] for item in requested if item in messages_by_id],
+            remaining,
+        )
 
     def _ingest_message(
         self,
@@ -720,6 +769,127 @@ class MailSyncer:
         usage = shutil.disk_usage(self.paths.root)
         used_ratio = usage.used / usage.total if usage.total else 1.0
         return usage.free >= MAIL_ATTACHMENT_STOP_FREE_BYTES and used_ratio < 0.95
+
+
+def _deduplicate_folder_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for source in items:
+        item = dict(source)
+        folder_id = str(item.get("id") or "").strip()
+        if not folder_id:
+            raise ValueError("飞书邮箱文件夹缺少 id")
+        item["id"] = folder_id
+        key = folder_id.casefold()
+        if key in positions:
+            result[positions[key]].update(item)
+        else:
+            positions[key] = len(result)
+            result.append(item)
+    return result
+
+
+def _selected_folder_search_values(
+    folder_items: Iterable[dict[str, Any]],
+    requested: Iterable[str] | None,
+) -> tuple[str, ...]:
+    items = [dict(item) for item in folder_items]
+    by_id = {
+        str(item.get("id") or "").strip().casefold(): item
+        for item in items
+        if str(item.get("id") or "").strip()
+    }
+    system_queries = {
+        folder_id.casefold(): search_name
+        for folder_id, _name, search_name in SYSTEM_MAIL_FOLDERS
+    }
+    system_aliases: dict[str, str] = {}
+    system_ids_exact: dict[str, str] = {}
+    for folder_id, _name, search_name in SYSTEM_MAIL_FOLDERS:
+        system_ids_exact[folder_id] = folder_id.casefold()
+        system_aliases[folder_id.casefold()] = folder_id.casefold()
+        system_aliases[search_name.casefold()] = folder_id.casefold()
+    system_aliases["archived"] = "archived"
+
+    path_cache: dict[str, str] = {}
+
+    def search_path(folder_key: str, parents: tuple[str, ...] = ()) -> str:
+        if folder_key in system_queries:
+            return system_queries[folder_key]
+        if folder_key in path_cache:
+            return path_cache[folder_key]
+        if folder_key in parents:
+            raise ValueError("飞书邮箱自定义文件夹父级关系存在循环")
+        item = by_id.get(folder_key)
+        if item is None:
+            raise ValueError("飞书邮箱自定义文件夹的父文件夹不存在")
+        name = str(item.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"飞书邮箱文件夹 {item.get('id')} 缺少名称")
+        parent_id = str(item.get("parent_folder_id") or "").strip()
+        if not parent_id or parent_id == "0":
+            path = name
+        else:
+            parent_key = parent_id.casefold()
+            if parent_key not in by_id:
+                raise ValueError(f"飞书邮箱文件夹 {item.get('id')} 的父文件夹不存在")
+            path = f"{search_path(parent_key, (*parents, folder_key))}/{name}"
+        path_cache[folder_key] = path
+        return path
+
+    query_by_id = {folder_key: search_path(folder_key) for folder_key in by_id}
+    ordered_keys = [folder_id.casefold() for folder_id, _name, _query in SYSTEM_MAIL_FOLDERS]
+    ordered_keys.extend(folder_key for folder_key in by_id if folder_key not in system_queries)
+
+    if requested is None:
+        selected_keys = ordered_keys
+    else:
+        requested_values = [str(value).strip() for value in requested if str(value).strip()]
+        if not requested_values:
+            raise ValueError("至少需要指定一个非空邮件文件夹")
+
+        by_id_exact: dict[str, str] = {}
+        by_query_exact: dict[str, list[str]] = {}
+        by_name_exact: dict[str, list[str]] = {}
+        by_query: dict[str, list[str]] = {}
+        by_name: dict[str, list[str]] = {}
+        for folder_key, item in by_id.items():
+            provider_id = str(item.get("id") or "").strip()
+            query_value = query_by_id[folder_key]
+            by_id_exact[provider_id] = folder_key
+            by_query_exact.setdefault(query_value, []).append(folder_key)
+            by_query.setdefault(query_value.casefold(), []).append(folder_key)
+            name = str(item.get("name") or "").strip()
+            if name:
+                by_name_exact.setdefault(name, []).append(folder_key)
+                by_name.setdefault(name.casefold(), []).append(folder_key)
+
+        selected_keys = []
+        for value in requested_values:
+            lookup = value.casefold()
+            folder_key = system_ids_exact.get(value) or by_id_exact.get(value)
+            if folder_key is None:
+                exact_matches = by_query_exact.get(value) or by_name_exact.get(value) or []
+                if len(exact_matches) > 1:
+                    raise ValueError(f"邮件文件夹名称不唯一，请改用 folder id：{value}")
+                if exact_matches:
+                    folder_key = exact_matches[0]
+            if folder_key is None:
+                folder_key = system_aliases.get(lookup)
+            if folder_key is None and lookup in by_id:
+                folder_key = lookup
+            if folder_key is None:
+                matches = by_query.get(lookup) or by_name.get(lookup) or []
+                if len(matches) > 1:
+                    raise ValueError(f"邮件文件夹名称不唯一，请改用 folder id：{value}")
+                if matches:
+                    folder_key = matches[0]
+            if folder_key is None or folder_key not in query_by_id:
+                raise ValueError(f"未找到邮件文件夹：{value}")
+            selected_keys.append(folder_key)
+
+    values = [query_by_id[key] for key in selected_keys]
+    return tuple(dict.fromkeys(values))
 
 
 def _decode_base64url(value: str) -> bytes:

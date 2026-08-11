@@ -28,6 +28,7 @@ from .automation import (
 from .config import (
     DEFAULT_INCREMENTAL_DAYS,
     DEFAULT_MAIL_INITIAL_DAYS,
+    DEFAULT_MAIL_MAX_PAGES,
     DEFAULT_MAIL_OVERLAP_DAYS,
     DEFAULT_MAIL_SYNC_HOUR,
     DEFAULT_MAIL_SYNC_MINUTE,
@@ -181,8 +182,8 @@ def build_parser() -> argparse.ArgumentParser:
     mail_sync.add_argument(
         "--folder",
         action="append",
-        choices=("INBOX", "SENT"),
-        help="可重复指定；默认同步 INBOX 和 SENT",
+        metavar="ID_OR_NAME",
+        help="可重复指定系统 ID、自定义文件夹 ID、名称或路径；默认同步全部文件夹",
     )
     mail_sync.add_argument("--skip-attachments", action="store_true")
     mail_sync.add_argument(
@@ -195,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MAX_MAIL_ATTACHMENT_BYTES / 1024**2,
     )
-    mail_sync.add_argument("--max-pages", type=int, default=500)
+    mail_sync.add_argument("--max-pages", type=int, default=DEFAULT_MAIL_MAX_PAGES)
 
     mail_scheduled_sync = subparsers.add_parser(
         "mail-scheduled-sync",
@@ -212,7 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MAX_MAIL_ATTACHMENT_BYTES / 1024**2,
     )
-    mail_scheduled_sync.add_argument("--max-pages", type=int, default=500)
+    mail_scheduled_sync.add_argument(
+        "--max-pages", type=int, default=DEFAULT_MAIL_MAX_PAGES
+    )
 
     subparsers.add_parser("mail-status", help="显示独立邮箱同步状态")
     subparsers.add_parser("mail-doctor", help="检查邮箱权限、数据库、容量和本机安全边界")
@@ -474,7 +477,8 @@ def main(argv: list[str] | None = None) -> None:
                 print("已有邮箱同步任务正在运行，本次无需重复启动。")
             else:
                 print(
-                    f"邮箱同步完成：读取 {result['messages_seen']} 封，"
+                    f"邮箱同步完成：文件夹 {result['folders_seen']} 个，"
+                    f"读取 {result['messages_seen']} 封，"
                     f"新增 {result['messages_written']} 封，"
                     f"下载附件 {result['attachments_downloaded']} 个，"
                     f"状态 {result['status']}"

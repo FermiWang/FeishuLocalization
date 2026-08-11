@@ -28,17 +28,6 @@ MAIL_BATCH_GET_SIZE = 20
 MAIL_ATTACHMENT_URL_BATCH_SIZE = 20
 MAIL_MESSAGE_FORMATS = {"metadata", "plain_text_full", "full"}
 
-_SEARCH_FOLDER_NAMES = {
-    "INBOX": "inbox",
-    "SENT": "sent",
-    "DRAFT": "draft",
-    "TRASH": "trash",
-    "SPAM": "spam",
-    "ARCHIVED": "archive",
-    "SCHEDULED": "scheduled",
-}
-
-
 class FeishuMailProvider:
     """Read-only Feishu Mail v1 adapter using the OAuth user's access token."""
 
@@ -114,7 +103,10 @@ class FeishuMailProvider:
 
         filter_body: dict[str, Any] = {}
         if folder and folder.strip():
-            filter_body["folder"] = [self._search_folder(folder)]
+            # The sync layer resolves system IDs to lowercase search aliases.
+            # Preserve this value exactly because a custom folder may legally
+            # be named "Inbox" or even "INBOX".
+            filter_body["folder"] = [folder.strip()]
         if label and label.strip():
             filter_body["label"] = [label.strip()]
         self._add_address_filter(filter_body, "from", from_addresses)
@@ -380,11 +372,6 @@ class FeishuMailProvider:
         if not normalized:
             raise ValueError(f"{name} 不能为空")
         return urllib.parse.quote(normalized, safe="")
-
-    @staticmethod
-    def _search_folder(folder: str) -> str:
-        normalized = folder.strip()
-        return _SEARCH_FOLDER_NAMES.get(normalized.upper(), normalized)
 
     @staticmethod
     def _mail_time(value: MailTime) -> str:

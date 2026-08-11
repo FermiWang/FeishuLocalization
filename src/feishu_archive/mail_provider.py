@@ -249,11 +249,13 @@ class FakeMailProvider:
             else self.messages.keys()
         )
         if folder:
-            normalized = _fake_folder_id(folder)
+            normalized = _fake_folder_id(folder.rsplit("/", 1)[-1]).casefold()
             ids = [
                 message_id
                 for message_id in ids
-                if _fake_folder_id(str(self.messages.get(message_id, {}).get("folder_id") or ""))
+                if _fake_folder_id(
+                    str(self.messages.get(message_id, {}).get("folder_id") or "")
+                ).casefold()
                 == normalized
             ]
         page_ids, next_token = _fake_page(ids, page_token, page_size)

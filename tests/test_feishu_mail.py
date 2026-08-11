@@ -192,7 +192,7 @@ class FeishuMailProviderTests(unittest.TestCase):
         end = datetime(2026, 8, 2, 0, 0, tzinfo=timezone.utc)
 
         page = provider.search_messages(
-            folder="INBOX",
+            folder="inbox",
             start_time=start,
             end_time=end,
             subject="Report",
@@ -234,6 +234,22 @@ class FeishuMailProviderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "同时提供"):
             provider.search_messages(folder="INBOX", start_time="2026-08-01T00:00:00Z")
+
+    def test_search_preserves_custom_names_that_match_system_aliases(self) -> None:
+        client = ScriptedClient(
+            lambda *args, **kwargs: {
+                "code": 0,
+                "data": {"items": [], "has_more": False},
+            }
+        )
+        provider = FeishuMailProvider(client)  # type: ignore[arg-type]
+
+        provider.search_messages(folder="INBOX")
+
+        self.assertEqual(
+            client.calls[0][2]["payload"]["filter"]["folder"],
+            ["INBOX"],
+        )
 
     def test_list_message_ids_uses_limits_and_mutually_exclusive_filters(self) -> None:
         client = ScriptedClient(

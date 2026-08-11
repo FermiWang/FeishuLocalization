@@ -12,6 +12,7 @@ from typing import Any, Callable
 from .config import (
     DEFAULT_INCREMENTAL_DAYS,
     DEFAULT_MAIL_OVERLAP_DAYS,
+    DEFAULT_MAIL_MAX_PAGES,
     DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
@@ -300,7 +301,7 @@ def run_mail_sync_cycle(
     skip_attachments: bool = False,
     max_mail_bytes: int = DEFAULT_MAX_MAIL_BYTES,
     max_attachment_bytes: int = DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
-    max_pages: int = 500,
+    max_pages: int = DEFAULT_MAIL_MAX_PAGES,
     lock: SyncFileLock | None = None,
     syncer_factory: Callable[..., MailSyncer] = MailSyncer,
 ) -> dict[str, Any]:
