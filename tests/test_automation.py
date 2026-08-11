@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from feishu_archive.automation import (
+    BackgroundMailSyncController,
     SyncBusyError,
     acquire_mail_sync_lock,
     acquire_sync_lock,
@@ -166,6 +167,43 @@ class AutomationTests(unittest.TestCase):
                 mail_lock.release()
                 wiki_lock.release()
                 message_lock.release()
+
+    def test_mail_cycle_forwards_unbounded_history_and_keeps_incremental_defaults(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = MailDatabase(paths.mail_database)
+            database.initialize()
+            calls = []
+
+            full_result = run_mail_sync_cycle(
+                database,
+                paths,
+                lambda: calls,
+                trigger="manual",
+                days=None,
+                syncer_factory=FakeMailSyncer,
+            )
+            self.assertEqual(calls, [(None, None, False, "manual", 5000)])
+            self.assertEqual(full_result["status"], "success")
+
+            calls.clear()
+            scheduled_result = run_mail_sync_cycle(
+                database,
+                paths,
+                lambda: calls,
+                trigger="scheduled",
+                syncer_factory=FakeMailSyncer,
+            )
+            self.assertEqual(calls, [(None, 2, False, "scheduled", 5000)])
+            self.assertEqual(scheduled_result["status"], "success")
+
+            controller = BackgroundMailSyncController(
+                database,
+                paths,
+                lambda: object(),
+            )
+            self.assertIsNone(controller.days)
 
 
 if __name__ == "__main__":

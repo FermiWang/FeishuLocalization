@@ -54,7 +54,7 @@ from .feishu import FeishuAPIError, FeishuClient
 from .feishu_mail import FeishuMailProvider
 from .keychain import KeychainError, KeychainStore
 from .mail_database import MailDatabase
-from .mail_sync import MailCapacityError
+from .mail_sync import MailAuthorizationError, MailCapacityError, MailSyncPartialError
 from .reader_auth import ReaderSessionManager
 from .sync import ArchiveSyncer
 from .web import is_loopback_host, serve
@@ -178,7 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
     wiki_rebuild.add_argument("--force", action="store_true", help="即使渲染版本未变化也重新生成")
 
     mail_sync = subparsers.add_parser("mail-sync", help="同步当前用户飞书邮箱到独立本地邮件库")
-    mail_sync.add_argument("--days", type=int, default=DEFAULT_MAIL_INITIAL_DAYS)
+    mail_sync.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_MAIL_INITIAL_DAYS,
+        help="只同步最近 N 天；默认同步全部可获取历史",
+    )
     mail_sync.add_argument(
         "--folder",
         action="append",
@@ -591,7 +596,14 @@ def main(argv: list[str] | None = None) -> None:
             assert database is not None
             failed = _doctor(database, paths.root)
             raise SystemExit(1 if failed else 0)
-    except (ValueError, FeishuAPIError, KeychainError, MailCapacityError) as exc:
+    except (
+        ValueError,
+        FeishuAPIError,
+        KeychainError,
+        MailAuthorizationError,
+        MailCapacityError,
+        MailSyncPartialError,
+    ) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 

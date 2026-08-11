@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from .config import (
     DEFAULT_INCREMENTAL_DAYS,
+    DEFAULT_MAIL_INITIAL_DAYS,
     DEFAULT_MAIL_OVERLAP_DAYS,
     DEFAULT_MAIL_MAX_PAGES,
     DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -296,7 +297,7 @@ def run_mail_sync_cycle(
     provider_factory: Callable[[], Any],
     *,
     trigger: str,
-    days: int = DEFAULT_MAIL_OVERLAP_DAYS,
+    days: int | None = DEFAULT_MAIL_OVERLAP_DAYS,
     folders: list[str] | None = None,
     skip_attachments: bool = False,
     max_mail_bytes: int = DEFAULT_MAX_MAIL_BYTES,
@@ -336,7 +337,7 @@ class BackgroundMailSyncController:
         paths: ArchivePaths,
         provider_factory: Callable[[], Any],
         *,
-        days: int = DEFAULT_MAIL_OVERLAP_DAYS,
+        days: int | None = DEFAULT_MAIL_INITIAL_DAYS,
         max_mail_bytes: int = DEFAULT_MAX_MAIL_BYTES,
         max_attachment_bytes: int = DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     ) -> None:

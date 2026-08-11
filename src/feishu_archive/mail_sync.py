@@ -33,6 +33,9 @@ MAIL_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 MAIL_HARD_STOP_FREE_BYTES = 75 * 1024**3
 MAIL_ATTACHMENT_STOP_FREE_BYTES = 100 * 1024**3
 MAIL_BATCH_RETRY_DELAYS = (0.25, 1.0)
+MAIL_LIST_MIN_INTERVAL_SECONDS = 0.11
+MAIL_BATCH_MIN_INTERVAL_SECONDS = 0.11
+MAIL_ATTACHMENT_URL_MIN_INTERVAL_SECONDS = 1.05
 
 SYSTEM_MAIL_FOLDERS = (
     ("INBOX", "收件箱", "inbox"),
@@ -87,6 +90,13 @@ class MailSyncCounts:
         }
 
 
+@dataclass(frozen=True)
+class MailFolderTarget:
+    provider_folder_id: str
+    search_value: str | None
+    list_label_id: str | None = None
+
+
 class MailSyncer:
     def __init__(
         self,
@@ -106,17 +116,20 @@ class MailSyncer:
         self.max_attachment_bytes = max_attachment_bytes
         self.paths.ensure()
         self._used_bytes = int(self.database.status().get("blob_bytes") or 0)
+        self._last_list_request_at = 0.0
+        self._last_batch_request_at = 0.0
+        self._last_attachment_url_request_at = 0.0
 
     def sync(
         self,
         *,
         folders: Iterable[str] | None = None,
-        days: int = DEFAULT_MAIL_INITIAL_DAYS,
+        days: int | None = DEFAULT_MAIL_INITIAL_DAYS,
         skip_attachments: bool = False,
         trigger: str = "manual",
         max_pages: int = DEFAULT_MAIL_MAX_PAGES,
     ) -> MailSyncCounts:
-        if days < 1:
+        if days is not None and days < 1:
             raise ValueError("days 必须大于 0")
         if max_pages < 1:
             raise ValueError("max_pages 必须大于 0")
@@ -153,45 +166,114 @@ class MailSyncer:
                     }
                 )
                 known_folder_ids.add(folder_id.casefold())
-        selected_folders = _selected_folder_search_values(folder_items, folders)
+        selected_folders = _selected_folder_targets(
+            folder_items,
+            folders,
+            require_search_paths=days is not None,
+        )
 
         mailbox_row_id = self.database.upsert_mailbox(profile)
         self.database.replace_folders(mailbox_row_id, folder_items)
         counts = MailSyncCounts(folders_seen=len(folder_items))
 
         now = datetime.now().astimezone().replace(microsecond=0)
-        start = now - timedelta(days=days)
+        window_end_ms = int(now.timestamp() * 1000)
+        start = now - timedelta(days=days) if days is not None else None
         run_id = self.database.start_sync_run(
             mailbox_row_id,
             trigger,
-            window_start=int(start.timestamp() * 1000),
-            window_end=int(now.timestamp() * 1000),
+            window_start=int(start.timestamp() * 1000) if start is not None else None,
+            window_end=window_end_ms,
         )
         errors: list[str] = []
         seen_ids: set[str] = set()
         page_budget = [max_pages]
         try:
-            for folder in selected_folders:
-                cursor = start
-                first_window = True
-                while cursor < now:
-                    window_end = min(cursor + timedelta(days=1), now)
-                    window_start = cursor if first_window else cursor - timedelta(minutes=1)
-                    self._sync_window(
+            if start is None:
+                for folder in selected_folders:
+                    scope = f"folder:{folder.provider_folder_id}"
+                    pages_before = counts.pages_scanned
+                    ids_before = counts.message_ids_seen
+                    errors_before = len(errors)
+                    state_extra = {
+                        "mode": "full",
+                        "run_id": run_id,
+                        "label_id": folder.list_label_id,
+                    }
+                    self.database.set_sync_state(
                         mailbox_row_id,
-                        mailbox_address,
-                        folder,
-                        window_start,
-                        window_end,
-                        seen_ids,
-                        counts,
-                        errors,
-                        page_budget,
-                        skip_attachments=skip_attachments,
+                        scope,
+                        window_end=window_end_ms,
+                        status="running",
+                        extra=state_extra,
                     )
+                    try:
+                        self._scan_folder_pages(
+                            mailbox_row_id,
+                            mailbox_address,
+                            folder,
+                            seen_ids,
+                            counts,
+                            errors,
+                            page_budget,
+                            skip_attachments=skip_attachments,
+                        )
+                    except Exception as exc:
+                        self.database.set_sync_state(
+                            mailbox_row_id,
+                            scope,
+                            window_end=window_end_ms,
+                            status="error",
+                            error=_safe_error(exc),
+                            extra={
+                                **state_extra,
+                                "pages": counts.pages_scanned - pages_before,
+                                "message_ids": counts.message_ids_seen - ids_before,
+                            },
+                        )
+                        raise
                     counts.windows_scanned += 1
-                    cursor = window_end
-                    first_window = False
+                    folder_status = (
+                        "partial" if len(errors) > errors_before else "success"
+                    )
+                    self.database.set_sync_state(
+                        mailbox_row_id,
+                        scope,
+                        window_end=window_end_ms,
+                        status=folder_status,
+                        error=("; ".join(errors[errors_before:]) or None),
+                        extra={
+                            **state_extra,
+                            "pages": counts.pages_scanned - pages_before,
+                            "message_ids": counts.message_ids_seen - ids_before,
+                        },
+                    )
+            else:
+                for folder in selected_folders:
+                    if folder.search_value is None:
+                        raise ValueError(
+                            f"邮件文件夹 {folder.provider_folder_id} 缺少可搜索路径"
+                        )
+                    cursor = start
+                    first_window = True
+                    while cursor < now:
+                        window_end = min(cursor + timedelta(days=1), now)
+                        window_start = cursor if first_window else cursor - timedelta(minutes=1)
+                        self._sync_window(
+                            mailbox_row_id,
+                            mailbox_address,
+                            folder.search_value,
+                            window_start,
+                            window_end,
+                            seen_ids,
+                            counts,
+                            errors,
+                            page_budget,
+                            skip_attachments=skip_attachments,
+                        )
+                        counts.windows_scanned += 1
+                        cursor = window_end
+                        first_window = False
 
             status = "partial" if errors else "success"
             self.database.finish_sync_run(
@@ -314,32 +396,120 @@ class MailSyncer:
             unique_ids = [
                 item for item in dict.fromkeys(message_ids) if item not in seen_ids
             ]
-            counts.message_ids_seen += len(unique_ids)
-            if unique_ids:
-                messages, unavailable = self._batch_get_messages_with_retry(
-                    mailbox_address,
-                    unique_ids,
-                )
-                if unavailable:
-                    errors.append(f"{len(unavailable)} 个邮件 ID 未返回详情")
-                for message in messages:
-                    returned_message_id = str(message.get("message_id") or "").strip()
-                    self._ingest_message(
-                        mailbox_row_id,
-                        mailbox_address,
-                        dict(message),
-                        counts,
-                        errors,
-                        skip_attachments=skip_attachments,
-                    )
-                    if returned_message_id:
-                        seen_ids.add(returned_message_id)
+            self._ingest_message_ids(
+                mailbox_row_id,
+                mailbox_address,
+                unique_ids,
+                seen_ids,
+                counts,
+                errors,
+                skip_attachments=skip_attachments,
+            )
             if not page.get("has_more"):
                 return
             next_token = str(page.get("page_token") or "")
             if not next_token or next_token == page_token:
                 raise MailSyncPartialError("邮件搜索返回无效 page_token")
             page_token = next_token
+
+    def _scan_folder_pages(
+        self,
+        mailbox_row_id: int,
+        mailbox_address: str,
+        folder: MailFolderTarget,
+        seen_ids: set[str],
+        counts: MailSyncCounts,
+        errors: list[str],
+        page_budget: list[int],
+        *,
+        skip_attachments: bool,
+    ) -> None:
+        page_token: str | None = None
+        folder_message_ids: list[str] = []
+        folder_seen_ids: set[str] = set()
+        while True:
+            if page_budget[0] <= 0:
+                raise MailSyncPartialError("邮件列表达到 max_pages 上限")
+            self._pace_request(
+                "_last_list_request_at",
+                MAIL_LIST_MIN_INTERVAL_SECONDS,
+            )
+            page = self.provider.list_message_ids(
+                mailbox_address,
+                folder_id=(None if folder.list_label_id else folder.provider_folder_id),
+                label_id=folder.list_label_id,
+                page_token=page_token,
+                page_size=20,
+            )
+            page_budget[0] -= 1
+            counts.pages_scanned += 1
+            message_ids = [str(item) for item in page.get("message_ids") or [] if item]
+            if not message_ids:
+                message_ids = _message_ids_from_items(page.get("items") or [])
+            for message_id in message_ids:
+                if message_id not in folder_seen_ids:
+                    folder_seen_ids.add(message_id)
+                    folder_message_ids.append(message_id)
+            if not page.get("has_more"):
+                break
+            next_token = str(page.get("page_token") or "")
+            if not next_token or next_token == page_token:
+                raise MailSyncPartialError("邮件列表返回无效 page_token")
+            page_token = next_token
+
+        for offset in range(0, len(folder_message_ids), 20):
+            unique_ids = [
+                item
+                for item in folder_message_ids[offset : offset + 20]
+                if item not in seen_ids
+            ]
+            self._ingest_message_ids(
+                mailbox_row_id,
+                mailbox_address,
+                unique_ids,
+                seen_ids,
+                counts,
+                errors,
+                fallback_folder_id=folder.provider_folder_id,
+                skip_attachments=skip_attachments,
+            )
+
+    def _ingest_message_ids(
+        self,
+        mailbox_row_id: int,
+        mailbox_address: str,
+        message_ids: list[str],
+        seen_ids: set[str],
+        counts: MailSyncCounts,
+        errors: list[str],
+        *,
+        fallback_folder_id: str | None = None,
+        skip_attachments: bool,
+    ) -> None:
+        counts.message_ids_seen += len(message_ids)
+        if not message_ids:
+            return
+        messages, unavailable = self._batch_get_messages_with_retry(
+            mailbox_address,
+            message_ids,
+        )
+        if unavailable:
+            errors.append(f"{len(unavailable)} 个邮件 ID 未返回详情")
+        for source in messages:
+            message = dict(source)
+            returned_message_id = str(message.get("message_id") or "").strip()
+            if fallback_folder_id and not str(message.get("folder_id") or "").strip():
+                message["folder_id"] = fallback_folder_id
+            self._ingest_message(
+                mailbox_row_id,
+                mailbox_address,
+                message,
+                counts,
+                errors,
+                skip_attachments=skip_attachments,
+            )
+            if returned_message_id:
+                seen_ids.add(returned_message_id)
 
     def _batch_get_messages_with_retry(
         self,
@@ -350,6 +520,10 @@ class MailSyncer:
         remaining = list(requested)
         messages_by_id: dict[str, MailMessage] = {}
         for attempt in range(len(MAIL_BATCH_RETRY_DELAYS) + 1):
+            self._pace_request(
+                "_last_batch_request_at",
+                MAIL_BATCH_MIN_INTERVAL_SECONDS,
+            )
             batch = self.provider.batch_get_messages(
                 mailbox_address,
                 remaining,
@@ -552,7 +726,7 @@ class MailSyncer:
             )
             return
         attachment_ids = [str(item[1].get("attachment_id") or "") for item in pending]
-        urls = self.provider.attachment_download_urls(
+        urls = self._attachment_download_urls(
             mailbox_address,
             provider_message_id,
             [item for item in attachment_ids if item],
@@ -589,7 +763,7 @@ class MailSyncer:
                     except FeishuAPIError as exc:
                         if attempt or exc.status not in {401, 403, 404}:
                             raise
-                        refreshed = self.provider.attachment_download_urls(
+                        refreshed = self._attachment_download_urls(
                             mailbox_address,
                             provider_message_id,
                             [attachment_id],
@@ -630,6 +804,29 @@ class MailSyncer:
                 errors.append(
                     f"邮件 {provider_message_id} 的附件 {attachment_id} 下载失败：{_safe_error(exc)}"
                 )
+
+    def _attachment_download_urls(
+        self,
+        mailbox_address: str,
+        provider_message_id: str,
+        attachment_ids: list[str],
+    ) -> dict[str, str]:
+        self._pace_request(
+            "_last_attachment_url_request_at",
+            MAIL_ATTACHMENT_URL_MIN_INTERVAL_SECONDS,
+        )
+        return self.provider.attachment_download_urls(
+            mailbox_address,
+            provider_message_id,
+            attachment_ids,
+        )
+
+    def _pace_request(self, attribute: str, minimum_interval: float) -> None:
+        now = time.monotonic()
+        elapsed = now - float(getattr(self, attribute))
+        if elapsed < minimum_interval:
+            time.sleep(minimum_interval - elapsed)
+        setattr(self, attribute, time.monotonic())
 
     def _store_attachment_bytes(
         self,
@@ -789,10 +986,12 @@ def _deduplicate_folder_items(items: Iterable[dict[str, Any]]) -> list[dict[str,
     return result
 
 
-def _selected_folder_search_values(
+def _selected_folder_targets(
     folder_items: Iterable[dict[str, Any]],
     requested: Iterable[str] | None,
-) -> tuple[str, ...]:
+    *,
+    require_search_paths: bool,
+) -> tuple[MailFolderTarget, ...]:
     items = [dict(item) for item in folder_items]
     by_id = {
         str(item.get("id") or "").strip().casefold(): item
@@ -837,7 +1036,14 @@ def _selected_folder_search_values(
         path_cache[folder_key] = path
         return path
 
-    query_by_id = {folder_key: search_path(folder_key) for folder_key in by_id}
+    query_by_id: dict[str, str] = {}
+    if require_search_paths or requested is not None:
+        for folder_key in by_id:
+            try:
+                query_by_id[folder_key] = search_path(folder_key)
+            except ValueError:
+                if require_search_paths:
+                    raise
     ordered_keys = [folder_id.casefold() for folder_id, _name, _query in SYSTEM_MAIL_FOLDERS]
     ordered_keys.extend(folder_key for folder_key in by_id if folder_key not in system_queries)
 
@@ -855,10 +1061,11 @@ def _selected_folder_search_values(
         by_name: dict[str, list[str]] = {}
         for folder_key, item in by_id.items():
             provider_id = str(item.get("id") or "").strip()
-            query_value = query_by_id[folder_key]
             by_id_exact[provider_id] = folder_key
-            by_query_exact.setdefault(query_value, []).append(folder_key)
-            by_query.setdefault(query_value.casefold(), []).append(folder_key)
+            query_value = query_by_id.get(folder_key)
+            if query_value is not None:
+                by_query_exact.setdefault(query_value, []).append(folder_key)
+                by_query.setdefault(query_value.casefold(), []).append(folder_key)
             name = str(item.get("name") or "").strip()
             if name:
                 by_name_exact.setdefault(name, []).append(folder_key)
@@ -884,12 +1091,21 @@ def _selected_folder_search_values(
                     raise ValueError(f"邮件文件夹名称不唯一，请改用 folder id：{value}")
                 if matches:
                     folder_key = matches[0]
-            if folder_key is None or folder_key not in query_by_id:
+            if folder_key is None or folder_key not in by_id:
                 raise ValueError(f"未找到邮件文件夹：{value}")
             selected_keys.append(folder_key)
 
-    values = [query_by_id[key] for key in selected_keys]
-    return tuple(dict.fromkeys(values))
+    targets: list[MailFolderTarget] = []
+    for folder_key in dict.fromkeys(selected_keys):
+        provider_folder_id = str(by_id[folder_key].get("id") or "").strip()
+        targets.append(
+            MailFolderTarget(
+                provider_folder_id=provider_folder_id,
+                search_value=query_by_id.get(folder_key),
+                list_label_id=("SCHEDULED" if folder_key == "scheduled" else None),
+            )
+        )
+    return tuple(targets)
 
 
 def _decode_base64url(value: str) -> bytes:

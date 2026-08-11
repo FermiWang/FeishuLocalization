@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,11 @@ from unittest.mock import patch
 from feishu_archive.config import ArchivePaths
 from feishu_archive.mail_database import MailDatabase
 from feishu_archive.mail_provider import FakeMailProvider
-from feishu_archive.mail_sync import MailAuthorizationError, MailSyncer
+from feishu_archive.mail_sync import (
+    MailAuthorizationError,
+    MailSyncPartialError,
+    MailSyncer,
+)
 
 
 def encoded(value: bytes | str) -> str:
@@ -341,6 +346,14 @@ class MailSyncTests(unittest.TestCase):
         )
         self.assertEqual(counts.windows_scanned, 9)
         self.assertEqual(counts.folders_seen, 9)
+        self.assertFalse(
+            any(name == "list_message_ids" for name, _arguments in self.provider.calls)
+        )
+        latest = self.database.latest_sync_run()
+        self.assertEqual(latest["status"], "success")
+        self.assertIsNotNone(latest["window_start"])
+        self.assertIsNotNone(latest["window_end"])
+        self.assertLess(latest["window_start"], latest["window_end"])
         mailbox = self.database.list_mailboxes()[0]
         self.assertEqual(
             {item["provider_folder_id"] for item in self.database.list_folders(mailbox["id"])},
@@ -356,6 +369,239 @@ class MailSyncTests(unittest.TestCase):
                 "project-year",
             },
         )
+
+    def test_default_full_history_lists_every_provider_folder_id_and_scheduled_label(self) -> None:
+        self.provider.folders = [
+            {
+                "id": "project-root",
+                "name": "ProjectX",
+                "parent_folder_id": "0",
+                "folder_type": 2,
+            },
+            {
+                "id": "project-year",
+                "name": "FY2026",
+                "parent_folder_id": "project-root",
+                "folder_type": 2,
+            },
+        ]
+        self.provider.messages = {}
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync()
+
+        listings = [
+            arguments
+            for name, arguments in self.provider.calls
+            if name == "list_message_ids"
+        ]
+        self.assertEqual(
+            [(item["folder_id"], item["label_id"]) for item in listings],
+            [
+                ("INBOX", None),
+                ("SENT", None),
+                ("DRAFT", None),
+                (None, "SCHEDULED"),
+                ("TRASH", None),
+                ("SPAM", None),
+                ("ARCHIVED", None),
+                ("project-root", None),
+                ("project-year", None),
+            ],
+        )
+        self.assertFalse(
+            any(name == "search_messages" for name, _arguments in self.provider.calls)
+        )
+        self.assertEqual(counts.folders_seen, 9)
+        self.assertEqual(counts.windows_scanned, 9)
+        self.assertEqual(counts.pages_scanned, 9)
+        latest = self.database.latest_sync_run()
+        self.assertEqual(latest["status"], "success")
+        self.assertIsNone(latest["window_start"])
+        self.assertIsNotNone(latest["window_end"])
+        mailbox = self.database.list_mailboxes()[0]
+        for folder_id in (
+            "INBOX",
+            "SENT",
+            "DRAFT",
+            "SCHEDULED",
+            "TRASH",
+            "SPAM",
+            "ARCHIVED",
+            "project-root",
+            "project-year",
+        ):
+            state = self.database.get_sync_state(mailbox["id"], f"folder:{folder_id}")
+            self.assertEqual(state["status"], "success")
+            self.assertIsNone(state["window_start"])
+            self.assertEqual(state["window_end"], latest["window_end"])
+            extra = json.loads(state["extra_json"])
+            self.assertEqual(extra["mode"], "full")
+            self.assertEqual(extra["run_id"], latest["id"])
+            self.assertEqual(extra["pages"], 1)
+
+    def test_full_history_paginates_and_deduplicates_ids_across_folders(self) -> None:
+        self.provider.folders = [
+            {"id": "folder-a", "name": "A", "parent_folder_id": "0", "folder_type": 2},
+            {"id": "folder-b", "name": "B", "parent_folder_id": "0", "folder_type": 2},
+        ]
+        message_ids = [f"history-{index:02d}" for index in range(21)]
+        self.provider.messages = {
+            message_id: {
+                "message_id": message_id,
+                "subject": message_id,
+                "folder_id": "folder-a",
+            }
+            for message_id in message_ids
+        }
+        self.provider.listed_message_ids = {
+            "folder-a": list(message_ids),
+            "folder-b": [message_ids[0], message_ids[-1]],
+        }
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["folder-a", "folder-b"]
+            )
+
+        listings = [
+            arguments
+            for name, arguments in self.provider.calls
+            if name == "list_message_ids"
+        ]
+        self.assertEqual(
+            [(item["folder_id"], item["page_token"]) for item in listings],
+            [("folder-a", None), ("folder-a", "20"), ("folder-b", None)],
+        )
+        batch_calls = [
+            arguments
+            for name, arguments in self.provider.calls
+            if name == "batch_get_messages"
+        ]
+        self.assertEqual([len(item["message_ids"]) for item in batch_calls], [20, 1])
+        self.assertEqual(
+            [message_id for item in batch_calls for message_id in item["message_ids"]],
+            message_ids,
+        )
+        self.assertEqual(counts.pages_scanned, 3)
+        self.assertEqual(counts.windows_scanned, 2)
+        self.assertEqual(counts.message_ids_seen, 21)
+        self.assertEqual(counts.messages_seen, 21)
+        self.assertEqual(counts.messages_written, 21)
+        self.assertEqual(self.database.status()["messages"], 21)
+
+    def test_full_history_uses_enumerated_folder_when_message_detail_omits_folder(self) -> None:
+        self.provider.folders = [
+            {
+                "id": "archive-2020",
+                "name": "Archive 2020",
+                "parent_folder_id": "0",
+                "folder_type": 2,
+            }
+        ]
+        self.provider.messages = {
+            "history-without-folder": {
+                "message_id": "history-without-folder",
+                "subject": "Old message",
+            }
+        }
+        self.provider.listed_message_ids = {
+            "archive-2020": ["history-without-folder"]
+        }
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["archive-2020"]
+            )
+
+        self.assertEqual(counts.messages_written, 1)
+        mailbox = self.database.list_mailboxes()[0]
+        message = self.database.find_message(mailbox["id"], "history-without-folder")
+        detail = self.database.get_message(message["id"])
+        self.assertEqual(
+            [item["provider_folder_id"] for item in detail["folders"]],
+            ["archive-2020"],
+        )
+        latest = self.database.latest_sync_run()
+        self.assertEqual(latest["status"], "success")
+        self.assertIsNone(latest["window_start"])
+        self.assertIsNotNone(latest["window_end"])
+
+    def test_scheduled_full_history_falls_back_to_scheduled_folder(self) -> None:
+        self.provider.folders = []
+        self.provider.messages = {
+            "scheduled-without-folder": {
+                "message_id": "scheduled-without-folder",
+                "subject": "Send later",
+                "label_ids": ["SCHEDULED"],
+            }
+        }
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["SCHEDULED"]
+            )
+
+        self.assertEqual(counts.messages_written, 1)
+        mailbox = self.database.list_mailboxes()[0]
+        message = self.database.find_message(mailbox["id"], "scheduled-without-folder")
+        detail = self.database.get_message(message["id"])
+        self.assertEqual(
+            [item["provider_folder_id"] for item in detail["folders"]],
+            ["SCHEDULED"],
+        )
+
+    def test_full_history_ignores_unrelated_invalid_folder_tree_for_explicit_id(self) -> None:
+        self.provider.folders = [
+            {"id": "valid", "name": "Valid", "folder_type": 2},
+            {
+                "id": "orphan",
+                "name": "Orphan",
+                "parent_folder_id": "missing-parent",
+                "folder_type": 2,
+            },
+        ]
+        self.provider.messages = {}
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            counts = MailSyncer(self.database, self.provider, self.paths).sync(
+                folders=["valid"]
+            )
+
+        self.assertEqual(counts.windows_scanned, 1)
+        listing = next(
+            arguments
+            for name, arguments in self.provider.calls
+            if name == "list_message_ids"
+        )
+        self.assertEqual(listing["folder_id"], "valid")
+
+    def test_full_history_page_budget_failure_is_audited_as_error(self) -> None:
+        message_ids = [f"budget-{index:02d}" for index in range(21)]
+        self.provider.messages = {
+            message_id: {
+                "message_id": message_id,
+                "subject": message_id,
+                "folder_id": "projects",
+            }
+            for message_id in message_ids
+        }
+        self.provider.listed_message_ids = {"projects": message_ids}
+
+        with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
+            with self.assertRaisesRegex(MailSyncPartialError, "max_pages"):
+                MailSyncer(self.database, self.provider, self.paths).sync(
+                    folders=["projects"], max_pages=1, skip_attachments=True
+                )
+
+        latest = self.database.latest_sync_run()
+        self.assertEqual(latest["status"], "error")
+        self.assertEqual(latest["pages_scanned"], 1)
+        self.assertEqual(latest["messages_seen"], 0)
+        mailbox = self.database.list_mailboxes()[0]
+        state = self.database.get_sync_state(mailbox["id"], "folder:projects")
+        self.assertEqual(state["status"], "error")
+        self.assertIn("max_pages", state["error"])
 
     def test_explicit_custom_folder_id_resolves_to_name_and_unknown_id_fails(self) -> None:
         with patch("feishu_archive.mail_sync.shutil.disk_usage", return_value=self.disk_usage):
