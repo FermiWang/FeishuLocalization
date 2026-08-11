@@ -204,6 +204,8 @@ class AutomationTests(unittest.TestCase):
                 lambda: object(),
             )
             self.assertIsNone(controller.days)
+            self.assertEqual(controller.max_mail_bytes, 10 * 1024**3)
+            self.assertEqual(controller.max_attachment_bytes, 1024**3)
 
 
 if __name__ == "__main__":

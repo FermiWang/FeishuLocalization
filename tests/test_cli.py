@@ -17,7 +17,13 @@ from feishu_archive.cli import (
     build_parser,
     main,
 )
-from feishu_archive.config import DEFAULT_SCOPES, MAIL_SCOPES, MAIL_TOKEN_NAMESPACE
+from feishu_archive.config import (
+    DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
+    DEFAULT_MAX_MAIL_BYTES,
+    DEFAULT_SCOPES,
+    MAIL_SCOPES,
+    MAIL_TOKEN_NAMESPACE,
+)
 from feishu_archive.keychain import MemoryTokenStore
 
 
@@ -113,6 +119,13 @@ class AppConfigTests(unittest.TestCase):
         sync_args = build_parser().parse_args(["mail-sync"])
         self.assertIsNone(sync_args.days)
         self.assertEqual(sync_args.max_pages, 5000)
+        self.assertEqual(sync_args.max_mail_gib, DEFAULT_MAX_MAIL_BYTES / 1024**3)
+        self.assertEqual(
+            sync_args.max_attachment_mib,
+            DEFAULT_MAX_MAIL_ATTACHMENT_BYTES / 1024**2,
+        )
+        self.assertEqual(sync_args.max_mail_gib, 10)
+        self.assertEqual(sync_args.max_attachment_mib, 1024)
         self.assertIsNone(sync_args.folder)
         self.assertFalse(sync_args.skip_attachments)
         bounded_args = build_parser().parse_args(["mail-sync", "--days", "30"])
@@ -123,6 +136,8 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(scoped_args.folder, ["DRAFT", "7421369296749756417"])
         scheduled_args = build_parser().parse_args(["mail-scheduled-sync"])
         self.assertEqual(scheduled_args.days, 2)
+        self.assertEqual(scheduled_args.max_mail_gib, 10)
+        self.assertEqual(scheduled_args.max_attachment_mib, 1024)
         reader_args = build_parser().parse_args(["mail-reader-url", "--open"])
         self.assertTrue(reader_args.open)
 
