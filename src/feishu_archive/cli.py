@@ -55,9 +55,13 @@ from .feishu_mail import FeishuMailProvider
 from .keychain import KeychainError, KeychainStore
 from .mail_database import MailDatabase
 from .mail_sync import MailAuthorizationError, MailCapacityError, MailSyncPartialError
-from .reader_auth import ReaderSessionManager
+from .reader_auth import (
+    ReaderSessionManager,
+    disable_permanent_unlock,
+    enable_permanent_unlock,
+)
 from .sync import ArchiveSyncer
-from .web import is_loopback_host, serve
+from .web import is_literal_loopback_host, is_loopback_host, serve
 from .wiki import WikiSyncer
 
 
@@ -227,11 +231,22 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("mail-preflight", help=argparse.SUPPRESS)
     mail_reader_url = subparsers.add_parser(
         "mail-reader-url",
-        help="生成带 URL fragment 的本机邮箱解锁地址",
+        help="生成本机邮箱解锁地址，或管理持久本机解锁策略",
     )
     mail_reader_url.add_argument("--host", default="127.0.0.1")
     mail_reader_url.add_argument("--port", type=int, default=DEFAULT_READER_PORT)
     mail_reader_url.add_argument("--open", action="store_true", help="在默认浏览器中打开解锁地址")
+    mail_reader_policy = mail_reader_url.add_mutually_exclusive_group()
+    mail_reader_policy.add_argument(
+        "--permanent",
+        action="store_true",
+        help="为当前档案永久解除本机邮箱阅读锁定",
+    )
+    mail_reader_policy.add_argument(
+        "--lock",
+        action="store_true",
+        help="恢复短期会话锁定并撤销现有邮箱会话",
+    )
 
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
     reader.add_argument("--host", default="127.0.0.1")
@@ -502,20 +517,42 @@ def main(argv: list[str] | None = None) -> None:
                 raise ValueError(f"邮件数据库预检失败：{integrity}")
             # Exercise MATCH rather than merely checking that the FTS table exists.
             mail_database.query_messages(query="feishu archive preflight", limit=1)
-            session = ReaderSessionManager(paths.reader_secret)
+            session = ReaderSessionManager(
+                paths.reader_secret,
+                permanent_unlock_path=paths.mail_reader_permanent_unlock,
+            )
             mode = paths.reader_secret.stat().st_mode & 0o777
             if mode != 0o600 or len(session.unlock_secret) < 32:
                 raise ValueError("邮箱解锁密钥预检失败")
-            print("邮件库 schema/FTS 与本机解锁密钥预检通过。")
+            access_mode = "永久本机解锁" if session.permanent_unlock_enabled else "短期本机会话"
+            print(f"邮件库 schema/FTS、解锁密钥与访问策略预检通过（{access_mode}）。")
         elif args.command == "mail-reader-url":
             _ensure_mail_paths(paths)
-            if not is_loopback_host(args.host):
-                raise ValueError("邮箱解锁地址只能使用本机回环主机")
+            if not is_literal_loopback_host(args.host) or not is_loopback_host(args.host):
+                raise ValueError("邮箱解锁地址只能使用 127.0.0.1 或 localhost")
             if not 1 <= args.port <= 65535:
                 raise ValueError("--port 必须在 1 到 65535 之间")
-            manager = ReaderSessionManager(paths.reader_secret)
-            fragment = urllib.parse.urlencode({"mail-unlock": manager.unlock_secret})
-            url = f"http://{args.host}:{args.port}/?mode=mail#{fragment}"
+            if args.lock and args.open:
+                raise ValueError("--lock 不能与 --open 同时使用")
+            if args.lock:
+                changed = disable_permanent_unlock(paths.mail_reader_permanent_unlock)
+                detail = "已恢复短期会话锁定" if changed else "当前已经是短期会话锁定"
+                print(f"{detail}；现有邮箱会话将在下一次请求时撤销。")
+                return
+            manager = ReaderSessionManager(
+                paths.reader_secret,
+                permanent_unlock_path=paths.mail_reader_permanent_unlock,
+            )
+            if args.permanent:
+                changed = enable_permanent_unlock(paths.mail_reader_permanent_unlock)
+                detail = "已永久解除本机邮箱锁定" if changed else "本机邮箱已处于永久解锁状态"
+                print(f"{detail}；服务重启与重新部署后仍会保留。")
+            url_host = f"[{args.host}]" if ":" in args.host else args.host
+            if manager.permanent_unlock_enabled:
+                url = f"http://{url_host}:{args.port}/?mode=mail"
+            else:
+                fragment = urllib.parse.urlencode({"mail-unlock": manager.unlock_secret})
+                url = f"http://{url_host}:{args.port}/?mode=mail#{fragment}"
             print(url)
             if args.open:
                 webbrowser.open(url)
@@ -534,7 +571,10 @@ def main(argv: list[str] | None = None) -> None:
                 _ensure_mail_paths(paths)
                 mail_database = MailDatabase(paths.mail_database)
                 mail_database.initialize()
-                mail_session_manager = ReaderSessionManager(paths.reader_secret)
+                mail_session_manager = ReaderSessionManager(
+                    paths.reader_secret,
+                    permanent_unlock_path=paths.mail_reader_permanent_unlock,
+                )
                 mail_controller = BackgroundMailSyncController(
                     mail_database,
                     paths,
@@ -904,15 +944,31 @@ def _mail_doctor(database: MailDatabase, paths: ArchivePaths) -> bool:
     )
     checks.append(("阅读器绑定", is_loopback_host("127.0.0.1"), "127.0.0.1 only"))
 
-    session = ReaderSessionManager(paths.reader_secret)
+    session: ReaderSessionManager | None = None
+    access_policy_ok = True
+    access_policy_detail = ""
+    try:
+        session = ReaderSessionManager(
+            paths.reader_secret,
+            permanent_unlock_path=paths.mail_reader_permanent_unlock,
+        )
+        access_policy_detail = (
+            "永久本机解锁（跨重启保留）"
+            if session.permanent_unlock_enabled
+            else "短期本机会话（15 分钟）"
+        )
+    except ValueError as exc:
+        access_policy_ok = False
+        access_policy_detail = str(exc)
     secret_mode = paths.reader_secret.stat().st_mode & 0o777
     checks.append(
         (
             "解锁密钥权限",
-            secret_mode == 0o600 and len(session.unlock_secret) >= 32,
+            secret_mode == 0o600 and bool(session and len(session.unlock_secret) >= 32),
             oct(secret_mode),
         )
     )
+    checks.append(("邮箱访问策略", access_policy_ok, access_policy_detail))
     mail_mode = paths.mail_database.stat().st_mode & 0o777
     checks.append(("邮件库权限", mail_mode == 0o600, oct(mail_mode)))
     directory_modes = {

@@ -25,6 +25,7 @@ STATIC_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".svg": "image/svg+xml",
 }
+LITERAL_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
 def is_loopback_host(host: str) -> bool:
@@ -35,6 +36,35 @@ def is_loopback_host(host: str) -> bool:
     if not addresses:
         return False
     return all(ipaddress.ip_address(address).is_loopback for address in addresses)
+
+
+def is_literal_loopback_host(host: str) -> bool:
+    return host.lower() in LITERAL_LOOPBACK_HOSTS
+
+
+def _literal_loopback_authority_allowed(authority: str | None, expected_port: int) -> bool:
+    if not authority or authority != authority.strip():
+        return False
+    if any(character.isspace() for character in authority):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(f"//{authority}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        not host
+        or not is_literal_loopback_host(host)
+        or port != expected_port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    return True
 
 
 class ArchiveHTTPServer(ThreadingHTTPServer):
@@ -74,6 +104,9 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
     server: ArchiveHTTPServer
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._host_header_allowed():
+            self._misdirected_request()
+            return
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         try:
@@ -166,6 +199,9 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             self._json({"error": "本地阅读器处理请求失败"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._host_header_allowed():
+            self._misdirected_request()
+            return
         parsed = urllib.parse.urlparse(self.path)
         try:
             if parsed.path.startswith("/api/mail/") and self._mail_api_unavailable():
@@ -194,12 +230,9 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             if self.headers.get("X-Feishu-Archive-Action") != action_name:
                 self._json({"error": "缺少本机同步确认标头"}, status=HTTPStatus.FORBIDDEN)
                 return
-            origin = self.headers.get("Origin")
-            if origin:
-                origin_host = urllib.parse.urlparse(origin).hostname
-                if not origin_host or not is_loopback_host(origin_host):
-                    self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
-                    return
+            if not self._loopback_origin_allowed():
+                self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
+                return
             if starter is None:
                 self._json({"error": "当前阅读器未启用同步控制"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
                 return
@@ -236,7 +269,22 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
 
     def _mail_session_valid(self) -> bool:
         manager = self.server.mail_session_manager
-        return bool(manager and manager.validate_cookie(self.headers.get("Cookie")))
+        return bool(manager and manager.allows_request(self.headers.get("Cookie")))
+
+    def _host_header_allowed(self) -> bool:
+        values = self.headers.get_all("Host") or []
+        if len(values) != 1:
+            return False
+        return _literal_loopback_authority_allowed(
+            values[0],
+            int(self.server.server_address[1]),
+        )
+
+    def _misdirected_request(self) -> None:
+        self._json(
+            {"error": "拒绝非本机或端口不匹配的 Host"},
+            status=HTTPStatus.MISDIRECTED_REQUEST,
+        )
 
     def _mail_unauthorized(self) -> None:
         self._json(
@@ -455,11 +503,28 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         return mailboxes[0] if mailboxes else None
 
     def _loopback_origin_allowed(self) -> bool:
-        origin = self.headers.get("Origin")
-        if not origin:
+        origins = self.headers.get_all("Origin") or []
+        if not origins:
             return True
-        origin_host = urllib.parse.urlparse(origin).hostname
-        return bool(origin_host and is_loopback_host(origin_host))
+        if len(origins) != 1:
+            return False
+        origin = origins[0]
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        return bool(
+            parsed.scheme == "http"
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+            and parsed.username is None
+            and parsed.password is None
+            and _literal_loopback_authority_allowed(
+                parsed.netloc,
+                int(self.server.server_address[1]),
+            )
+        )
 
     def _messages(self, query: dict[str, list[str]]) -> None:
         date_from = _date_to_ms(_first(query, "date_from"))
@@ -721,7 +786,7 @@ def serve(
     mail_sync_schedule: dict[str, Any] | None = None,
     mail_unavailable_reason: str | None = None,
 ) -> None:
-    if not is_loopback_host(host):
+    if not is_literal_loopback_host(host) or not is_loopback_host(host):
         raise ValueError("安全限制：离线阅读器只能监听回环地址 127.0.0.1 或 localhost")
     server = ArchiveHTTPServer(
         (host, port),
@@ -737,6 +802,12 @@ def serve(
         mail_sync_schedule=mail_sync_schedule,
         mail_unavailable_reason=mail_unavailable_reason,
     )
+    try:
+        if not ipaddress.ip_address(str(server.server_address[0])).is_loopback:
+            raise ValueError("安全限制：阅读器实际监听地址不是回环地址")
+    except Exception:
+        server.server_close()
+        raise
     print(f"Feishu Archive 阅读器：http://{host}:{port}")
     print("按 Ctrl+C 停止。阅读器不会监听局域网地址。")
     try:

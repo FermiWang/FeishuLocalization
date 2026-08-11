@@ -140,6 +140,128 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(scheduled_args.max_attachment_mib, 1024)
         reader_args = build_parser().parse_args(["mail-reader-url", "--open"])
         self.assertTrue(reader_args.open)
+        permanent_args = build_parser().parse_args(["mail-reader-url", "--permanent"])
+        self.assertTrue(permanent_args.permanent)
+        self.assertFalse(permanent_args.lock)
+        lock_args = build_parser().parse_args(["mail-reader-url", "--lock"])
+        self.assertTrue(lock_args.lock)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["mail-reader-url", "--permanent", "--lock"]
+            )
+
+    def test_mail_reader_permanent_unlock_and_relock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = io.StringIO()
+            with patch("feishu_archive.cli.webbrowser.open") as opener, contextlib.redirect_stdout(
+                output
+            ):
+                main(
+                    [
+                        "--archive-dir",
+                        temp,
+                        "mail-reader-url",
+                        "--permanent",
+                        "--open",
+                    ]
+                )
+
+            marker = root / "mail-reader.always-unlocked"
+            secret = root / "reader.secret"
+            self.assertTrue(marker.is_file())
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(secret.is_file())
+            opened_url = opener.call_args.args[0]
+            self.assertEqual(opened_url, "http://127.0.0.1:8765/?mode=mail")
+            self.assertNotIn("#", output.getvalue())
+            self.assertNotIn(secret.read_text(encoding="utf-8").strip(), output.getvalue())
+
+            with patch("feishu_archive.cli.serve") as serve_reader:
+                main(["--archive-dir", temp, "serve"])
+            deployed_manager = serve_reader.call_args.kwargs["mail_session_manager"]
+            self.assertIsNotNone(deployed_manager)
+            self.assertTrue(deployed_manager.allows_request(None))
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                main(["--archive-dir", temp, "mail-reader-url", "--lock"])
+            self.assertFalse(marker.exists())
+            self.assertTrue(secret.is_file())
+            self.assertTrue((root / "mail-reader.policy-generation").is_file())
+            self.assertIn("已恢复短期会话锁定", output.getvalue())
+
+    def test_mail_reader_lock_rejects_open_without_changing_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            main(["--archive-dir", temp, "mail-reader-url", "--permanent"])
+            marker = Path(temp) / "mail-reader.always-unlocked"
+            self.assertTrue(marker.exists())
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--archive-dir",
+                        temp,
+                        "mail-reader-url",
+                        "--lock",
+                        "--open",
+                    ]
+                )
+            self.assertEqual(context.exception.code, 2)
+            self.assertTrue(marker.exists())
+
+    def test_invalid_reader_secret_does_not_enable_permanent_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "reader.secret").write_text("short\n", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--archive-dir",
+                        temp,
+                        "mail-reader-url",
+                        "--permanent",
+                    ]
+                )
+            self.assertEqual(context.exception.code, 2)
+            self.assertFalse((root / "mail-reader.always-unlocked").exists())
+
+    def test_nonloopback_permanent_unlock_does_not_create_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--archive-dir",
+                        temp,
+                        "mail-reader-url",
+                        "--host",
+                        "0.0.0.0",
+                        "--permanent",
+                    ]
+                )
+            self.assertEqual(context.exception.code, 2)
+            self.assertFalse((Path(temp) / "mail-reader.always-unlocked").exists())
+
+    def test_misresolved_localhost_does_not_create_permanent_policy(self) -> None:
+        external_resolution = [
+            (2, 1, 6, "", ("192.0.2.10", 0)),
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "feishu_archive.web.socket.getaddrinfo",
+            return_value=external_resolution,
+        ), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--archive-dir",
+                        temp,
+                        "mail-reader-url",
+                        "--host",
+                        "localhost",
+                        "--permanent",
+                    ]
+                )
+            self.assertEqual(context.exception.code, 2)
+            self.assertFalse((Path(temp) / "mail-reader.always-unlocked").exists())
 
     def test_app_config_reads_credentials_from_keychain(self) -> None:
         store = MemoryTokenStore()

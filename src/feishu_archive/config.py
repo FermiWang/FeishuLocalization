@@ -118,6 +118,10 @@ class ArchivePaths:
     def reader_secret(self) -> Path:
         return self.root / "reader.secret"
 
+    @property
+    def mail_reader_permanent_unlock(self) -> Path:
+        return self.root / "mail-reader.always-unlocked"
+
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.attachments.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -14,8 +14,13 @@ from feishu_archive.config import ArchivePaths
 from feishu_archive.database import ArchiveDatabase
 from feishu_archive.demo import seed_demo
 from feishu_archive.mail_database import MailDatabase
-from feishu_archive.reader_auth import ReaderSessionManager
-from feishu_archive.web import ArchiveHTTPServer, is_loopback_host
+from feishu_archive.reader_auth import (
+    ReaderSessionManager,
+    SESSION_COOKIE,
+    disable_permanent_unlock,
+    enable_permanent_unlock,
+)
+from feishu_archive.web import ArchiveHTTPServer, is_loopback_host, serve
 
 
 class WebTests(unittest.TestCase):
@@ -23,6 +28,126 @@ class WebTests(unittest.TestCase):
         self.assertTrue(is_loopback_host("127.0.0.1"))
         self.assertTrue(is_loopback_host("localhost"))
         self.assertFalse(is_loopback_host("0.0.0.0"))
+
+    def test_serve_rejects_localhost_resolving_outside_loopback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            external_resolution = [(2, 1, 6, "", ("192.0.2.10", 0))]
+            with mock.patch(
+                "feishu_archive.web.socket.getaddrinfo",
+                return_value=external_resolution,
+            ), self.assertRaises(ValueError):
+                serve(database, paths, "localhost", 0)
+            with self.assertRaises(ValueError):
+                serve(database, paths, "0.0.0.0", 0)
+
+    def test_permanent_mail_access_is_dynamic_but_host_and_origin_stay_guarded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            mail_database = MailDatabase(paths.mail_database)
+            mail_database.initialize()
+            sessions = ReaderSessionManager(
+                paths.reader_secret,
+                ttl_seconds=60,
+                permanent_unlock_path=paths.mail_reader_permanent_unlock,
+            )
+            token = sessions.create_session(sessions.unlock_secret)
+            self.assertIsNotNone(token)
+            old_cookie = f"{SESSION_COOKIE}={token}"
+
+            controller = mock.MagicMock()
+            controller.request_manual_sync.return_value = True
+            server = ArchiveHTTPServer(
+                ("127.0.0.1", 0),
+                database,
+                paths,
+                mail_database=mail_database,
+                mail_sync_controller=controller,
+                mail_session_manager=sessions,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = int(server.server_address[1])
+                base = f"http://127.0.0.1:{port}"
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(f"{base}/api/mail/status", timeout=2)
+                self.assertEqual(context.exception.code, 401)
+
+                enable_permanent_unlock(paths.mail_reader_permanent_unlock)
+                with urllib.request.urlopen(f"{base}/api/mail/status", timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+
+                forged_host = urllib.request.Request(
+                    f"{base}/api/mail/status",
+                    headers={"Host": f"attacker.example:{port}"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(forged_host, timeout=2)
+                self.assertEqual(context.exception.code, 421)
+
+                wrong_port = urllib.request.Request(
+                    f"{base}/api/mail/status",
+                    headers={"Host": f"127.0.0.1:{port + 1}"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(wrong_port, timeout=2)
+                self.assertEqual(context.exception.code, 421)
+
+                missing_action = urllib.request.Request(
+                    f"{base}/api/mail/sync",
+                    data=b"",
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(missing_action, timeout=2)
+                self.assertEqual(context.exception.code, 403)
+
+                evil_origin = urllib.request.Request(
+                    f"{base}/api/mail/sync",
+                    data=b"",
+                    method="POST",
+                    headers={
+                        "Origin": f"http://attacker.example:{port}",
+                        "X-Feishu-Archive-Action": "mail-sync",
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(evil_origin, timeout=2)
+                self.assertEqual(context.exception.code, 403)
+
+                https_origin = urllib.request.Request(
+                    f"{base}/api/mail/sync",
+                    data=b"",
+                    method="POST",
+                    headers={
+                        "Origin": f"https://127.0.0.1:{port}",
+                        "X-Feishu-Archive-Action": "mail-sync",
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(https_origin, timeout=2)
+                self.assertEqual(context.exception.code, 403)
+                controller.request_manual_sync.assert_not_called()
+
+                disable_permanent_unlock(paths.mail_reader_permanent_unlock)
+                relocked = urllib.request.Request(
+                    f"{base}/api/mail/status",
+                    headers={"Cookie": old_cookie},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(relocked, timeout=2)
+                self.assertEqual(context.exception.code, 401)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_unavailable_mail_lane_returns_503_while_archive_api_stays_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

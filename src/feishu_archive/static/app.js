@@ -116,7 +116,7 @@ function writeMailLocation(messageId = state.selectedMailMessage, replace = fals
 
 function mailAccessMessage(error) {
   return error?.status === 401
-    ? "邮箱尚未解锁。请运行 feishu-archive mail-reader-url --open 解锁。"
+    ? "邮箱尚未解锁。请运行 feishu-archive mail-reader-url --open 临时解锁，或使用 --permanent --open 永久解除本机锁定。"
     : error?.message || "邮件档案暂时不可用。";
 }
 
