@@ -9,8 +9,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import DEFAULT_INCREMENTAL_DAYS, DEFAULT_MAX_ATTACHMENT_BYTES, ArchivePaths
+from .config import (
+    DEFAULT_INCREMENTAL_DAYS,
+    DEFAULT_MAIL_OVERLAP_DAYS,
+    DEFAULT_MAX_ATTACHMENT_BYTES,
+    DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
+    DEFAULT_MAX_MAIL_BYTES,
+    ArchivePaths,
+)
 from .database import ArchiveDatabase
+from .mail_database import MailDatabase
+from .mail_sync import MailSyncer
 from .sync import ArchiveSyncer, SyncCounts
 from .wiki import WikiSyncCounts, WikiSyncer
 
@@ -51,6 +60,11 @@ def acquire_sync_lock(paths: ArchivePaths) -> SyncFileLock:
 def acquire_wiki_sync_lock(paths: ArchivePaths) -> SyncFileLock:
     paths.ensure()
     return SyncFileLock(paths.wiki_sync_lock)
+
+
+def acquire_mail_sync_lock(paths: ArchivePaths) -> SyncFileLock:
+    paths.ensure()
+    return SyncFileLock(paths.mail_sync_lock)
 
 
 def run_sync_cycle(
@@ -273,6 +287,98 @@ class BackgroundWikiSyncController:
             )
         except Exception as exc:
             print(f"[wiki-sync] 手工同步失败：{exc}", file=sys.stderr)
+
+
+def run_mail_sync_cycle(
+    database: MailDatabase,
+    paths: ArchivePaths,
+    provider_factory: Callable[[], Any],
+    *,
+    trigger: str,
+    days: int = DEFAULT_MAIL_OVERLAP_DAYS,
+    folders: list[str] | None = None,
+    skip_attachments: bool = False,
+    max_mail_bytes: int = DEFAULT_MAX_MAIL_BYTES,
+    max_attachment_bytes: int = DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
+    max_pages: int = 500,
+    lock: SyncFileLock | None = None,
+    syncer_factory: Callable[..., MailSyncer] = MailSyncer,
+) -> dict[str, Any]:
+    active_lock = lock or acquire_mail_sync_lock(paths)
+    try:
+        syncer = syncer_factory(
+            database,
+            provider_factory(),
+            paths,
+            max_mail_bytes=max_mail_bytes,
+            max_attachment_bytes=max_attachment_bytes,
+        )
+        syncer.sync(
+            folders=folders,
+            days=days,
+            skip_attachments=skip_attachments,
+            trigger=trigger,
+            max_pages=max_pages,
+        )
+        result = database.latest_sync_run()
+        if result is None:
+            raise RuntimeError("邮箱同步作业状态未保存")
+        return result
+    finally:
+        active_lock.release()
+
+
+class BackgroundMailSyncController:
+    def __init__(
+        self,
+        database: MailDatabase,
+        paths: ArchivePaths,
+        provider_factory: Callable[[], Any],
+        *,
+        days: int = DEFAULT_MAIL_OVERLAP_DAYS,
+        max_mail_bytes: int = DEFAULT_MAX_MAIL_BYTES,
+        max_attachment_bytes: int = DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
+    ) -> None:
+        self.database = database
+        self.paths = paths
+        self.provider_factory = provider_factory
+        self.days = days
+        self.max_mail_bytes = max_mail_bytes
+        self.max_attachment_bytes = max_attachment_bytes
+        self._guard = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        with self._guard:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            try:
+                lock = acquire_mail_sync_lock(self.paths)
+            except SyncBusyError:
+                return False
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(lock,),
+                name="feishu-mail-manual-sync",
+                daemon=True,
+            )
+            self._thread.start()
+            return True
+
+    def _run(self, lock: SyncFileLock) -> None:
+        try:
+            run_mail_sync_cycle(
+                self.database,
+                self.paths,
+                self.provider_factory,
+                trigger="manual",
+                days=self.days,
+                max_mail_bytes=self.max_mail_bytes,
+                max_attachment_bytes=self.max_attachment_bytes,
+                lock=lock,
+            )
+        except Exception as exc:
+            print(f"[mail-sync] 手工同步失败：{exc}", file=sys.stderr)
 
 
 def _add_counts(total: SyncCounts, value: SyncCounts) -> None:

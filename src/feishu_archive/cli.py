@@ -17,15 +17,23 @@ from typing import Any
 
 from . import __version__
 from .automation import (
+    BackgroundMailSyncController,
     BackgroundSyncController,
     BackgroundWikiSyncController,
     SyncBusyError,
+    run_mail_sync_cycle,
     run_sync_cycle,
     run_wiki_sync_cycle,
 )
 from .config import (
     DEFAULT_INCREMENTAL_DAYS,
+    DEFAULT_MAIL_INITIAL_DAYS,
+    DEFAULT_MAIL_OVERLAP_DAYS,
+    DEFAULT_MAIL_SYNC_HOUR,
+    DEFAULT_MAIL_SYNC_MINUTE,
     DEFAULT_MAX_ATTACHMENT_BYTES,
+    DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
+    DEFAULT_MAX_MAIL_BYTES,
     DEFAULT_OAUTH_PORT,
     DEFAULT_READER_PORT,
     DEFAULT_SYNC_HOUR,
@@ -33,13 +41,20 @@ from .config import (
     DEFAULT_WIKI_SYNC_HOUR,
     DEFAULT_WIKI_SYNC_MINUTE,
     DEFAULT_SCOPES,
+    MAIL_SCOPES,
+    MAIL_TOKEN_NAMESPACE,
+    ArchivePaths,
     FeishuAppConfig,
     archive_paths,
 )
 from .database import ArchiveDatabase
 from .demo import seed_demo
 from .feishu import FeishuAPIError, FeishuClient
+from .feishu_mail import FeishuMailProvider
 from .keychain import KeychainError, KeychainStore
+from .mail_database import MailDatabase
+from .mail_sync import MailCapacityError
+from .reader_auth import ReaderSessionManager
 from .sync import ArchiveSyncer
 from .web import is_loopback_host, serve
 from .wiki import WikiSyncer
@@ -48,7 +63,7 @@ from .wiki import WikiSyncer
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="feishu-archive",
-        description="通过飞书官方接口建立本机离线消息与知识库档案",
+        description="通过飞书官方接口建立本机离线消息、知识库与邮箱档案",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
@@ -76,6 +91,22 @@ def build_parser() -> argparse.ArgumentParser:
     auth = subparsers.add_parser("auth", help="通过浏览器完成飞书用户 OAuth 授权")
     auth.add_argument("--oauth-port", type=int, default=DEFAULT_OAUTH_PORT)
     auth.add_argument("--no-open", action="store_true", help="只显示授权链接，不自动打开浏览器")
+
+    mail_configure = subparsers.add_parser(
+        "mail-configure",
+        help="保存独立邮箱应用凭据；未配置时可复用主应用",
+    )
+    mail_configure_mode = mail_configure.add_mutually_exclusive_group(required=True)
+    mail_configure_mode.add_argument("--app-id-stdin", action="store_true", help="从标准输入读取邮箱 App ID")
+    mail_configure_mode.add_argument(
+        "--app-secret-stdin",
+        action="store_true",
+        help="从标准输入读取邮箱 App Secret",
+    )
+
+    mail_auth = subparsers.add_parser("mail-auth", help="完成飞书邮箱只读 OAuth 授权")
+    mail_auth.add_argument("--oauth-port", type=int, default=DEFAULT_OAUTH_PORT)
+    mail_auth.add_argument("--no-open", action="store_true", help="只显示授权链接")
 
     subparsers.add_parser("discover", help="发现用户令牌可见的群聊和有可见消息的单聊")
 
@@ -145,6 +176,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wiki_rebuild.add_argument("--force", action="store_true", help="即使渲染版本未变化也重新生成")
 
+    mail_sync = subparsers.add_parser("mail-sync", help="同步当前用户飞书邮箱到独立本地邮件库")
+    mail_sync.add_argument("--days", type=int, default=DEFAULT_MAIL_INITIAL_DAYS)
+    mail_sync.add_argument(
+        "--folder",
+        action="append",
+        choices=("INBOX", "SENT"),
+        help="可重复指定；默认同步 INBOX 和 SENT",
+    )
+    mail_sync.add_argument("--skip-attachments", action="store_true")
+    mail_sync.add_argument(
+        "--max-mail-gib",
+        type=float,
+        default=DEFAULT_MAX_MAIL_BYTES / 1024**3,
+    )
+    mail_sync.add_argument(
+        "--max-attachment-mib",
+        type=float,
+        default=DEFAULT_MAX_MAIL_ATTACHMENT_BYTES / 1024**2,
+    )
+    mail_sync.add_argument("--max-pages", type=int, default=500)
+
+    mail_scheduled_sync = subparsers.add_parser(
+        "mail-scheduled-sync",
+        help="执行邮箱每日重叠增量同步",
+    )
+    mail_scheduled_sync.add_argument("--days", type=int, default=DEFAULT_MAIL_OVERLAP_DAYS)
+    mail_scheduled_sync.add_argument(
+        "--max-mail-gib",
+        type=float,
+        default=DEFAULT_MAX_MAIL_BYTES / 1024**3,
+    )
+    mail_scheduled_sync.add_argument(
+        "--max-attachment-mib",
+        type=float,
+        default=DEFAULT_MAX_MAIL_ATTACHMENT_BYTES / 1024**2,
+    )
+    mail_scheduled_sync.add_argument("--max-pages", type=int, default=500)
+
+    subparsers.add_parser("mail-status", help="显示独立邮箱同步状态")
+    subparsers.add_parser("mail-doctor", help="检查邮箱权限、数据库、容量和本机安全边界")
+    subparsers.add_parser("mail-preflight", help=argparse.SUPPRESS)
+    mail_reader_url = subparsers.add_parser(
+        "mail-reader-url",
+        help="生成带 URL fragment 的本机邮箱解锁地址",
+    )
+    mail_reader_url.add_argument("--host", default="127.0.0.1")
+    mail_reader_url.add_argument("--port", type=int, default=DEFAULT_READER_PORT)
+    mail_reader_url.add_argument("--open", action="store_true", help="在默认浏览器中打开解锁地址")
+
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
     reader.add_argument("--host", default="127.0.0.1")
     reader.add_argument("--port", type=int, default=DEFAULT_READER_PORT)
@@ -153,17 +233,78 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_archive_paths(paths: ArchivePaths) -> None:
+    paths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for directory in (
+        paths.attachments,
+        paths.exports,
+        paths.knowledge_assets,
+        paths.knowledge_exports,
+    ):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(paths.root, 0o700)
+
+
+def _ensure_mail_paths(paths: ArchivePaths) -> None:
+    paths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for directory in (
+        paths.mail,
+        paths.mail_blobs,
+        paths.mail_tmp,
+        paths.mail_quarantine,
+        paths.mail_exports,
+    ):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+    os.chmod(paths.root, 0o700)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     paths = archive_paths(args.archive_dir)
-    paths.ensure()
-    database = ArchiveDatabase(paths.database)
-    database.initialize()
+    database: ArchiveDatabase | None = None
+    mail_database: MailDatabase | None = None
+
+    archive_commands = {
+        "init",
+        "demo",
+        "discover",
+        "sync",
+        "attachments",
+        "scheduled-sync",
+        "wiki-discover",
+        "wiki-sync",
+        "wiki-scheduled-sync",
+        "wiki-rebuild",
+        "serve",
+        "doctor",
+    }
+    mail_database_commands = {
+        "init",
+        "mail-sync",
+        "mail-scheduled-sync",
+        "mail-status",
+        "mail-doctor",
+        "mail-preflight",
+    }
+
+    if args.command in archive_commands:
+        _ensure_archive_paths(paths)
+        database = ArchiveDatabase(paths.database)
+        database.initialize()
+    if args.command in mail_database_commands:
+        _ensure_mail_paths(paths)
+        mail_database = MailDatabase(paths.mail_database)
+        mail_database.initialize()
     try:
         if args.command == "init":
+            assert database is not None
+            assert mail_database is not None
             print(f"档案库已初始化：{paths.database}")
+            print(f"独立邮件库已初始化：{paths.mail_database}")
         elif args.command == "demo":
+            assert database is not None
             result = seed_demo(database, paths)
             print(
                 f"示例数据已就绪：{result['conversations']} 个会话，"
@@ -173,7 +314,12 @@ def main(argv: list[str] | None = None) -> None:
             _configure(args.app_id_stdin, args.app_secret_stdin)
         elif args.command == "auth":
             _authorize(args.oauth_port, args.no_open)
+        elif args.command == "mail-configure":
+            _mail_configure(args.app_id_stdin, args.app_secret_stdin)
+        elif args.command == "mail-auth":
+            _authorize(args.oauth_port, args.no_open, mail=True)
         elif args.command == "discover":
+            assert database is not None
             client = _client()
             syncer = ArchiveSyncer(
                 database,
@@ -189,6 +335,7 @@ def main(argv: list[str] | None = None) -> None:
             p2p_count = sum(1 for item in chats if item.get("chat_mode") == "p2p")
             print(f"共发现 {len(chats)} 个会话，其中单聊 {p2p_count} 个。")
         elif args.command == "sync":
+            assert database is not None
             max_bytes = int(args.max_attachment_gib * 1024**3)
             if max_bytes < 0:
                 parser.error("--max-attachment-gib 不能小于 0")
@@ -216,6 +363,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"释放 {counts.attachment_bytes_pruned / 1024**2:.1f} MiB"
                 )
         elif args.command == "attachments":
+            assert database is not None
             max_bytes = int(args.max_attachment_gib * 1024**3)
             if max_bytes < 0:
                 parser.error("--max-attachment-gib 不能小于 0")
@@ -236,6 +384,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"跳过 {counts.attachments_skipped} 个"
             )
         elif args.command == "scheduled-sync":
+            assert database is not None
             try:
                 result = run_sync_cycle(
                     database,
@@ -253,6 +402,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"读取 {result['messages_seen']} 条消息，状态 {result['status']}"
                 )
         elif args.command == "wiki-discover":
+            assert database is not None
             spaces = WikiSyncer(database, _client(), paths).discover_spaces()
             if not spaces:
                 print("未发现可见知识空间。")
@@ -260,6 +410,7 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"{item.get('space_id')}\t{item.get('name') or '(未命名)'}")
             print(f"共发现 {len(spaces)} 个知识空间。")
         elif args.command == "wiki-rebuild":
+            assert database is not None
             result = WikiSyncer(database, None, paths).rebuild_views(force=args.force)
             print(
                 f"知识库正文重建完成：检查 {result['documents_seen']} 篇，"
@@ -268,6 +419,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"渲染版本 {result['render_version']}"
             )
         elif args.command in {"wiki-sync", "wiki-scheduled-sync"}:
+            assert database is not None
             max_bytes = int(args.max_asset_gib * 1024**3)
             if max_bytes < 0:
                 parser.error("--max-asset-gib 不能小于 0")
@@ -290,9 +442,107 @@ def main(argv: list[str] | None = None) -> None:
                     f"更新正文 {result['documents_written']} 篇，"
                     f"下载附件 {result['assets_downloaded']} 个，状态 {result['status']}"
                 )
+        elif args.command in {"mail-sync", "mail-scheduled-sync"}:
+            assert mail_database is not None
+            max_mail_bytes = int(args.max_mail_gib * 1024**3)
+            max_attachment_bytes = int(args.max_attachment_mib * 1024**2)
+            if max_mail_bytes < 0:
+                parser.error("--max-mail-gib 不能小于 0")
+            if max_attachment_bytes < 0:
+                parser.error("--max-attachment-mib 不能小于 0")
+            if args.command == "mail-scheduled-sync":
+                ready, detail = _mail_oauth_readiness()
+                if not ready:
+                    print(f"邮箱计划同步已安全跳过：{detail}")
+                    return
+            try:
+                result = run_mail_sync_cycle(
+                    mail_database,
+                    paths,
+                    _mail_provider,
+                    trigger="scheduled" if args.command == "mail-scheduled-sync" else "manual",
+                    days=args.days,
+                    folders=args.folder if args.command == "mail-sync" else None,
+                    skip_attachments=(
+                        args.skip_attachments if args.command == "mail-sync" else False
+                    ),
+                    max_mail_bytes=max_mail_bytes,
+                    max_attachment_bytes=max_attachment_bytes,
+                    max_pages=args.max_pages,
+                )
+            except SyncBusyError:
+                print("已有邮箱同步任务正在运行，本次无需重复启动。")
+            else:
+                print(
+                    f"邮箱同步完成：读取 {result['messages_seen']} 封，"
+                    f"新增 {result['messages_written']} 封，"
+                    f"下载附件 {result['attachments_downloaded']} 个，"
+                    f"状态 {result['status']}"
+                )
+        elif args.command == "mail-status":
+            assert mail_database is not None
+            status = mail_database.status()
+            mailboxes = mail_database.list_mailboxes()
+            status["mailbox"] = mailboxes[0] if mailboxes else None
+            status["oauth_ready"], status["oauth_detail"] = _mail_oauth_readiness()
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        elif args.command == "mail-preflight":
+            assert mail_database is not None
+            integrity = mail_database.integrity_check()
+            if integrity != "ok":
+                raise ValueError(f"邮件数据库预检失败：{integrity}")
+            # Exercise MATCH rather than merely checking that the FTS table exists.
+            mail_database.query_messages(query="feishu archive preflight", limit=1)
+            session = ReaderSessionManager(paths.reader_secret)
+            mode = paths.reader_secret.stat().st_mode & 0o777
+            if mode != 0o600 or len(session.unlock_secret) < 32:
+                raise ValueError("邮箱解锁密钥预检失败")
+            print("邮件库 schema/FTS 与本机解锁密钥预检通过。")
+        elif args.command == "mail-reader-url":
+            _ensure_mail_paths(paths)
+            if not is_loopback_host(args.host):
+                raise ValueError("邮箱解锁地址只能使用本机回环主机")
+            if not 1 <= args.port <= 65535:
+                raise ValueError("--port 必须在 1 到 65535 之间")
+            manager = ReaderSessionManager(paths.reader_secret)
+            fragment = urllib.parse.urlencode({"mail-unlock": manager.unlock_secret})
+            url = f"http://{args.host}:{args.port}/?mode=mail#{fragment}"
+            print(url)
+            if args.open:
+                webbrowser.open(url)
+        elif args.command == "mail-doctor":
+            assert mail_database is not None
+            failed = _mail_doctor(mail_database, paths)
+            raise SystemExit(1 if failed else 0)
         elif args.command == "serve":
+            assert database is not None
             controller = BackgroundSyncController(database, paths, _client)
             wiki_controller = BackgroundWikiSyncController(database, paths, _client)
+            mail_controller: BackgroundMailSyncController | None = None
+            mail_session_manager: ReaderSessionManager | None = None
+            mail_unavailable_reason: str | None = None
+            try:
+                _ensure_mail_paths(paths)
+                mail_database = MailDatabase(paths.mail_database)
+                mail_database.initialize()
+                mail_session_manager = ReaderSessionManager(paths.reader_secret)
+                mail_controller = BackgroundMailSyncController(
+                    mail_database,
+                    paths,
+                    _mail_provider,
+                )
+            except Exception as exc:
+                # Mail is an independent lane. A broken mail database, directory or
+                # unlock secret must never take the chat/wiki reader offline.
+                mail_database = None
+                mail_controller = None
+                mail_session_manager = None
+                mail_unavailable_reason = f"{type(exc).__name__}: {exc}"
+                print(
+                    "警告：邮件档案初始化失败，已降级为 503；"
+                    "聊天与知识库阅读仍可用。",
+                    file=sys.stderr,
+                )
             serve(
                 database,
                 paths,
@@ -300,6 +550,10 @@ def main(argv: list[str] | None = None) -> None:
                 args.port,
                 sync_start=controller.start,
                 wiki_sync_start=wiki_controller.start,
+                mail_database=mail_database,
+                mail_sync_controller=mail_controller,
+                mail_session_manager=mail_session_manager,
+                mail_unavailable_reason=mail_unavailable_reason,
                 sync_schedule={
                     "enabled": True,
                     "hour": DEFAULT_SYNC_HOUR,
@@ -318,11 +572,22 @@ def main(argv: list[str] | None = None) -> None:
                         f"{DEFAULT_WIKI_SYNC_MINUTE:02d} 自动同步知识库"
                     ),
                 },
+                mail_sync_schedule={
+                    "enabled": True,
+                    "hour": DEFAULT_MAIL_SYNC_HOUR,
+                    "minute": DEFAULT_MAIL_SYNC_MINUTE,
+                    "overlap_days": DEFAULT_MAIL_OVERLAP_DAYS,
+                    "description": (
+                        f"每天 {DEFAULT_MAIL_SYNC_HOUR:02d}:"
+                        f"{DEFAULT_MAIL_SYNC_MINUTE:02d} 自动同步邮箱"
+                    ),
+                },
             )
         elif args.command == "doctor":
+            assert database is not None
             failed = _doctor(database, paths.root)
             raise SystemExit(1 if failed else 0)
-    except (ValueError, FeishuAPIError, KeychainError) as exc:
+    except (ValueError, FeishuAPIError, KeychainError, MailCapacityError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
@@ -348,6 +613,41 @@ def _app_config(
     return FeishuAppConfig(app_id=app_id, app_secret=app_secret, redirect_uri=redirect_uri)
 
 
+def _mail_app_config(
+    oauth_port: int = DEFAULT_OAUTH_PORT,
+    store: KeychainStore | None = None,
+) -> FeishuAppConfig:
+    store = store or KeychainStore()
+    mail_app_id = os.environ.get("FEISHU_MAIL_APP_ID", "").strip() or (
+        store.get("mail_app_id") or ""
+    ).strip()
+    if mail_app_id:
+        app_secret = os.environ.get("FEISHU_MAIL_APP_SECRET", "").strip() or (
+            store.get(f"{mail_app_id}:app_secret") or ""
+        ).strip()
+        if not app_secret:
+            raise ValueError("已配置邮箱 App ID，但缺少对应 App Secret")
+        redirect_uri = os.environ.get(
+            "FEISHU_MAIL_REDIRECT_URI",
+            f"http://127.0.0.1:{oauth_port}/oauth/callback",
+        ).strip()
+        return FeishuAppConfig(
+            app_id=mail_app_id,
+            app_secret=app_secret,
+            redirect_uri=redirect_uri,
+            scopes=MAIL_SCOPES,
+        )
+
+    shared = _app_config(oauth_port, store)
+    scopes = tuple(dict.fromkeys((*DEFAULT_SCOPES, *MAIL_SCOPES)))
+    return FeishuAppConfig(
+        app_id=shared.app_id,
+        app_secret=shared.app_secret,
+        redirect_uri=shared.redirect_uri,
+        scopes=scopes,
+    )
+
+
 def _configure(app_id_stdin: bool, app_secret_stdin: bool) -> None:
     value = sys.stdin.read().strip()
     if not value:
@@ -367,14 +667,74 @@ def _configure(app_id_stdin: bool, app_secret_stdin: bool) -> None:
     raise ValueError("请选择要保存的凭据类型")
 
 
-def _client(oauth_port: int = DEFAULT_OAUTH_PORT) -> FeishuClient:
+def _mail_configure(app_id_stdin: bool, app_secret_stdin: bool) -> None:
+    value = sys.stdin.read().strip()
+    if not value:
+        raise ValueError("标准输入为空")
     store = KeychainStore()
+    if app_id_stdin:
+        store.set("mail_app_id", value)
+        print("邮箱 App ID 已保存到 macOS 钥匙串。")
+        return
+    if app_secret_stdin:
+        app_id = (store.get("mail_app_id") or "").strip()
+        if not app_id:
+            raise ValueError("请先执行 mail-configure --app-id-stdin")
+        store.set(f"{app_id}:app_secret", value)
+        print("邮箱 App Secret 已保存到 macOS 钥匙串。")
+        return
+    raise ValueError("请选择要保存的邮箱凭据类型")
+
+
+def _client(
+    oauth_port: int = DEFAULT_OAUTH_PORT,
+    store: KeychainStore | None = None,
+) -> FeishuClient:
+    store = store or KeychainStore()
     return FeishuClient(_app_config(oauth_port, store), store)
 
 
-def _authorize(oauth_port: int, no_open: bool) -> None:
+def _mail_client(
+    oauth_port: int = DEFAULT_OAUTH_PORT,
+    store: KeychainStore | None = None,
+) -> FeishuClient:
+    store = store or KeychainStore()
+    return FeishuClient(
+        _mail_app_config(oauth_port, store),
+        store,
+        token_namespace=MAIL_TOKEN_NAMESPACE,
+    )
+
+
+def _mail_provider() -> FeishuMailProvider:
+    return FeishuMailProvider(_mail_client())
+
+
+def _mail_oauth_readiness(
+    store: KeychainStore | None = None,
+) -> tuple[bool, str]:
+    store = store or KeychainStore()
+    try:
+        client = _mail_client(store=store)
+    except (ValueError, KeychainError) as exc:
+        return False, str(exc)
+    try:
+        if not store.get(client.account("refresh_token")):
+            return False, "未找到邮箱 OAuth 刷新令牌，请执行 mail-auth"
+        granted = client.authorized_scopes()
+    except KeychainError as exc:
+        return False, str(exc)
+    required = set(MAIL_SCOPES) - {"offline_access"}
+    missing = sorted(required - granted)
+    if missing:
+        return False, "需重新执行 mail-auth 授权：" + " ".join(missing)
+    return True, f"应用 {client.config.app_id} 的只读邮箱授权已就绪"
+
+
+def _authorize(oauth_port: int, no_open: bool, *, mail: bool = False) -> None:
     store = KeychainStore()
-    config = _app_config(oauth_port, store)
+    client = _mail_client(oauth_port, store) if mail else _client(oauth_port, store)
+    config = client.config
     parsed_redirect = urllib.parse.urlparse(config.redirect_uri)
     redirect_host = parsed_redirect.hostname or ""
     redirect_port = parsed_redirect.port or (443 if parsed_redirect.scheme == "https" else 80)
@@ -382,7 +742,6 @@ def _authorize(oauth_port: int, no_open: bool) -> None:
         raise ValueError("FEISHU_REDIRECT_URI 路径必须是 /oauth/callback")
     if not is_loopback_host(redirect_host) or redirect_port != oauth_port:
         raise ValueError("OAuth 回调必须指向本机回环地址和 --oauth-port 指定端口")
-    client = FeishuClient(config, store)
     state = client.new_state()
     result: dict[str, str] = {}
 
@@ -425,7 +784,8 @@ def _authorize(oauth_port: int, no_open: bool) -> None:
     server = HTTPServer((redirect_host, oauth_port), CallbackHandler)
     server.timeout = 1
     url = client.authorization_url(state)
-    print("请在 5 分钟内完成飞书授权：")
+    purpose = "飞书邮箱只读授权" if mail else "飞书授权"
+    print(f"请在 5 分钟内完成{purpose}：")
     print(url)
     if not no_open:
         webbrowser.open(url)
@@ -491,6 +851,72 @@ def _doctor(database: ArchiveDatabase, root: Path) -> bool:
         print("安全检查未通过：" + "、".join(hard_failures))
         return True
     return False
+
+
+def _mail_doctor(database: MailDatabase, paths: ArchivePaths) -> bool:
+    checks: list[tuple[str, bool, str]] = []
+    filevault = subprocess.run(
+        ["/usr/bin/fdesetup", "status"], capture_output=True, text=True, check=False
+    )
+    filevault_text = (filevault.stdout or filevault.stderr).strip()
+    checks.append(("FileVault", "FileVault is On" in filevault_text, filevault_text))
+
+    usage = shutil.disk_usage(paths.root)
+    used_ratio = usage.used / usage.total if usage.total else 1.0
+    disk_ok = usage.free >= 75 * 1024**3 and used_ratio < 0.97
+    checks.append(
+        (
+            "邮件写入容量",
+            disk_ok,
+            f"剩余 {_format_bytes(usage.free)}，已用 {used_ratio:.1%}",
+        )
+    )
+    integrity = database.integrity_check()
+    checks.append(("邮件 SQLite 完整性", integrity == "ok", integrity))
+    blob_integrity = database.blob_integrity_report(paths.root)
+    blobs_ok = not blob_integrity["missing"] and not blob_integrity["corrupt"]
+    checks.append(
+        (
+            "邮件 CAS 完整性",
+            blobs_ok,
+            (
+                f"检查 {blob_integrity['checked']} 个，"
+                f"缺失 {blob_integrity['missing']} 个，"
+                f"损坏 {blob_integrity['corrupt']} 个"
+            ),
+        )
+    )
+    checks.append(("阅读器绑定", is_loopback_host("127.0.0.1"), "127.0.0.1 only"))
+
+    session = ReaderSessionManager(paths.reader_secret)
+    secret_mode = paths.reader_secret.stat().st_mode & 0o777
+    checks.append(
+        (
+            "解锁密钥权限",
+            secret_mode == 0o600 and len(session.unlock_secret) >= 32,
+            oct(secret_mode),
+        )
+    )
+    mail_mode = paths.mail_database.stat().st_mode & 0o777
+    checks.append(("邮件库权限", mail_mode == 0o600, oct(mail_mode)))
+    directory_modes = {
+        str(path.relative_to(paths.root)): oct(path.stat().st_mode & 0o777)
+        for path in (paths.mail, paths.mail_blobs, paths.mail_tmp, paths.mail_quarantine)
+    }
+    directories_ok = all(value == "0o700" for value in directory_modes.values())
+    checks.append(
+        (
+            "邮件目录权限",
+            directories_ok,
+            ", ".join(f"{name}={mode}" for name, mode in directory_modes.items()),
+        )
+    )
+    oauth_ready, oauth_detail = _mail_oauth_readiness()
+    checks.append(("邮箱只读 OAuth", oauth_ready, oauth_detail))
+
+    for name, ok, detail in checks:
+        print(f"{'✓' if ok else '!'} {name}: {detail}")
+    return any(not ok for _, ok, _ in checks)
 
 
 def _format_bytes(value: int) -> str:

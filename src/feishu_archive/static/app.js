@@ -11,13 +11,37 @@ const state = {
   wikiView: "nodes",
   wikiSyncWasRunning: false,
   wikiPollTimer: null,
+  mailFolders: [],
+  mailMessages: [],
+  selectedMailFolder: "",
+  selectedMailMessage: null,
+  mailPage: 1,
+  mailPageSize: 30,
+  mailHasMore: false,
+  mailTotal: 0,
+  mailArchiveTotal: 0,
+  mailLoaded: false,
+  mailSyncWasRunning: false,
+  mailPollTimer: null,
 };
 const $ = (id) => document.getElementById(id);
 
 async function request(path, options = {}) {
   const response = await fetch(path, { cache: "no-store", ...options });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || `请求失败：${response.status}`);
+  const raw = await response.text();
+  let payload = {};
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = {};
+    }
+  }
+  if (!response.ok) {
+    const error = new Error(payload.error || `请求失败：${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
@@ -40,19 +64,27 @@ function formatSourceTime(value) {
 }
 
 function setMode(mode) {
+  if (!["messages", "wiki", "mail"].includes(mode)) mode = "messages";
   state.mode = mode;
+  const messages = mode === "messages";
   const wiki = mode === "wiki";
-  $("message-sidebar").hidden = wiki;
+  const mail = mode === "mail";
+  $("message-sidebar").hidden = !messages;
   $("wiki-sidebar").hidden = !wiki;
-  $("message-view").hidden = wiki;
+  $("mail-sidebar").hidden = !mail;
+  $("message-view").hidden = !messages;
   $("wiki-view").hidden = !wiki;
-  $("mode-messages").classList.toggle("active", !wiki);
+  $("mail-view").hidden = !mail;
+  $("mode-messages").classList.toggle("active", messages);
   $("mode-wiki").classList.toggle("active", wiki);
+  $("mode-mail").classList.toggle("active", mail);
 }
 
 function writeWikiLocation(nodeToken = null, replace = false) {
   const url = new URL(window.location.href);
   url.searchParams.set("mode", "wiki");
+  url.searchParams.delete("folder_id");
+  url.searchParams.delete("message_id");
   if (state.selectedWikiSpace) url.searchParams.set("space_id", state.selectedWikiSpace);
   else url.searchParams.delete("space_id");
   if (nodeToken) url.searchParams.set("node_token", nodeToken);
@@ -65,7 +97,66 @@ function writeMessageLocation() {
   url.searchParams.delete("mode");
   url.searchParams.delete("space_id");
   url.searchParams.delete("node_token");
+  url.searchParams.delete("folder_id");
+  url.searchParams.delete("message_id");
   history.pushState({}, "", url);
+}
+
+function writeMailLocation(messageId = state.selectedMailMessage, replace = false) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("mode", "mail");
+  url.searchParams.delete("space_id");
+  url.searchParams.delete("node_token");
+  if (state.selectedMailFolder) url.searchParams.set("folder_id", state.selectedMailFolder);
+  else url.searchParams.delete("folder_id");
+  if (messageId) url.searchParams.set("message_id", messageId);
+  else url.searchParams.delete("message_id");
+  history[replace ? "replaceState" : "pushState"]({}, "", url);
+}
+
+function mailAccessMessage(error) {
+  return error?.status === 401
+    ? "邮箱尚未解锁。请运行 feishu-archive mail-reader-url --open 解锁。"
+    : error?.message || "邮件档案暂时不可用。";
+}
+
+function renderMailEmpty(root, title, detail) {
+  root.replaceChildren();
+  const empty = document.createElement("div");
+  empty.className = "mail-empty-state";
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  const description = document.createElement("span");
+  description.textContent = detail;
+  empty.append(heading, description);
+  root.append(empty);
+}
+
+async function unlockMailSessionFromHash() {
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const unlockToken = fragment.get("mail-unlock");
+  if (!unlockToken) return false;
+  try {
+    await request("/api/mail/session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Feishu-Archive-Action": "mail-session",
+      },
+      body: JSON.stringify({ unlock_token: unlockToken }),
+    });
+    fragment.delete("mail-unlock");
+    const url = new URL(window.location.href);
+    url.hash = fragment.toString();
+    url.searchParams.set("mode", "mail");
+    history.replaceState({}, "", url);
+    return true;
+  } catch (error) {
+    const message = mailAccessMessage(error);
+    $("mail-status").textContent = message;
+    $("mail-sync-status").textContent = message;
+    return false;
+  }
 }
 
 async function loadStatus() {
@@ -352,6 +443,412 @@ async function searchWiki() {
   root.hidden = false;
 }
 
+function mailFolderId(item) {
+  return String(item?.folder_id ?? item?.id ?? "");
+}
+
+function mailMessageId(item) {
+  return String(item?.id ?? item?.message_id ?? item?.provider_message_id ?? "");
+}
+
+function formatMailTime(value) {
+  if (!value) return "时间未知";
+  try {
+    return typeof value === "number" || /^\d+$/.test(String(value))
+      ? formatSourceTime(value)
+      : formatTime(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function mailAddressText(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (Array.isArray(value)) return value.map(mailAddressText).filter(Boolean).join("、");
+  if (typeof value !== "object") return String(value);
+  const name = value.name || value.display_name || value.displayName || "";
+  const address = value.address || value.email || value.mail_address || "";
+  if (name && address && name !== address) return `${name} <${address}>`;
+  return String(name || address || "");
+}
+
+function mailAddresses(item, role) {
+  const candidates = [item?.[role], item?.[`head_${role}`], item?.[`${role}_addresses`]];
+  if (role === "from") {
+    candidates.push(item?.from_address);
+    if (!candidates.some((value) => mailAddressText(value))) {
+      candidates.push({
+        name: item?.sender_name || item?.from_name,
+        address: item?.sender_address,
+      });
+    }
+  }
+  const direct = candidates.map(mailAddressText).find(Boolean);
+  if (direct) return direct;
+  const recipients = Array.isArray(item?.recipients) ? item.recipients : [];
+  return recipients
+    .filter((recipient) => String(recipient.role || recipient.type || "").toLowerCase() === role)
+    .map(mailAddressText)
+    .filter(Boolean)
+    .join("、");
+}
+
+function mailSenderLabel(item) {
+  return item.sender_name || item.from_name || mailAddresses(item, "from") || "未知发件人";
+}
+
+function mailSentTime(item) {
+  return item.sent_at || item.received_at || item.create_time || item.created_at || item.date;
+}
+
+function mailFolderName(item) {
+  const labels = {
+    inbox: "收件箱",
+    sent: "已发送",
+    drafts: "草稿",
+    trash: "已删除",
+    spam: "垃圾邮件",
+    archive: "归档",
+  };
+  const type = String(item?.folder_type || item?.type || "").toLowerCase();
+  return item?.name || item?.display_name || labels[type] || mailFolderId(item) || "未命名文件夹";
+}
+
+function renderMailFolderButton(root, id, name, meta) {
+  const button = document.createElement("button");
+  button.className = `mail-folder${id === state.selectedMailFolder ? " active" : ""}`;
+  const title = document.createElement("span");
+  title.textContent = name;
+  const detail = document.createElement("small");
+  detail.textContent = meta;
+  button.append(title, detail);
+  button.addEventListener("click", () => selectMailFolder(id));
+  root.append(button);
+}
+
+function renderMailFolders() {
+  const root = $("mail-folder-list");
+  root.replaceChildren();
+  renderMailFolderButton(root, "", "全部邮件", `${state.mailArchiveTotal || 0} 封本地邮件`);
+  state.mailFolders.forEach((item) => {
+    const count = item.message_count ?? item.total_count ?? item.messages ?? 0;
+    const unread = item.unread_count ? ` · ${item.unread_count} 封未读` : "";
+    renderMailFolderButton(root, mailFolderId(item), mailFolderName(item), `${count} 封${unread}`);
+  });
+}
+
+async function loadMailStatus() {
+  clearTimeout(state.mailPollTimer);
+  try {
+    const data = await request("/api/mail/status");
+    const mailbox = data.mailbox || data.account || {};
+    const address = mailbox.address || mailbox.email || data.mailbox_address || "";
+    const messages = data.messages ?? data.message_count ?? data.total_messages ?? 0;
+    const attachments = data.attachments ?? data.attachment_count ?? 0;
+    const bytes = data.attachment_bytes ?? data.resource_bytes ?? data.blob_bytes ?? 0;
+    const prefix = address ? `${address} · ` : "";
+    state.mailArchiveTotal = Number(messages) || 0;
+    $("mail-status").textContent = `${prefix}${messages} 封邮件 · ${attachments} 个附件 · 占用 ${formatBytes(bytes)}`;
+
+    const job = data.latest_sync || data.job || data.sync || null;
+    const running = job?.status === "running";
+    const schedule = data.schedule?.description || data.schedule_description || "自动同步未配置";
+    const button = $("mail-sync-now");
+    button.disabled = running;
+    button.textContent = running ? "同步中…" : "同步邮箱";
+    if (!job) {
+      $("mail-sync-status").textContent = schedule;
+    } else if (running) {
+      $("mail-sync-status").textContent = `邮件同步进行中 · ${schedule}`;
+    } else {
+      const labels = { success: "成功", partial: "部分完成", error: "失败" };
+      const detail = job.error ? ` · ${String(job.error).split("\n")[0]}` : "";
+      $("mail-sync-status").textContent = `上次同步${labels[job.status] || job.status}：${formatMailTime(job.finished_at)}${detail} · ${schedule}`;
+    }
+    if (state.mailSyncWasRunning && !running) {
+      await loadMailFolders(true);
+      if (state.mode === "mail") {
+        await loadMailMessages({ selectFirst: true, updateHistory: false });
+      }
+    }
+    state.mailSyncWasRunning = running;
+    state.mailPollTimer = setTimeout(loadMailStatus, running ? 2000 : 60000);
+  } catch (error) {
+    const message = mailAccessMessage(error);
+    $("mail-status").textContent = message;
+    $("mail-sync-status").textContent = message;
+    $("mail-sync-now").disabled = error.status === 401;
+    state.mailLoaded = false;
+    if (error.status === 401) {
+      state.mailMessages = [];
+      state.selectedMailMessage = null;
+      renderMailEmpty($("mail-folder-list"), "邮箱已锁定", message);
+      renderMailEmpty($("mail-message-list"), "邮箱已锁定", message);
+      renderMailEmpty($("mail-detail"), "邮箱已锁定", message);
+    }
+    state.mailPollTimer = setTimeout(loadMailStatus, 60000);
+  }
+}
+
+async function startMailSync() {
+  const button = $("mail-sync-now");
+  button.disabled = true;
+  button.textContent = "正在启动…";
+  $("mail-sync-status").textContent = "正在启动本机邮件同步任务…";
+  try {
+    await request("/api/mail/sync", {
+      method: "POST",
+      headers: { "X-Feishu-Archive-Action": "mail-sync" },
+    });
+    state.mailSyncWasRunning = true;
+    await loadMailStatus();
+  } catch (error) {
+    $("mail-sync-status").textContent = mailAccessMessage(error);
+    button.disabled = error.status === 401;
+    button.textContent = "同步邮箱";
+  }
+}
+
+async function loadMailFolders(keepSelection = false) {
+  try {
+    const data = await request("/api/mail/folders");
+    state.mailFolders = Array.isArray(data.items) ? data.items : (Array.isArray(data.folders) ? data.folders : []);
+    if (!keepSelection || !state.mailFolders.some((item) => mailFolderId(item) === state.selectedMailFolder)) {
+      state.selectedMailFolder = "";
+    }
+    renderMailFolders();
+    state.mailLoaded = true;
+    return true;
+  } catch (error) {
+    const message = mailAccessMessage(error);
+    const root = $("mail-folder-list");
+    renderMailEmpty(root, error.status === 401 ? "邮箱已锁定" : "无法读取文件夹", message);
+    $("mail-status").textContent = message;
+    state.mailLoaded = false;
+    return false;
+  }
+}
+
+function renderMailMessages() {
+  const root = $("mail-message-list");
+  root.replaceChildren();
+  if (!state.mailMessages.length) {
+    renderMailEmpty(root, "没有符合条件的邮件", "这不代表飞书邮箱中不存在数据，也可能受授权范围或同步时间范围限制。");
+    return;
+  }
+  state.mailMessages.forEach((item) => {
+    const id = mailMessageId(item);
+    const button = document.createElement("button");
+    const unread = item.unread === true || item.is_read === false;
+    button.className = `mail-message${unread ? " unread" : ""}${id === state.selectedMailMessage ? " active" : ""}`;
+    const head = document.createElement("span");
+    head.className = "mail-message-head";
+    const sender = document.createElement("strong");
+    sender.textContent = mailSenderLabel(item);
+    const time = document.createElement("time");
+    time.textContent = formatMailTime(mailSentTime(item));
+    head.append(sender, time);
+    const subject = document.createElement("span");
+    subject.className = "mail-message-subject";
+    subject.textContent = item.subject || "（无主题）";
+    const excerpt = document.createElement("span");
+    excerpt.className = "mail-message-excerpt";
+    excerpt.textContent = String(item.snippet || item.body_preview || item.body_plain_text || "").replace(/\s+/g, " ").slice(0, 180);
+    button.append(head, subject);
+    if (excerpt.textContent) button.append(excerpt);
+    const attachmentCount = item.attachment_count ?? (Array.isArray(item.attachments) ? item.attachments.length : 0);
+    if (attachmentCount) {
+      const badge = document.createElement("small");
+      badge.className = "mail-message-attachment";
+      badge.textContent = `${attachmentCount} 个附件`;
+      button.append(badge);
+    }
+    button.addEventListener("click", () => selectMailMessage(id));
+    root.append(button);
+  });
+}
+
+async function loadMailMessages({ selectFirst = true, updateHistory = true } = {}) {
+  const params = new URLSearchParams({
+    page: String(state.mailPage),
+    page_size: String(state.mailPageSize),
+  });
+  const query = $("mail-query").value.trim();
+  if (query) params.set("q", query);
+  if (state.selectedMailFolder) params.set("folder_id", state.selectedMailFolder);
+  const root = $("mail-message-list");
+  renderMailEmpty(root, "正在读取邮件…", "正在从本机邮件档案加载。" );
+  try {
+    const data = await request(`/api/mail/messages?${params}`);
+    state.mailMessages = Array.isArray(data.items) ? data.items : (Array.isArray(data.messages) ? data.messages : []);
+    state.mailPage = Number(data.page || data.pagination?.page || state.mailPage) || 1;
+    const explicitTotal = data.total ?? data.total_count ?? data.pagination?.total;
+    if (explicitTotal !== undefined) state.mailTotal = Number(explicitTotal) || 0;
+    else state.mailTotal = (state.mailPage - 1) * state.mailPageSize + state.mailMessages.length;
+    const explicitHasMore = data.has_more ?? data.pagination?.has_more;
+    state.mailHasMore = typeof explicitHasMore === "boolean"
+      ? explicitHasMore
+      : explicitTotal !== undefined
+        ? state.mailPage * state.mailPageSize < Number(explicitTotal)
+        : state.mailMessages.length === state.mailPageSize;
+    const shown = state.mailMessages.length;
+    $("mail-result-count").textContent = explicitTotal !== undefined
+      ? `共 ${state.mailTotal} 封邮件`
+      : `本页 ${shown} 封邮件`;
+    $("mail-page-label").textContent = `第 ${state.mailPage} 页`;
+    $("mail-prev").disabled = state.mailPage <= 1;
+    $("mail-next").disabled = !state.mailHasMore;
+    renderMailFolders();
+    renderMailMessages();
+    if (!selectFirst || !state.mailMessages.length) {
+      if (!state.mailMessages.length) {
+        state.selectedMailMessage = null;
+        renderMailEmpty($("mail-detail"), "请选择一封邮件", "邮件 HTML 不会在此处执行或渲染。");
+        if (updateHistory) writeMailLocation(null);
+      }
+      return true;
+    }
+    const selected = state.mailMessages.find((item) => mailMessageId(item) === state.selectedMailMessage);
+    await selectMailMessage(mailMessageId(selected || state.mailMessages[0]), updateHistory);
+    return true;
+  } catch (error) {
+    const message = mailAccessMessage(error);
+    if (error.status === 401) state.mailLoaded = false;
+    renderMailEmpty(root, error.status === 401 ? "邮箱已锁定" : "邮件读取失败", message);
+    renderMailEmpty($("mail-detail"), "无法显示邮件", message);
+    $("mail-result-count").textContent = "0 封邮件";
+    $("mail-prev").disabled = true;
+    $("mail-next").disabled = true;
+    return false;
+  }
+}
+
+function appendMailAddressRow(root, label, value) {
+  if (!value) return;
+  const row = document.createElement("div");
+  row.className = "mail-address-row";
+  const name = document.createElement("strong");
+  name.textContent = label;
+  const address = document.createElement("span");
+  address.textContent = value;
+  row.append(name, address);
+  root.append(row);
+}
+
+function renderMailDetail(item) {
+  const root = $("mail-detail");
+  root.replaceChildren();
+  const header = document.createElement("header");
+  header.className = "mail-detail-header";
+  const heading = document.createElement("div");
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "eyebrow";
+  eyebrow.textContent = item.folder_name || item.folder || "本机邮件档案";
+  const subject = document.createElement("h3");
+  subject.textContent = item.subject || "（无主题）";
+  heading.append(eyebrow, subject);
+  const time = document.createElement("time");
+  time.textContent = formatMailTime(mailSentTime(item));
+  header.append(heading, time);
+  root.append(header);
+
+  const addresses = document.createElement("section");
+  addresses.className = "mail-addresses";
+  appendMailAddressRow(addresses, "发件人", mailAddresses(item, "from"));
+  appendMailAddressRow(addresses, "收件人", mailAddresses(item, "to"));
+  appendMailAddressRow(addresses, "抄送", mailAddresses(item, "cc"));
+  appendMailAddressRow(addresses, "密送", mailAddresses(item, "bcc"));
+  if (addresses.childElementCount) root.append(addresses);
+
+  const bodySection = document.createElement("section");
+  bodySection.className = "mail-body-section";
+  const bodyHeading = document.createElement("h4");
+  bodyHeading.textContent = "纯文本正文";
+  const body = document.createElement("pre");
+  body.className = "mail-plain-body";
+  body.textContent = String(item.body_plain_text ?? item.body_text ?? item.text ?? "本地尚无可显示的纯文本正文。");
+  bodySection.append(bodyHeading, body);
+  root.append(bodySection);
+
+  const attachments = Array.isArray(item.attachments) ? item.attachments : [];
+  if (attachments.length) {
+    const section = document.createElement("section");
+    section.className = "mail-attachments";
+    const attachmentHeading = document.createElement("h4");
+    attachmentHeading.textContent = `附件（${attachments.length}）`;
+    section.append(attachmentHeading);
+    attachments.forEach((attachment) => {
+      const id = attachment.id ?? attachment.attachment_id;
+      const status = String(attachment.status || "").toLowerCase();
+      const blocked = ["pending", "skipped", "error", "failed", "metadata_only"].includes(status);
+      const quarantined = status === "quarantined";
+      const element = document.createElement(id !== undefined && !blocked ? "a" : "span");
+      element.className = "mail-attachment";
+      if (quarantined) element.classList.add("quarantined");
+      const filename = attachment.filename || attachment.name || "未命名附件";
+      const size = attachment.byte_size ?? attachment.size;
+      element.textContent = `${filename}${size ? ` · ${formatBytes(size)}` : ""}${blocked ? ` · ${status || "不可下载"}` : ""}${quarantined ? " · 风险格式，下载前需确认" : ""}`;
+      if (element instanceof HTMLAnchorElement) {
+        element.href = `/api/mail/attachments/${encodeURIComponent(id)}`;
+        element.download = filename;
+        if (quarantined) {
+          element.addEventListener("click", (event) => {
+            event.preventDefault();
+            const accepted = window.confirm(
+              `“${filename}”可能包含脚本、宏或其他主动内容。仅在信任发件人和文件来源时下载。是否继续？`,
+            );
+            if (!accepted) return;
+            const download = document.createElement("a");
+            download.href = `/api/mail/attachments/${encodeURIComponent(id)}?confirm=1`;
+            download.download = filename;
+            document.body.append(download);
+            download.click();
+            download.remove();
+          });
+        }
+      }
+      section.append(element);
+    });
+    root.append(section);
+  }
+}
+
+async function selectMailMessage(messageId, updateHistory = true) {
+  if (!messageId) return;
+  state.selectedMailMessage = String(messageId);
+  renderMailMessages();
+  renderMailEmpty($("mail-detail"), "正在读取邮件…", "正在从本机邮件档案加载纯文本正文。" );
+  try {
+    const data = await request(`/api/mail/messages/${encodeURIComponent(messageId)}`);
+    const item = data.item || data.message || data;
+    renderMailDetail(item);
+    $("mail-title").textContent = item.subject || "（无主题）";
+    $("mail-view-meta").textContent = `${mailSenderLabel(item)} · ${formatMailTime(mailSentTime(item))} · 正文仅以纯文本显示`;
+    if (updateHistory) writeMailLocation(messageId);
+  } catch (error) {
+    renderMailEmpty($("mail-detail"), error.status === 401 ? "邮箱已锁定" : "邮件读取失败", mailAccessMessage(error));
+  }
+}
+
+async function selectMailFolder(folderId, updateHistory = true) {
+  state.selectedMailFolder = String(folderId || "");
+  state.selectedMailMessage = null;
+  state.mailPage = 1;
+  renderMailFolders();
+  const folder = state.mailFolders.find((item) => mailFolderId(item) === state.selectedMailFolder);
+  $("mail-title").textContent = folder ? mailFolderName(folder) : "全部邮件";
+  $("mail-view-meta").textContent = "正文以纯文本显示，附件仅提供本地下载。";
+  await loadMailMessages({ selectFirst: true, updateHistory });
+}
+
+async function ensureMailLoaded(updateHistory = true) {
+  if (!state.mailLoaded) {
+    const loaded = await loadMailFolders(true);
+    if (!loaded) return false;
+  }
+  return loadMailMessages({ selectFirst: true, updateHistory });
+}
+
 async function startSync() {
   const button = $("sync-now");
   button.disabled = true;
@@ -507,15 +1004,64 @@ $("mode-wiki").addEventListener("click", async () => {
   if (state.selectedWikiSpace) showWikiNodeList(true);
   else if (state.wikiSpaces.length) await selectWikiSpace(state.wikiSpaces[0].space_id);
 });
+$("mode-mail").addEventListener("click", async () => {
+  setMode("mail");
+  const loaded = await ensureMailLoaded(true);
+  if (!loaded) writeMailLocation(null);
+});
 $("wiki-sync-now").addEventListener("click", startWikiSync);
 $("wiki-search").addEventListener("click", searchWiki);
 $("wiki-query").addEventListener("input", () => { if (state.wikiView === "nodes") renderWikiNodes(); });
 $("wiki-query").addEventListener("keydown", (event) => { if (event.key === "Enter") searchWiki(); });
 $("wiki-back").addEventListener("click", () => showWikiNodeList(true));
+$("mail-sync-now").addEventListener("click", startMailSync);
+$("mail-search").addEventListener("click", async () => {
+  state.mailPage = 1;
+  state.selectedMailMessage = null;
+  await loadMailMessages({ selectFirst: true, updateHistory: true });
+});
+$("mail-query").addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter") return;
+  state.mailPage = 1;
+  state.selectedMailMessage = null;
+  await loadMailMessages({ selectFirst: true, updateHistory: true });
+});
+$("mail-prev").addEventListener("click", async () => {
+  if (state.mailPage <= 1) return;
+  state.mailPage -= 1;
+  state.selectedMailMessage = null;
+  await loadMailMessages({ selectFirst: true, updateHistory: true });
+});
+$("mail-next").addEventListener("click", async () => {
+  if (!state.mailHasMore) return;
+  state.mailPage += 1;
+  state.selectedMailMessage = null;
+  await loadMailMessages({ selectFirst: true, updateHistory: true });
+});
 
 async function restoreLocation() {
   const params = new URLSearchParams(window.location.search);
-  if (params.get("mode") !== "wiki") {
+  const mode = params.get("mode");
+  if (mode === "mail") {
+    setMode("mail");
+    if (!state.mailLoaded) {
+      const loaded = await loadMailFolders(true);
+      if (!loaded) return;
+    }
+    const requestedFolder = params.get("folder_id") || "";
+    state.selectedMailFolder = state.mailFolders.some((item) => mailFolderId(item) === requestedFolder)
+      ? requestedFolder
+      : "";
+    state.mailPage = 1;
+    renderMailFolders();
+    const folder = state.mailFolders.find((item) => mailFolderId(item) === state.selectedMailFolder);
+    $("mail-title").textContent = folder ? mailFolderName(folder) : "全部邮件";
+    const messageId = params.get("message_id");
+    const loaded = await loadMailMessages({ selectFirst: !messageId, updateHistory: false });
+    if (loaded && messageId) await selectMailMessage(messageId, false);
+    return;
+  }
+  if (mode !== "wiki") {
     setMode("messages");
     return;
   }
@@ -533,11 +1079,13 @@ async function restoreLocation() {
 }
 
 window.addEventListener("popstate", () => restoreLocation().catch((error) => {
-  $("wiki-document-meta").textContent = error.message;
+  if (state.mode === "mail") $("mail-view-meta").textContent = mailAccessMessage(error);
+  else $("wiki-document-meta").textContent = error.message;
 }));
 
 async function initialize() {
-  await Promise.all([loadStatus(), loadConversations(), loadSyncStatus(), loadWikiStatus(), loadWikiSpaces()]);
+  await unlockMailSessionFromHash();
+  await Promise.all([loadStatus(), loadConversations(), loadSyncStatus(), loadWikiStatus(), loadWikiSpaces(), loadMailStatus()]);
   await restoreLocation();
 }
 

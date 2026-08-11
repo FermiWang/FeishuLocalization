@@ -16,6 +16,7 @@
       <nav class="mode-switch" aria-label="档案类型">
         <button id="mode-messages" class="mode-button active">聊天记录</button>
         <button id="mode-wiki" class="mode-button">知识库</button>
+        <button id="mode-mail" class="mode-button">邮箱</button>
       </nav>
       <section id="message-sidebar">
         <div id="archive-status" class="status-card">正在读取档案…</div>
@@ -40,6 +41,20 @@
         </div>
         <p class="wiki-space-heading">知识空间</p>
         <nav id="wiki-space-list" class="wiki-space-list" aria-label="知识空间列表"></nav>
+      </section>
+      <section id="mail-sidebar" hidden>
+        <div id="mail-status" class="status-card">正在读取邮件档案…</div>
+        <section class="sync-card" aria-label="邮件同步控制">
+          <button id="mail-sync-now" class="button sync-button">同步邮箱</button>
+          <span id="mail-sync-status" aria-live="polite">正在读取同步状态…</span>
+        </section>
+        <label class="search-label" for="mail-query">搜索邮件</label>
+        <div class="mail-search-row">
+          <input id="mail-query" class="input" type="search" placeholder="主题、正文或地址">
+          <button id="mail-search" class="button">搜索</button>
+        </div>
+        <p class="mail-folder-heading">邮件文件夹</p>
+        <nav id="mail-folder-list" class="mail-folder-list" aria-label="邮件文件夹列表"></nav>
       </section>
     </aside>
 
@@ -88,6 +103,35 @@
         <nav id="wiki-node-list" class="wiki-node-list" aria-label="知识库目录"></nav>
       </section>
       <article id="wiki-document" class="wiki-document" aria-live="polite" hidden></article>
+    </main>
+
+    <main id="mail-view" class="content mail-content" hidden>
+      <header class="content-header mail-header">
+        <div>
+          <p class="eyebrow">飞书邮箱离线阅读</p>
+          <h2 id="mail-title">邮箱</h2>
+          <p id="mail-view-meta" class="mail-view-meta">正文以纯文本显示，附件仅提供本地下载。</p>
+        </div>
+      </header>
+      <section class="result-summary mail-result-summary">
+        <span id="mail-result-count">0 封邮件</span>
+        <span>仅显示 Mail OpenAPI 已授权且已同步到本机的内容</span>
+      </section>
+      <section class="mail-reader" aria-label="邮件阅读器">
+        <div class="mail-list-pane">
+          <nav id="mail-message-list" class="mail-message-list" aria-label="邮件列表">
+            <div class="mail-empty-state"><strong>选择邮箱开始阅读</strong><span>邮件内容仅从本机档案加载。</span></div>
+          </nav>
+          <div class="mail-pagination" aria-label="邮件分页">
+            <button id="mail-prev" class="button secondary" disabled>上一页</button>
+            <span id="mail-page-label">第 1 页</span>
+            <button id="mail-next" class="button secondary" disabled>下一页</button>
+          </div>
+        </div>
+        <article id="mail-detail" class="mail-detail" aria-live="polite">
+          <div class="mail-empty-state"><strong>请选择一封邮件</strong><span>邮件 HTML 不会在此处执行或渲染。</span></div>
+        </article>
+      </section>
     </main>
   </div>
   <script src="/static/app.js" defer></script>

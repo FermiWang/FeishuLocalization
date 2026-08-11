@@ -29,6 +29,43 @@ class RecordingClient(FeishuClient):
 
 
 class FeishuClientTests(unittest.TestCase):
+    def test_token_namespace_isolates_oauth_for_the_same_app_id(self) -> None:
+        store = MemoryTokenStore()
+        config = FeishuAppConfig(
+            "cli_shared",
+            "secret",
+            "http://127.0.0.1:8766/oauth/callback",
+        )
+        default_client = FeishuClient(config, store)
+        mail_client = FeishuClient(config, store, token_namespace="mail")
+
+        default_client._save_token_result(
+            {
+                "access_token": "chat-access",
+                "expires_in": 3600,
+                "refresh_token": "chat-refresh",
+                "scope": "im:message:readonly offline_access",
+            }
+        )
+        mail_client._save_token_result(
+            {
+                "access_token": "mail-access",
+                "expires_in": 3600,
+                "refresh_token": "mail-refresh",
+                "scope": "mail:user_mailbox:readonly offline_access",
+            }
+        )
+
+        self.assertEqual(store.get("cli_shared:access_token"), "chat-access")
+        self.assertEqual(store.get("cli_shared:refresh_token"), "chat-refresh")
+        self.assertEqual(store.get("cli_shared:mail:access_token"), "mail-access")
+        self.assertEqual(store.get("cli_shared:mail:refresh_token"), "mail-refresh")
+        self.assertEqual(default_client.authorized_scopes(), {"im:message:readonly", "offline_access"})
+        self.assertEqual(
+            mail_client.authorized_scopes(),
+            {"mail:user_mailbox:readonly", "offline_access"},
+        )
+
     def test_message_paging_uses_documented_limits(self) -> None:
         client = RecordingClient()
         pages = list(client.iter_message_pages("chat", "oc_1", start_time=100, end_time=200))

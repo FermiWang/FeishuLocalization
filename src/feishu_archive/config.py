@@ -15,6 +15,12 @@ DEFAULT_SYNC_HOUR = 3
 DEFAULT_SYNC_MINUTE = 30
 DEFAULT_WIKI_SYNC_HOUR = 3
 DEFAULT_WIKI_SYNC_MINUTE = 45
+DEFAULT_MAIL_SYNC_HOUR = 4
+DEFAULT_MAIL_SYNC_MINUTE = 0
+DEFAULT_MAIL_INITIAL_DAYS = 30
+DEFAULT_MAIL_OVERLAP_DAYS = 2
+DEFAULT_MAX_MAIL_BYTES = 2 * 1024**3
+DEFAULT_MAX_MAIL_ATTACHMENT_BYTES = 25 * 1024**2
 DEFAULT_SCOPES = (
     "im:message:readonly",
     "im:message.p2p_msg:get_as_user",
@@ -27,6 +33,20 @@ DEFAULT_SCOPES = (
     "drive:drive:readonly",
     "offline_access",
 )
+
+MAIL_SCOPES = (
+    "mail:user_mailbox:readonly",
+    "mail:user_mailbox.folder:read",
+    "mail:user_mailbox.message:readonly",
+    "mail:user_mailbox.message.subject:read",
+    "mail:user_mailbox.message.address:read",
+    "mail:user_mailbox.message.body:read",
+    "offline_access",
+)
+
+# OAuth tokens for the mail lane must never share the legacy/default account
+# names used by chat and wiki, even when both lanes reuse the same Feishu app.
+MAIL_TOKEN_NAMESPACE = "mail"
 
 
 @dataclass(frozen=True)
@@ -58,6 +78,30 @@ class ArchivePaths:
         return self.knowledge / "exports"
 
     @property
+    def mail_database(self) -> Path:
+        return self.root / "mail.sqlite3"
+
+    @property
+    def mail(self) -> Path:
+        return self.root / "mail"
+
+    @property
+    def mail_blobs(self) -> Path:
+        return self.mail / "blobs"
+
+    @property
+    def mail_tmp(self) -> Path:
+        return self.mail / "tmp"
+
+    @property
+    def mail_quarantine(self) -> Path:
+        return self.mail / "quarantine"
+
+    @property
+    def mail_exports(self) -> Path:
+        return self.mail / "exports"
+
+    @property
     def sync_lock(self) -> Path:
         return self.root / "sync.lock"
 
@@ -65,13 +109,33 @@ class ArchivePaths:
     def wiki_sync_lock(self) -> Path:
         return self.root / "wiki-sync.lock"
 
+    @property
+    def mail_sync_lock(self) -> Path:
+        return self.root / "mail-sync.lock"
+
+    @property
+    def reader_secret(self) -> Path:
+        return self.root / "reader.secret"
+
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.attachments.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.exports.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.knowledge_assets.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.knowledge_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.mail_blobs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.mail_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.mail_quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.mail_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
+        for directory in (
+            self.mail,
+            self.mail_blobs,
+            self.mail_tmp,
+            self.mail_quarantine,
+            self.mail_exports,
+        ):
+            os.chmod(directory, 0o700)
 
 
 @dataclass(frozen=True)

@@ -1,18 +1,18 @@
 # Feishu Archive
 
-Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞书官方授权接口同步当前用户可见的聊天记录和知识空间，将消息、目录、文档正文、图片、文件、全文索引与同步状态保存在本机，并提供只监听回环地址的离线网页阅读器。
+Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞书官方授权接口同步当前用户可见的聊天记录、知识空间和飞书邮箱，将消息、目录、文档正文、邮件正文、图片、文件、附件、全文索引与同步状态保存在本机，并提供只监听回环地址的离线网页阅读器。
 
-项目不会读取、复制或尝试解密 `LarkShell`、`messages.db`、`im.db`、`Core.db` 等飞书客户端私有数据。
+项目不会读取、复制或尝试解密 `LarkShell`、`messages.db`、`im.db`、`Core.db` 等飞书客户端私有数据。邮箱同步使用飞书 Mail OpenAPI，不通过 IMAP，也不读取飞书客户端的本地邮件数据库。
 
 ## 先看平台支持范围
 
-当前版本为 `0.2.0`，完整的“授权、同步、自动增量更新”链路仍以 macOS 为目标平台。Linux 和 Windows 可以复用部分源码，但不能在不改代码的情况下获得与 macOS 相同的完整同步能力。
+当前版本为 `0.3.0`，完整的“授权、同步、自动增量更新”链路仍以 macOS 为目标平台。Linux 和 Windows 可以复用部分源码，但不能在不改代码的情况下获得与 macOS 相同的完整同步能力。
 
 | 能力 | macOS 原生 | Linux 原生 | Windows 原生 | Windows + WSL2 |
 | --- | --- | --- | --- | --- |
 | 初始化 SQLite、写入示例数据 | 支持 | 支持 | 不支持 | 支持 |
 | 启动本地离线阅读器 | 支持 | 支持 | 不支持 | 支持 |
-| 飞书 OAuth、聊天与知识库同步 | 支持 | 暂不支持 | 不支持 | 暂不支持 |
+| 飞书 OAuth、聊天、知识库与邮箱同步 | 支持 | 暂不支持 | 不支持 | 暂不支持 |
 | 安全保存应用凭据和用户令牌 | macOS Keychain | 尚未适配 Secret Service | 尚未适配 Credential Manager | 尚未适配 |
 | 重复同步进程锁 | `fcntl` | `fcntl` | 尚未适配 | `fcntl` |
 | 后台启动和每日计划任务 | LaunchAgent | 可为阅读器配置 systemd；同步尚不可用 | 尚未适配 Task Scheduler | 可运行阅读器 |
@@ -40,9 +40,12 @@ Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞�
 - 为知识库建立独立 FTS5 索引，并为每篇新版文档生成本地 HTML 副本。
 - 知识库阅读采用“左侧空间、右侧节点目录、点击节点查看正文”的三级导航；图片在正文内显示，网页和文件从新窗口打开。
 - 未适配的旧版文档、表格、多维表格、思维笔记、幻灯片等保留目录元数据并标记为“仅目录”。
+- 将飞书邮箱作为聊天、知识库之外的第三条独立同步通道，通过 Mail OpenAPI 同步收件箱和已发送邮件、正文及附件。
+- 邮箱使用独立的 `mail.sqlite3`、`mail/blobs` 内容寻址存储和 `mail-sync.lock`，不会把邮件写入聊天/知识库数据库，也不会共用同步锁。
+- 邮箱阅读器使用短期本机会话；邮件 HTML 不直接渲染，附件只以强制下载方式提供；HTML、SVG、脚本和可执行格式还需要二次风险确认。
 - 保存本人和其他人发送的图片并直接显示；普通文件只归档其他人或机器人发送的文件。
 - 单个资源限制为 100 MB；消息资源和知识库资源分别设置本地总容量上限。
-- macOS 每天 03:30 增量同步消息、03:45 增量同步知识库，阅读器也提供手工同步按钮。
+- macOS 每天 03:30 增量同步消息、03:45 增量同步知识库、04:00 增量同步邮箱，阅读器也提供手工同步按钮。
 - 离线阅读器不加载 CDN、外部字体、统计脚本或其他网络资源。
 - 单个会话可导出 JSON 或自包含 HTML。
 
@@ -68,7 +71,7 @@ cd FeishuLocalization
 
 ## macOS：完整部署
 
-macOS 是当前唯一支持真实 OAuth、聊天同步、知识库同步和每日计划任务的完整平台。
+macOS 是当前唯一支持真实 OAuth、聊天同步、知识库同步、邮箱同步和每日计划任务的完整平台。
 
 ### 1. 安装并确认 Python
 
@@ -132,6 +135,18 @@ http://127.0.0.1:8766/oauth/callback
 
 权限变更必须发布新版本，然后重新执行 OAuth；只在后台勾选但未发布，不会改变已授权令牌。
 
+邮箱同步还需要在飞书开放平台为应用申请并发布以下只读权限；此列表与源码中的 `MAIL_SCOPES` 保持一致：
+
+- `mail:user_mailbox:readonly`
+- `mail:user_mailbox.folder:read`
+- `mail:user_mailbox.message:readonly`
+- `mail:user_mailbox.message.subject:read`
+- `mail:user_mailbox.message.address:read`
+- `mail:user_mailbox.message.body:read`
+- `offline_access`
+
+推荐为邮箱准备独立的企业自建应用，使邮件授权和聊天/知识库授权保持边界清晰。也可以复用主应用，但必须在主应用中保留原有权限、追加上述邮箱权限、发布新版本，并重新执行 `mail-auth`；原有 `auth` 令牌不会自动取得新增邮箱权限。
+
 ### 4. 保存凭据并完成 OAuth
 
 先在开放平台复制 App ID：
@@ -162,6 +177,16 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 
 复制命令输出的授权链接到浏览器，并保持当前终端运行，直到 `8766` 回调完成。
 
+如使用独立邮箱应用，按相同方式把它的 App ID 和 App Secret 保存到邮箱专用 Keychain 项：
+
+```bash
+pbpaste | ./bin/feishu-archive mail-configure --app-id-stdin
+pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
+./bin/feishu-archive mail-auth
+```
+
+如复用主应用，不需要执行 `mail-configure`；发布邮箱权限后直接执行 `mail-auth`。程序会以“原聊天/知识库权限 + 邮箱只读权限”的并集发起授权，但邮箱令牌固定写入 `{app_id}:mail:*` Keychain 命名空间，不会覆盖聊天/知识库使用的 `{app_id}:*` 令牌。独立邮箱应用仍是推荐方案，因为它还能在开放平台的应用、权限发布和撤销层面保持隔离。浏览器不能自动打开时可使用 `mail-auth --no-open`。
+
 ### 5. 首次发现和完整同步
 
 首次回溯可能需要较长时间，并受租户保留期、机器人群成员身份、历史消息可见性和接口限流影响。
@@ -178,6 +203,13 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 
 # 检查数据库、磁盘、FileVault 和授权状态
 ./bin/feishu-archive doctor
+
+# 首次同步最近 30 天的收件箱和已发送邮件
+./bin/feishu-archive mail-sync
+
+# 检查独立邮件库、授权范围、容量和本机安全边界
+./bin/feishu-archive mail-status
+./bin/feishu-archive mail-doctor
 ```
 
 常用的范围和容量参数：
@@ -208,10 +240,24 @@ pbpaste | ./bin/feishu-archive configure --app-secret-stdin
 
 # 排查或开发时强制重建，即使渲染版本未变化
 ./bin/feishu-archive wiki-rebuild --force
+
+# 只同步一个系统文件夹；--folder 可重复指定 INBOX 或 SENT
+./bin/feishu-archive mail-sync --folder INBOX
+
+# 邮箱元数据与正文照常同步，但不下载附件
+./bin/feishu-archive mail-sync --skip-attachments
+
+# 调整邮件归档总量、单附件上限和首次回溯范围
+./bin/feishu-archive mail-sync --days 30 --max-mail-gib 2 --max-attachment-mib 25
+
+# 手工执行与每日任务相同的 2 天重叠增量同步
+./bin/feishu-archive mail-scheduled-sync --days 2
 ```
 
 `wiki-rebuild` 用于阅读器升级后的本地迁移。它会保留已有消息、知识空间、正文原始块和资源文件，只重新生成正文 HTML 与离线导出。
 macOS 的 `scripts/install-local.sh` 会在启动新版阅读器前自动执行一次；渲染版本没有变化时会直接跳过。
+
+邮箱首次同步默认回溯 30 天；每日任务默认重叠回看最近 2 天，用于补收延迟出现或状态变化的邮件。邮箱内容与附件合计默认最多写入 2 GiB，单个附件默认最多 25 MiB。可用空间低于 75 GiB 或磁盘使用率达到 97% 时，邮箱同步硬停止；可用空间低于 100 GiB 或使用率达到 95% 时，暂停下载附件并保留邮件同步结果。容量门槛是保护本机磁盘的运行条件，不应通过修改状态库或删除锁文件绕过。
 
 ### 6. 安装 macOS 后台服务
 
@@ -225,12 +271,18 @@ command -v python3
 
 安装脚本会：
 
+- 在停止现有服务前，用候选运行时预检邮件 schema、FTS 和解锁密钥；
 - 把稳定运行副本保存到 `~/Library/Application Support/Feishu Archive/runtime`；
 - 注册阅读器 LaunchAgent `com.fermiwang.feishu-archive`；
 - 注册每天 03:30 的消息同步任务；
 - 注册每天 03:45 的知识库同步任务；
+- 注册每天 04:00 的独立邮箱同步任务 `com.fermiwang.feishu-archive-mail-sync`；
 - 把日志写入 `~/Library/Application Support/Feishu Archive/logs`；
 - 只让阅读器监听 <http://127.0.0.1:8765>。
+
+候选运行时通过预检后，脚本会临时保留上一版运行时和 LaunchAgent；如果后续正文重建、plist 安装、服务启动或健康检查失败，会自动恢复上一版并重新注册原服务。只有新版阅读器通过 `/api/status` 健康检查后，回滚副本才会删除。
+
+邮箱计划任务使用独立的 `mail-sync.lock`。开放平台权限尚未发布、尚未执行 `mail-auth` 或授权已经失效时，任务会安全跳过，不会降级到 IMAP，也不会影响 03:30 的聊天同步或 03:45 的知识库同步。
 
 验证服务：
 
@@ -238,6 +290,16 @@ command -v python3
 curl --fail http://127.0.0.1:8765/api/status
 curl --fail http://127.0.0.1:8765/api/wiki/status
 launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive"
+launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-mail-sync"
+./bin/feishu-archive mail-status
+./bin/feishu-archive mail-doctor
+```
+
+邮箱 API 在未建立本机会话时应返回 `401`。使用下列命令生成并打开带 URL fragment 的解锁地址；fragment 不会作为 HTTP 请求的一部分发送给服务端，页面只用它交换短期、仅驻留内存的本机会话：
+
+```bash
+curl -i http://127.0.0.1:8765/api/mail/status
+./bin/feishu-archive mail-reader-url --open
 ```
 
 查看日志：
@@ -246,6 +308,7 @@ launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive"
 tail -f "$HOME/Library/Application Support/Feishu Archive/logs/service.error.log"
 tail -f "$HOME/Library/Application Support/Feishu Archive/logs/sync.error.log"
 tail -f "$HOME/Library/Application Support/Feishu Archive/logs/wiki-sync.error.log"
+tail -f "$HOME/Library/Application Support/Feishu Archive/logs/mail-sync.error.log"
 ```
 
 移除后台服务但保留档案数据：
@@ -363,11 +426,11 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 
 ## 在另一台机器上迁移已有档案
 
-档案不是只复制一个 SQLite 文件就能完整迁移。应处理数据库、WAL、附件、知识库资源、HTML 导出和凭据边界。
+档案不是只复制一个 SQLite 文件就能完整迁移。应处理聊天与知识库数据库、独立邮件数据库、WAL、附件、知识库资源、邮件 blob、HTML 导出和凭据边界。
 
 ### 安全迁移流程
 
-1. 在源机器停止阅读器和两个同步任务，避免复制过程中继续写入。
+1. 在源机器停止阅读器和聊天、知识库、邮箱三个同步任务，避免复制过程中继续写入。
 2. 复制整个档案根目录，而不是只复制 `archive.sqlite3`。
 3. 不复制 `.venv`；在目标机器重新创建虚拟环境。
 4. macOS Keychain 项不会随档案目录复制；目标 Mac 需要重新配置应用凭据并执行 OAuth。
@@ -377,6 +440,7 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 ### 当前迁移限制
 
 - 运行中直接复制 SQLite 可能遗漏 `archive.sqlite3-wal` 中的数据。
+- 邮件保存在独立的 `mail.sqlite3` 和 `mail/blobs`；只复制其中一项会得到不完整的邮件档案，运行中复制也可能遗漏 `mail.sqlite3-wal`。
 - 聊天附件主要使用档案根目录下的相对路径，整目录迁移后通常仍可读取。
 - 知识库资源数据库目前保存绝对本机路径。跨用户名、跨目录或跨系统复制后，阅读器中的知识库图片和附件可能无法打开。
 - `knowledge/exports` 中的 HTML 使用相对资源路径，更适合在保持目录结构时独立迁移和查看。
@@ -401,6 +465,11 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 - 阅读器只允许绑定 `127.0.0.1`、`::1` 或 `localhost`。
 - OAuth `state` 会校验，授权码只在本地回调服务中交换。
 - macOS 上的应用凭据和令牌保存在 Keychain，日志和 SQLite 不写入这些值。
+- 邮箱 API 需要短期、仅驻留服务进程内存的本机会话；解锁密钥通过 URL fragment 交给页面，不写入查询字符串或服务访问日志。
+- 邮件 HTML 正文不在阅读器中直接渲染，避免远程资源、脚本和跟踪像素被激活；附件响应固定为强制下载，不以内联方式打开。
+- HTML、SVG、脚本、XML 和可执行附件标记为 `quarantined`；直接下载会被拒绝，只有阅读器显示风险提示并由用户二次确认后才提供强制下载。
+- 邮箱数据、内容 blob、同步状态和进程锁分别位于 `mail.sqlite3`、`mail/blobs` 和 `mail-sync.lock`，不与聊天/知识库通道混写。
+- 邮件内容使用 SHA-256 内容寻址；重叠同步会复核已有文件的大小与摘要并修复损坏对象，`mail-doctor` 会扫描索引中的 blob 完整性。
 - SQLite、FTS 索引、附件和 HTML 导出仍是本机文件；macOS 建议启用 FileVault。
 - App Secret 只从环境变量或 macOS Keychain 读取，不写入项目配置文件。
 - 导出文件是明文副本，需要自行控制保存位置、备份和传播范围。
@@ -413,6 +482,11 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 | `0 个会话 · 0 条消息` | 服务可能正常，但真实档案还没有数据。依次检查应用凭据、OAuth、`discover` 和 `sync --all-discovered`。不要用 demo 数据冒充真实同步。 |
 | 浏览器没有出现飞书登录页 | 运行 `auth --no-open` 并手工打开链接；同时保持终端运行，确认 `8766` 未被占用。 |
 | OAuth 后仍提示缺少权限 | 在开放平台发布新增权限后重新执行 `auth`；旧令牌不会自动获得新权限。 |
+| `mail-auth` 后仍提示缺少邮箱权限 | 核对 `MAIL_SCOPES` 对应的只读权限是否已经发布，而不只是保存在开放平台草稿中；随后重新执行 `mail-auth`。复用主应用时也必须重新授权。 |
+| 邮箱计划任务显示跳过 | 尚未配置/发布邮箱权限或没有有效邮箱 OAuth 令牌时属于安全行为；完成 `mail-auth` 后再运行 `mail-doctor`，聊天和知识库同步不受影响。 |
+| 邮件正文存在但附件未下载 | 检查 25 MiB 单附件上限、2 GiB 邮件总量上限，以及 100 GiB/95% 的附件暂停阈值；达到 75 GiB/97% 硬停止阈值时应先释放磁盘空间。 |
+| 风险格式附件不能直接下载 | `quarantined` 附件需要在本机阅读器中阅读风险提示并二次确认；不要通过改数据库状态或绕过确认链接来打开不可信文件。 |
+| 直接访问 `/api/mail/*` 返回 `401` | 邮箱阅读器要求短期本机会话；运行 `mail-reader-url --open` 重新解锁，不要把 fragment 中的密钥复制到日志或聊天中。 |
 | 单聊数量明显少于飞书客户端 | 群列表接口不返回单聊；需要 `search:message`，且超出租户保留期或不可搜索的单聊仍无法发现。 |
 | 图片或附件缺失 | 检查机器人是否在会话内、资源是否超过 100 MB、是否受防泄密策略限制，并运行 `attachments --workers 4`。 |
 | 知识空间有节点数量但正文显示方式仍旧 | 运行 `wiki-rebuild`，使用已保存的原始内容块重建正文；无需执行 `wiki-sync --force`。 |
@@ -452,6 +526,8 @@ sh -n scripts/uninstall-local.sh
 - 知识库只保存 OAuth 用户当前可见的空间和节点；暂时不可见的旧节点会标记为 `missing`，不会因一次权限变化静默删除本地正文。
 - 当前完整正文适配覆盖新版文档和普通文件；旧版文档、电子表格、多维表格、思维笔记、幻灯片及第三方组件只保存目录元数据。
 - 知识库附件同样限制单文件不超过 100 MB；超限或受防泄密策略限制时，正文仍会保留并记录资源错误。
+- 邮箱通道只覆盖 Mail OpenAPI 和当前 OAuth 用户可见的数据，不尝试从 IMAP 或飞书客户端私有数据库补齐；被删除、超出接口可见范围或受租户策略限制的邮件无法恢复。
+- 系统文件夹当前以 `INBOX` 和 `SENT` 为默认同步范围；首次默认回溯 30 天，每日按 2 天重叠窗口增量同步，仍受 Mail OpenAPI 分页、权限与租户策略限制。
 
 飞书接口参考：
 
@@ -465,7 +541,8 @@ sh -n scripts/uninstall-local.sh
 - [获取知识空间子节点列表](https://open.feishu.cn/document/server-docs/docs/wiki-v2/space-node/list)
 - [获取新版文档纯文本内容](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/raw_content)
 - [获取新版文档所有块](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document-block/list)
+- [飞书邮箱 Mail OpenAPI](https://open.feishu.cn/document/server-docs/mail-v1/user_mailbox)
 
 ## 项目阶段
 
-当前已经完成 macOS 上的聊天历史回溯、知识库新版文档与文件节点离线化，以及两类每日增量同步。下一阶段若要面向任何 macOS、Windows 和 Linux 机器发布，应优先完成多平台凭据存储、锁、数据目录、资源路径、磁盘加密检查、后台任务安装器和 CI 测试矩阵，再发布新的平台支持声明。
+当前已经完成 macOS 上的聊天历史回溯、知识库新版文档与文件节点离线化，以及基于飞书 Mail OpenAPI 的第三条独立邮箱同步通道；聊天、知识库、邮箱分别执行每日增量同步。邮箱投入真实运行前，仍须先在飞书开放平台发布 `MAIL_SCOPES` 对应权限并完成 `mail-auth`，未授权的计划任务只会安全跳过。下一阶段若要面向任何 macOS、Windows 和 Linux 机器发布，应优先完成多平台凭据存储、锁、数据目录、资源路径、磁盘加密检查、后台任务安装器和 CI 测试矩阵，再发布新的平台支持声明。

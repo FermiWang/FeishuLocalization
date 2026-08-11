@@ -49,10 +49,15 @@ class FeishuClient:
         token_store: TokenStore,
         *,
         timeout: float = 30,
+        token_namespace: str | None = None,
     ) -> None:
         self.config = config
         self.token_store = token_store
         self.timeout = timeout
+        namespace = (token_namespace or "").strip()
+        if ":" in namespace:
+            raise ValueError("token_namespace 不能包含冒号")
+        self.token_namespace = namespace
         ca_file = os.environ.get("SSL_CERT_FILE", "").strip()
         if not ca_file and os.path.isfile(MACOS_SYSTEM_CA_FILE):
             ca_file = MACOS_SYSTEM_CA_FILE
@@ -62,6 +67,8 @@ class FeishuClient:
         self._current_user_open_id: str | None = None
 
     def account(self, name: str) -> str:
+        if self.token_namespace:
+            return f"{self.config.app_id}:{self.token_namespace}:{name}"
         return f"{self.config.app_id}:{name}"
 
     def new_state(self) -> str:

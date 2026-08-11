@@ -15,6 +15,8 @@ from typing import Any, Callable
 
 from .config import ArchivePaths
 from .database import ArchiveDatabase
+from .mail_database import MailDatabase
+from .reader_auth import ReaderSessionManager
 
 
 STATIC_TYPES = {
@@ -48,6 +50,11 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         sync_schedule: dict[str, Any] | None = None,
         wiki_sync_start: Callable[[], bool] | None = None,
         wiki_sync_schedule: dict[str, Any] | None = None,
+        mail_database: MailDatabase | None = None,
+        mail_sync_controller: Any | None = None,
+        mail_session_manager: ReaderSessionManager | None = None,
+        mail_sync_schedule: dict[str, Any] | None = None,
+        mail_unavailable_reason: str | None = None,
     ) -> None:
         self.database = database
         self.paths = paths
@@ -55,6 +62,11 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         self.sync_schedule = sync_schedule or {"enabled": False}
         self.wiki_sync_start = wiki_sync_start
         self.wiki_sync_schedule = wiki_sync_schedule or {"enabled": False}
+        self.mail_database = mail_database
+        self.mail_sync_controller = mail_sync_controller
+        self.mail_session_manager = mail_session_manager
+        self.mail_sync_schedule = mail_sync_schedule or {"enabled": False}
+        self.mail_unavailable_reason = mail_unavailable_reason
         super().__init__(server_address, ArchiveRequestHandler)
 
 
@@ -65,7 +77,21 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         try:
-            if parsed.path == "/api/status":
+            if parsed.path.startswith("/api/mail/") and self._mail_api_unavailable():
+                return
+            if parsed.path.startswith("/api/mail/") and not self._mail_session_valid():
+                self._mail_unauthorized()
+            elif parsed.path == "/api/mail/status":
+                self._mail_status(query)
+            elif parsed.path == "/api/mail/folders":
+                self._mail_folders(query)
+            elif parsed.path == "/api/mail/messages":
+                self._mail_messages(query)
+            elif parsed.path.startswith("/api/mail/messages/"):
+                self._mail_message(parsed.path)
+            elif parsed.path.startswith("/api/mail/attachments/"):
+                self._mail_attachment(parsed.path, query)
+            elif parsed.path == "/api/status":
                 self._json(self.server.database.status())
             elif parsed.path == "/api/sync/status":
                 self._json(
@@ -142,6 +168,20 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         try:
+            if parsed.path.startswith("/api/mail/") and self._mail_api_unavailable():
+                return
+            if parsed.path == "/api/mail/session":
+                self._mail_session()
+                return
+            if parsed.path.startswith("/api/mail/"):
+                if not self._mail_session_valid():
+                    self._mail_unauthorized()
+                    return
+                if parsed.path == "/api/mail/sync":
+                    self._mail_sync()
+                    return
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
             actions = {
                 "/api/sync": ("sync", self.server.sync_start),
                 "/api/wiki/sync": ("wiki-sync", self.server.wiki_sync_start),
@@ -167,8 +207,259 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                 self._json({"error": "已有同步任务正在运行"}, status=HTTPStatus.CONFLICT)
                 return
             self._json({"status": "accepted"}, status=HTTPStatus.ACCEPTED)
+        except ValueError as exc:
+            self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception:
             self._json({"error": "启动同步失败"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _mail_database(self) -> MailDatabase | None:
+        database = self.server.mail_database
+        if database is None:
+            self._json(
+                {"error": "当前阅读器未启用邮件档案"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return database
+
+    def _mail_api_unavailable(self) -> bool:
+        if (
+            self.server.mail_unavailable_reason is None
+            and self.server.mail_database is not None
+            and self.server.mail_session_manager is not None
+        ):
+            return False
+        self._json(
+            {"error": "邮件档案暂不可用；聊天与知识库仍可使用"},
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        return True
+
+    def _mail_session_valid(self) -> bool:
+        manager = self.server.mail_session_manager
+        return bool(manager and manager.validate_cookie(self.headers.get("Cookie")))
+
+    def _mail_unauthorized(self) -> None:
+        self._json(
+            {"error": "邮箱档案已锁定，请使用本机解锁链接重新进入"},
+            status=HTTPStatus.UNAUTHORIZED,
+        )
+
+    def _mail_session(self) -> None:
+        manager = self.server.mail_session_manager
+        if manager is None:
+            self._json(
+                {"error": "当前阅读器未启用邮箱会话"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if not self._loopback_origin_allowed():
+            self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
+            return
+        raw_length = self.headers.get("Content-Length") or "0"
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("Content-Length 无效") from exc
+        if content_length < 1:
+            raise ValueError("缺少邮箱解锁密钥")
+        if content_length > 4096:
+            self._json({"error": "请求体过大"}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("邮箱解锁请求必须是 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("邮箱解锁请求必须是 JSON 对象")
+        presented = payload.get("secret") or payload.get("unlock_token")
+        if not isinstance(presented, str):
+            raise ValueError("缺少邮箱解锁密钥")
+        token = manager.create_session(presented)
+        if token is None:
+            self._mail_unauthorized()
+            return
+        self._json(
+            {"status": "unlocked", "expires_in": manager.ttl_seconds},
+            headers={"Set-Cookie": manager.cookie_value(token)},
+        )
+
+    def _mail_status(self, query: dict[str, list[str]]) -> None:
+        database = self._mail_database()
+        if database is None:
+            return
+        mailbox = self._mailbox(database, query)
+        mailbox_id = int(mailbox["id"]) if mailbox else None
+        status = database.status(mailbox_id)
+        if mailbox:
+            mailbox = _public_mailbox(mailbox)
+            mailbox["address"] = mailbox.get("primary_email_address") or ""
+        self._json(
+            {
+                **status,
+                "mailbox": mailbox,
+                "mailboxes": [_public_mailbox(item) for item in database.list_mailboxes()],
+                "schedule": self.server.mail_sync_schedule,
+            }
+        )
+
+    def _mail_folders(self, query: dict[str, list[str]]) -> None:
+        database = self._mail_database()
+        if database is None:
+            return
+        mailbox = self._mailbox(database, query)
+        items = database.list_folders(int(mailbox["id"])) if mailbox else []
+        self._json(
+            {
+                "items": [_public_mail_folder(item) for item in items],
+                "mailbox": _public_mailbox(mailbox) if mailbox else None,
+            }
+        )
+
+    def _mail_messages(self, query: dict[str, list[str]]) -> None:
+        database = self._mail_database()
+        if database is None:
+            return
+        mailbox = self._mailbox(database, query)
+        page = _positive_int(_first(query, "page") or "1", "page", maximum=1_000_000)
+        page_size = _positive_int(_first(query, "page_size") or "50", "page_size", maximum=200)
+        folder_value = _first(query, "folder_id")
+        folder_id: int | str | None = None
+        if folder_value:
+            folder_id = int(folder_value) if folder_value.isdigit() else folder_value
+        items = database.query_messages(
+            mailbox_id=int(mailbox["id"]) if mailbox else None,
+            query=_first(query, "q"),
+            folder_id=folder_id,
+            limit=page_size + 1,
+            offset=(page - 1) * page_size,
+        )
+        has_more = len(items) > page_size
+        public_items = [_mail_message_value(item) for item in items[:page_size]]
+        self._json(
+            {
+                "items": public_items,
+                "page": page,
+                "page_size": page_size,
+                "has_more": has_more,
+            }
+        )
+
+    def _mail_message(self, path: str) -> None:
+        database = self._mail_database()
+        if database is None:
+            return
+        raw_id = path.removeprefix("/api/mail/messages/")
+        if not raw_id.isdigit():
+            raise ValueError("邮件 ID 无效")
+        item = database.get_message(int(raw_id))
+        if item is None:
+            self._json({"error": "邮件不存在"}, status=HTTPStatus.NOT_FOUND)
+            return
+        self._json({"item": _mail_message_value(item)})
+
+    def _mail_attachment(
+        self,
+        path: str,
+        query: dict[str, list[str]],
+    ) -> None:
+        database = self._mail_database()
+        if database is None:
+            return
+        raw_id = path.removeprefix("/api/mail/attachments/")
+        if not raw_id.isdigit():
+            raise ValueError("附件 ID 无效")
+        attachment = database.get_attachment(int(raw_id))
+        if (
+            not attachment
+            or attachment.get("status") not in {"available", "downloaded", "quarantined"}
+            or not attachment.get("relative_path")
+        ):
+            self._json({"error": "附件不存在或尚未下载"}, status=HTTPStatus.NOT_FOUND)
+            return
+        quarantined = attachment.get("status") == "quarantined"
+        if quarantined and _first(query, "confirm") != "1":
+            self._json(
+                {
+                    "error": (
+                        "该附件属于可能执行脚本或主动内容的风险格式；"
+                        "请在本机阅读器中明确确认后下载"
+                    )
+                },
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        root = self.server.paths.root.resolve()
+        relative_path = Path(str(attachment["relative_path"]))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            self._json({"error": "附件路径无效"}, status=HTTPStatus.NOT_FOUND)
+            return
+        target = (root / relative_path).resolve()
+        if root not in target.parents or not target.is_file():
+            self._json({"error": "附件不存在"}, status=HTTPStatus.NOT_FOUND)
+            return
+        filename = str(attachment.get("filename") or target.name)
+        content_type = (
+            attachment.get("content_type")
+            or attachment.get("blob_media_type")
+            or mimetypes.guess_type(filename)[0]
+            or "application/octet-stream"
+        )
+        response_headers = (
+            {"X-Feishu-Archive-Warning": "quarantined-attachment"}
+            if quarantined
+            else None
+        )
+        self._bytes(
+            target.read_bytes(),
+            str(content_type),
+            filename=filename,
+            headers=response_headers,
+        )
+
+    def _mail_sync(self) -> None:
+        if self.headers.get("X-Feishu-Archive-Action") != "mail-sync":
+            self._json({"error": "缺少本机同步确认标头"}, status=HTTPStatus.FORBIDDEN)
+            return
+        if not self._loopback_origin_allowed():
+            self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
+            return
+        controller = self.server.mail_sync_controller
+        starter = getattr(controller, "request_manual_sync", None)
+        if not callable(starter):
+            starter = getattr(controller, "start", None)
+        if not callable(starter):
+            self._json(
+                {"error": "当前阅读器未启用邮件同步控制"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if not starter():
+            self._json({"error": "已有邮件同步任务正在运行"}, status=HTTPStatus.CONFLICT)
+            return
+        self._json({"status": "accepted"}, status=HTTPStatus.ACCEPTED)
+
+    def _mailbox(
+        self,
+        database: MailDatabase,
+        query: dict[str, list[str]],
+    ) -> dict[str, Any] | None:
+        raw_id = _first(query, "mailbox_id")
+        if raw_id:
+            if not raw_id.isdigit():
+                raise ValueError("mailbox_id 无效")
+            mailbox = database.get_mailbox(int(raw_id))
+            if mailbox is None:
+                raise ValueError("邮箱账户不存在")
+            return mailbox
+        mailboxes = database.list_mailboxes()
+        return mailboxes[0] if mailboxes else None
+
+    def _loopback_origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        origin_host = urllib.parse.urlparse(origin).hostname
+        return bool(origin_host and is_loopback_host(origin_host))
 
     def _messages(self, query: dict[str, list[str]]) -> None:
         date_from = _date_to_ms(_first(query, "date_from"))
@@ -360,11 +651,18 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         body = resource.read_bytes()
         self._bytes(body, STATIC_TYPES.get(Path(name).suffix, "application/octet-stream"))
 
-    def _json(self, value: Any, *, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _json(
+        self,
+        value: Any,
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._bytes(
             json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             "application/json; charset=utf-8",
             status=status,
+            headers=headers,
         )
 
     def _bytes(
@@ -375,6 +673,7 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         status: HTTPStatus = HTTPStatus.OK,
         filename: str | None = None,
         allow_same_origin_frame: bool = False,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -393,11 +692,17 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         if filename:
             encoded = urllib.parse.quote(filename)
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded}")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[reader] {self.client_address[0]} {fmt % args}")
+        # BaseHTTPRequestHandler's default request line contains the raw query.
+        # Mail searches can be sensitive, so only log method, path and status.
+        path = urllib.parse.urlparse(self.path).path
+        status = str(args[1]) if len(args) > 1 else "-"
+        print(f"[reader] {self.client_address[0]} {self.command} {path} {status}")
 
 
 def serve(
@@ -410,6 +715,11 @@ def serve(
     sync_schedule: dict[str, Any] | None = None,
     wiki_sync_start: Callable[[], bool] | None = None,
     wiki_sync_schedule: dict[str, Any] | None = None,
+    mail_database: MailDatabase | None = None,
+    mail_sync_controller: Any | None = None,
+    mail_session_manager: ReaderSessionManager | None = None,
+    mail_sync_schedule: dict[str, Any] | None = None,
+    mail_unavailable_reason: str | None = None,
 ) -> None:
     if not is_loopback_host(host):
         raise ValueError("安全限制：离线阅读器只能监听回环地址 127.0.0.1 或 localhost")
@@ -421,6 +731,11 @@ def serve(
         sync_schedule=sync_schedule,
         wiki_sync_start=wiki_sync_start,
         wiki_sync_schedule=wiki_sync_schedule,
+        mail_database=mail_database,
+        mail_sync_controller=mail_sync_controller,
+        mail_session_manager=mail_session_manager,
+        mail_sync_schedule=mail_sync_schedule,
+        mail_unavailable_reason=mail_unavailable_reason,
     )
     print(f"Feishu Archive 阅读器：http://{host}:{port}")
     print("按 Ctrl+C 停止。阅读器不会监听局域网地址。")
@@ -435,6 +750,76 @@ def serve(
 def _first(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _positive_int(value: str, name: str, *, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是正整数") from exc
+    if parsed < 1 or parsed > maximum:
+        raise ValueError(f"{name} 必须在 1 到 {maximum} 之间")
+    return parsed
+
+
+def _mail_message_value(item: dict[str, Any]) -> dict[str, Any]:
+    value = dict(item)
+    for key in (
+        "raw_json",
+        "security_level_json",
+        "source_hash",
+        "body_html_blob_id",
+        "raw_blob_id",
+    ):
+        value.pop(key, None)
+    for relation in ("recipients", "labels", "folders", "attachments"):
+        if not isinstance(value.get(relation), list):
+            continue
+        public_items: list[dict[str, Any]] = []
+        for raw in value[relation]:
+            if not isinstance(raw, dict):
+                continue
+            public = dict(raw)
+            for key in ("raw_json", "relative_path", "blob_id", "sha256", "provider_id"):
+                public.pop(key, None)
+            public_items.append(public)
+        value[relation] = public_items
+    value.setdefault("snippet", value.get("excerpt") or value.get("body_plain_text") or "")
+    value.setdefault("sent_at", value.get("send_date"))
+    value.setdefault("received_at", value.get("received_date"))
+    return value
+
+
+def _public_mailbox(item: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "id",
+        "provider",
+        "provider_mailbox_id",
+        "primary_email_address",
+        "display_name",
+        "status",
+        "last_seen_at",
+        "last_synced_at",
+        "error",
+    }
+    return {key: value for key, value in item.items() if key in allowed}
+
+
+def _public_mail_folder(item: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "id",
+        "mailbox_id",
+        "provider_folder_id",
+        "name",
+        "folder_type",
+        "parent_provider_folder_id",
+        "unread_count",
+        "total_count",
+        "message_count",
+        "status",
+        "last_seen_at",
+    }
+    return {key: value for key, value in item.items() if key in allowed}
 
 
 def _date_to_ms(value: str | None, *, end_of_day: bool = False) -> int | None:
