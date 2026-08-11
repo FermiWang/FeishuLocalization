@@ -1,3 +1,4 @@
+import http.client
 import io
 import time
 import unittest
@@ -177,6 +178,24 @@ class FeishuClientTests(unittest.TestCase):
 
         self.assertEqual(result["data"]["ok"], True)
         self.assertEqual(opener.call_count, 2)
+
+    def test_json_request_retries_remote_disconnect(self) -> None:
+        client = RecordingClient()
+        client.token_store.set(client.account("access_token"), "user-token")
+        client.token_store.set(client.account("access_expires_at"), str(int(time.time()) + 3600))
+
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"code":0,"data":{"ok":true}}'
+        with patch(
+            "feishu_archive.feishu.urllib.request.urlopen",
+            side_effect=[http.client.RemoteDisconnected("remote closed"), response],
+        ) as opener, patch("feishu_archive.feishu.time.sleep") as sleeper:
+            result = FeishuClient._json_request(client, "GET", "/test")
+
+        self.assertEqual(result["data"]["ok"], True)
+        self.assertEqual(opener.call_count, 2)
+        sleeper.assert_called_once_with(1)
 
     def test_json_request_retries_http_400_rate_limit(self) -> None:
         client = RecordingClient()

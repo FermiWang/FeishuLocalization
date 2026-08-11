@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import secrets
@@ -454,6 +455,11 @@ class FeishuClient:
                     time.sleep(min(2**attempt, 5))
                     continue
                 raise FeishuAPIError(f"飞书 API 网络请求失败：{exc.reason}") from exc
+            except (ConnectionError, http.client.HTTPException) as exc:
+                if attempt < 3:
+                    time.sleep(min(2**attempt, 5))
+                    continue
+                raise FeishuAPIError(f"飞书 API 网络请求失败：{exc}") from exc
             except TimeoutError as exc:
                 if attempt < 3:
                     time.sleep(min(2**attempt, 5))
