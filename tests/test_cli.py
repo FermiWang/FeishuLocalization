@@ -70,7 +70,7 @@ class AppConfigTests(unittest.TestCase):
             self.assertTrue((root / "archive.sqlite3").exists())
             kwargs = serve_reader.call_args.kwargs
             self.assertIsNone(kwargs["mail_database"])
-            self.assertIsNone(kwargs["mail_session_manager"])
+            self.assertIsNotNone(kwargs["mail_session_manager"])
             self.assertIsNone(kwargs["mail_sync_controller"])
             self.assertIn("FileExistsError", kwargs["mail_unavailable_reason"])
             self.assertIn("聊天与知识库阅读仍可用", error.getvalue())
@@ -109,6 +109,19 @@ class AppConfigTests(unittest.TestCase):
     def test_scheduled_sync_uses_two_day_overlap(self) -> None:
         args = build_parser().parse_args(["scheduled-sync"])
         self.assertEqual(args.days, 2)
+
+    def test_insights_commands_default_to_secure_daily_model_route(self) -> None:
+        args = build_parser().parse_args(["insights-run"])
+        self.assertEqual(args.timezone, "Europe/Amsterdam")
+        self.assertEqual(args.host, "192.168.100.179")
+        self.assertEqual(args.model, "vmlx/gemma-4-31b-it-8bit")
+        self.assertEqual(args.remote_port, 11435)
+        self.assertFalse(args.no_model)
+        self.assertFalse(args.dry_run)
+        configure = build_parser().parse_args(
+            ["insights-configure", "--bearer-token-stdin"]
+        )
+        self.assertTrue(configure.bearer_token_stdin)
 
     def test_wiki_rebuild_can_force_local_rendering(self) -> None:
         args = build_parser().parse_args(["wiki-rebuild", "--force"])

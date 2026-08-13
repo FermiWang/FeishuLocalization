@@ -17,6 +17,14 @@ DEFAULT_WIKI_SYNC_HOUR = 3
 DEFAULT_WIKI_SYNC_MINUTE = 45
 DEFAULT_MAIL_SYNC_HOUR = 4
 DEFAULT_MAIL_SYNC_MINUTE = 0
+DEFAULT_INSIGHTS_SYNC_HOUR = 4
+DEFAULT_INSIGHTS_SYNC_MINUTE = 30
+DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
+DEFAULT_VMLX_HOST = "192.168.100.179"
+DEFAULT_VMLX_USER = "apple"
+DEFAULT_VMLX_MODEL = "vmlx/gemma-4-31b-it-8bit"
+DEFAULT_VMLX_LOCAL_PORT = 18135
+DEFAULT_VMLX_REMOTE_PORT = 11435
 DEFAULT_MAIL_INITIAL_DAYS: int | None = None
 DEFAULT_MAIL_OVERLAP_DAYS = 2
 DEFAULT_MAIL_MAX_PAGES = 5000
@@ -83,6 +91,18 @@ class ArchivePaths:
         return self.root / "mail.sqlite3"
 
     @property
+    def insights_database(self) -> Path:
+        return self.root / "insights.sqlite3"
+
+    @property
+    def insights(self) -> Path:
+        return self.root / "insights"
+
+    @property
+    def insights_exports(self) -> Path:
+        return self.insights / "exports"
+
+    @property
     def mail(self) -> Path:
         return self.root / "mail"
 
@@ -115,6 +135,10 @@ class ArchivePaths:
         return self.root / "mail-sync.lock"
 
     @property
+    def insights_lock(self) -> Path:
+        return self.root / "insights.lock"
+
+    @property
     def reader_secret(self) -> Path:
         return self.root / "reader.secret"
 
@@ -132,6 +156,7 @@ class ArchivePaths:
         self.mail_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.mail_quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.mail_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.insights_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
         for directory in (
             self.mail,
@@ -139,6 +164,8 @@ class ArchivePaths:
             self.mail_tmp,
             self.mail_quarantine,
             self.mail_exports,
+            self.insights,
+            self.insights_exports,
         ):
             os.chmod(directory, 0o700)
 

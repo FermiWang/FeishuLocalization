@@ -16,6 +16,7 @@ from typing import Any, Callable
 from .config import ArchivePaths
 from .database import ArchiveDatabase
 from .mail_database import MailDatabase
+from .insights_database import InsightsDatabase
 from .reader_auth import ReaderSessionManager
 
 
@@ -85,6 +86,9 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         mail_session_manager: ReaderSessionManager | None = None,
         mail_sync_schedule: dict[str, Any] | None = None,
         mail_unavailable_reason: str | None = None,
+        insights_database: InsightsDatabase | None = None,
+        insights_schedule: dict[str, Any] | None = None,
+        insights_unavailable_reason: str | None = None,
     ) -> None:
         self.database = database
         self.paths = paths
@@ -97,6 +101,9 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         self.mail_session_manager = mail_session_manager
         self.mail_sync_schedule = mail_sync_schedule or {"enabled": False}
         self.mail_unavailable_reason = mail_unavailable_reason
+        self.insights_database = insights_database
+        self.insights_schedule = insights_schedule or {"enabled": False}
+        self.insights_unavailable_reason = insights_unavailable_reason
         super().__init__(server_address, ArchiveRequestHandler)
 
 
@@ -110,10 +117,49 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            if parsed.path.startswith("/api/insights/") and self._insights_api_unavailable():
+                return
+            if parsed.path.startswith("/api/insights/") and not self._mail_session_valid():
+                self._mail_unauthorized()
+                return
             if parsed.path.startswith("/api/mail/") and self._mail_api_unavailable():
                 return
             if parsed.path.startswith("/api/mail/") and not self._mail_session_valid():
                 self._mail_unauthorized()
+            elif parsed.path == "/api/insights/status":
+                database = self._insights_database()
+                if database is not None:
+                    self._json({**database.status(), "schedule": self.server.insights_schedule})
+            elif parsed.path == "/api/insights/daily":
+                database = self._insights_database()
+                if database is not None:
+                    item = database.latest_report(_first(query, "date"))
+                    if item is None:
+                        self._json({"error": "尚未生成该日期的每日洞察"}, status=HTTPStatus.NOT_FOUND)
+                    else:
+                        self._json({"item": item})
+            elif parsed.path == "/api/insights/tasks":
+                database = self._insights_database()
+                if database is not None:
+                    self._json(
+                        {
+                            "items": database.list_tasks(
+                                status=_first(query, "status"),
+                                limit=int(_first(query, "limit") or 500),
+                            )
+                        }
+                    )
+            elif parsed.path == "/api/insights/opportunities":
+                database = self._insights_database()
+                if database is not None:
+                    self._json(
+                        {
+                            "items": database.list_opportunities(
+                                status=_first(query, "status"),
+                                limit=int(_first(query, "limit") or 500),
+                            )
+                        }
+                    )
             elif parsed.path == "/api/mail/status":
                 self._mail_status(query)
             elif parsed.path == "/api/mail/folders":
@@ -204,6 +250,17 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         try:
+            if parsed.path.startswith("/api/insights/"):
+                if self._insights_api_unavailable():
+                    return
+                if not self._mail_session_valid():
+                    self._mail_unauthorized()
+                    return
+                if parsed.path.startswith("/api/insights/tasks/") and parsed.path.endswith("/status"):
+                    self._insights_task_status(parsed.path)
+                    return
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
             if parsed.path.startswith("/api/mail/") and self._mail_api_unavailable():
                 return
             if parsed.path == "/api/mail/session":
@@ -253,6 +310,61 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
             )
         return database
+
+    def _insights_database(self) -> InsightsDatabase | None:
+        database = self.server.insights_database
+        if database is None:
+            self._json(
+                {"error": "每日洞察暂不可用；聊天、知识库与邮箱阅读仍可使用"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return database
+
+    def _insights_api_unavailable(self) -> bool:
+        if self.server.insights_database is not None:
+            return False
+        self._json(
+            {"error": "每日洞察暂不可用；三条源档案仍可使用"},
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        return True
+
+    def _insights_task_status(self, path: str) -> None:
+        if self.headers.get("X-Feishu-Archive-Action") != "insights-task-status":
+            self._json({"error": "缺少本机任务确认标头"}, status=HTTPStatus.FORBIDDEN)
+            return
+        if not self._loopback_origin_allowed():
+            self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
+            return
+        parts = path.strip("/").split("/")
+        if len(parts) != 5 or not parts[3].isdigit():
+            raise ValueError("任务 ID 无效")
+        raw_length = self.headers.get("Content-Length") or "0"
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("Content-Length 无效") from exc
+        if content_length < 1 or content_length > 4096:
+            raise ValueError("任务状态请求体无效")
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("任务状态请求必须是 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("任务状态请求必须是 JSON 对象")
+        database = self._insights_database()
+        if database is None:
+            return
+        item = database.set_task_status(
+            int(parts[3]),
+            {
+                "status": payload.get("status"),
+                "actor_kind": "human",
+                "operation_id": payload.get("operation_id"),
+                "reason": payload.get("reason"),
+            },
+        )
+        self._json({"item": item})
 
     def _mail_api_unavailable(self) -> bool:
         if (
@@ -785,6 +897,9 @@ def serve(
     mail_session_manager: ReaderSessionManager | None = None,
     mail_sync_schedule: dict[str, Any] | None = None,
     mail_unavailable_reason: str | None = None,
+    insights_database: InsightsDatabase | None = None,
+    insights_schedule: dict[str, Any] | None = None,
+    insights_unavailable_reason: str | None = None,
 ) -> None:
     if not is_literal_loopback_host(host) or not is_loopback_host(host):
         raise ValueError("安全限制：离线阅读器只能监听回环地址 127.0.0.1 或 localhost")
@@ -801,6 +916,9 @@ def serve(
         mail_session_manager=mail_session_manager,
         mail_sync_schedule=mail_sync_schedule,
         mail_unavailable_reason=mail_unavailable_reason,
+        insights_database=insights_database,
+        insights_schedule=insights_schedule,
+        insights_unavailable_reason=insights_unavailable_reason,
     )
     try:
         if not ipaddress.ip_address(str(server.server_address[0])).is_loopback:

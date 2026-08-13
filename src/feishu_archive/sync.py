@@ -50,6 +50,7 @@ class ArchiveSyncer:
 
     def discover(self) -> list[dict[str, Any]]:
         current_user_id = self.client.current_user_open_id()
+        self.database.set_metadata("current_user_open_id", current_user_id)
         chats: list[dict[str, Any]] = []
         for page in self.client.iter_chat_pages():
             for item in page.get("items") or []:
@@ -186,6 +187,7 @@ class ArchiveSyncer:
         run_id = self.database.start_sync_run(unique_chat_ids, days)
         counts = SyncCounts()
         current_user_id = self.client.current_user_open_id()
+        self.database.set_metadata("current_user_open_id", current_user_id)
         counts.attachments_pruned, counts.attachment_bytes_pruned = (
             self._prune_sent_attachments(current_user_id)
         )
@@ -253,6 +255,7 @@ class ArchiveSyncer:
         run_id = self.database.start_sync_run(unique_chat_ids, None)
         counts = SyncCounts()
         current_user_id = self.client.current_user_open_id()
+        self.database.set_metadata("current_user_open_id", current_user_id)
         counts.attachments_pruned, counts.attachment_bytes_pruned = (
             self._prune_sent_attachments(current_user_id)
         )

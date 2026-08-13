@@ -10,10 +10,12 @@ import sys
 import time
 import urllib.parse
 import webbrowser
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import __version__
 from .automation import (
@@ -21,11 +23,15 @@ from .automation import (
     BackgroundSyncController,
     BackgroundWikiSyncController,
     SyncBusyError,
+    acquire_insights_lock,
     run_mail_sync_cycle,
     run_sync_cycle,
     run_wiki_sync_cycle,
 )
 from .config import (
+    DEFAULT_INSIGHTS_SYNC_HOUR,
+    DEFAULT_INSIGHTS_SYNC_MINUTE,
+    DEFAULT_INSIGHTS_TIMEZONE,
     DEFAULT_INCREMENTAL_DAYS,
     DEFAULT_MAIL_INITIAL_DAYS,
     DEFAULT_MAIL_MAX_PAGES,
@@ -41,6 +47,11 @@ from .config import (
     DEFAULT_SYNC_MINUTE,
     DEFAULT_WIKI_SYNC_HOUR,
     DEFAULT_WIKI_SYNC_MINUTE,
+    DEFAULT_VMLX_HOST,
+    DEFAULT_VMLX_LOCAL_PORT,
+    DEFAULT_VMLX_MODEL,
+    DEFAULT_VMLX_REMOTE_PORT,
+    DEFAULT_VMLX_USER,
     DEFAULT_SCOPES,
     MAIL_SCOPES,
     MAIL_TOKEN_NAMESPACE,
@@ -55,6 +66,8 @@ from .feishu_mail import FeishuMailProvider
 from .keychain import KeychainError, KeychainStore
 from .mail_database import MailDatabase
 from .mail_sync import MailAuthorizationError, MailCapacityError, MailSyncPartialError
+from .insights import InsightsRunOptions, export_report, run_daily_insights
+from .insights_database import InsightsDatabase
 from .reader_auth import (
     ReaderSessionManager,
     disable_permanent_unlock,
@@ -63,6 +76,9 @@ from .reader_auth import (
 from .sync import ArchiveSyncer
 from .web import is_literal_loopback_host, is_loopback_host, serve
 from .wiki import WikiSyncer
+
+
+VMLX_BEARER_ACCOUNT = "vmlx:api_bearer_token"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -242,11 +258,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="为当前档案永久解除本机邮箱阅读锁定",
     )
+
     mail_reader_policy.add_argument(
         "--lock",
         action="store_true",
         help="恢复短期会话锁定并撤销现有邮箱会话",
     )
+
+    insights_configure = subparsers.add_parser(
+        "insights-configure",
+        help="从标准输入把 vMLX Bearer 凭据保存到 macOS 钥匙串",
+    )
+    insights_configure.add_argument("--bearer-token-stdin", action="store_true", required=True)
+
+    insights_run = subparsers.add_parser(
+        "insights-run",
+        help="生成指定自然日的本机每日洞察",
+    )
+    insights_run.add_argument("--date", dest="report_date", help="YYYY-MM-DD；默认昨日")
+    insights_run.add_argument("--timezone", default=DEFAULT_INSIGHTS_TIMEZONE)
+    insights_run.add_argument("--host", default=DEFAULT_VMLX_HOST)
+    insights_run.add_argument("--user", default=DEFAULT_VMLX_USER)
+    insights_run.add_argument("--model", default=DEFAULT_VMLX_MODEL)
+    insights_run.add_argument("--local-port", type=int, default=DEFAULT_VMLX_LOCAL_PORT)
+    insights_run.add_argument("--remote-port", type=int, choices=(8067, 11435), default=DEFAULT_VMLX_REMOTE_PORT)
+    insights_run.add_argument(
+        "--no-model",
+        action="store_true",
+        help="不调用模型，只生成确定性覆盖统计",
+    )
+    insights_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只打印结果，不写入洞察数据库或导出文件",
+    )
+    insights_run.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+
+    subparsers.add_parser("insights-status", help="显示每日洞察状态")
 
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
     reader.add_argument("--host", default="127.0.0.1")
@@ -560,6 +608,94 @@ def main(argv: list[str] | None = None) -> None:
             assert mail_database is not None
             failed = _mail_doctor(mail_database, paths)
             raise SystemExit(1 if failed else 0)
+        elif args.command == "insights-configure":
+            value = sys.stdin.read().strip()
+            if not value:
+                raise ValueError("标准输入为空")
+            KeychainStore().set(VMLX_BEARER_ACCOUNT, value)
+            print("vMLX Bearer 凭据已保存到 macOS 钥匙串。")
+        elif args.command == "insights-status":
+            insights_database = InsightsDatabase(paths.insights_database)
+            insights_database.initialize()
+            print(json.dumps(insights_database.status(), ensure_ascii=False, indent=2))
+        elif args.command == "insights-run":
+            if not paths.database.is_file():
+                raise ValueError(f"聊天与知识库档案不存在：{paths.database}")
+            database = ArchiveDatabase(paths.database)
+            mail_database = MailDatabase(paths.mail_database) if paths.mail_database.is_file() else None
+            report_date = args.report_date or _yesterday(args.timezone)
+            insights_database = None if args.dry_run else InsightsDatabase(paths.insights_database)
+            if insights_database is not None:
+                insights_database.initialize()
+            lock = None if args.dry_run else acquire_insights_lock(paths)
+            try:
+                client = None
+                tunnel = None
+                model_unavailable_reason = None
+                if not args.no_model:
+                    from .vmlx import Tunnel, VMLXClient, VMLXError
+
+                    try:
+                        bearer = None
+                        if args.remote_port == 8067:
+                            bearer = (KeychainStore().get(VMLX_BEARER_ACCOUNT) or "").strip()
+                            if not bearer:
+                                raise ValueError(
+                                    "8067 需要 Bearer 凭据；请通过 insights-configure --bearer-token-stdin 保存"
+                                )
+                        tunnel = Tunnel(
+                            host=args.host,
+                            user=args.user,
+                            local_port=args.local_port,
+                            remote_port=args.remote_port,
+                        )
+                        base_url = tunnel.__enter__()
+                        client = VMLXClient(
+                            base_url,
+                            model=args.model,
+                            bearer_token=bearer,
+                            timeout=360.0,
+                        )
+                        available_models = {
+                            str(item.get("id") or "") for item in client.models()
+                        }
+                        if args.model not in available_models:
+                            raise ValueError(f"远端未提供指定模型：{args.model}")
+                    except (ValueError, VMLXError) as exc:
+                        if tunnel is not None:
+                            tunnel.__exit__(*sys.exc_info())
+                        tunnel = None
+                        client = None
+                        model_unavailable_reason = str(exc)
+                try:
+                    report = run_daily_insights(
+                        database,
+                        mail_database,
+                        insights_database,
+                        paths,
+                        InsightsRunOptions(
+                            report_date=report_date,
+                            timezone=args.timezone,
+                            model=args.model,
+                            dry_run=args.dry_run,
+                            trigger="scheduled" if args.scheduled else "manual",
+                            model_unavailable_reason=model_unavailable_reason,
+                        ),
+                        client=client,
+                    )
+                finally:
+                    if tunnel is not None:
+                        tunnel.__exit__(None, None, None)
+                if not args.dry_run:
+                    json_path, markdown_path = export_report(paths, report)
+                    report["exports"] = {
+                        "json": str(json_path),
+                        "markdown": str(markdown_path),
+                    }
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            finally:
+                if lock is not None:
+                    lock.release()
         elif args.command == "serve":
             assert database is not None
             controller = BackgroundSyncController(database, paths, _client)
@@ -567,14 +703,30 @@ def main(argv: list[str] | None = None) -> None:
             mail_controller: BackgroundMailSyncController | None = None
             mail_session_manager: ReaderSessionManager | None = None
             mail_unavailable_reason: str | None = None
+            insights_database: InsightsDatabase | None = None
+            insights_unavailable_reason: str | None = None
             try:
-                _ensure_mail_paths(paths)
-                mail_database = MailDatabase(paths.mail_database)
-                mail_database.initialize()
                 mail_session_manager = ReaderSessionManager(
                     paths.reader_secret,
                     permanent_unlock_path=paths.mail_reader_permanent_unlock,
                 )
+            except Exception as exc:
+                mail_session_manager = None
+                mail_unavailable_reason = f"{type(exc).__name__}: {exc}"
+            try:
+                insights_database = InsightsDatabase(paths.insights_database)
+                insights_database.initialize()
+            except Exception as exc:
+                insights_database = None
+                insights_unavailable_reason = f"{type(exc).__name__}: {exc}"
+                print(
+                    "警告：每日洞察数据库初始化失败；三条源档案阅读仍可用。",
+                    file=sys.stderr,
+                )
+            try:
+                _ensure_mail_paths(paths)
+                mail_database = MailDatabase(paths.mail_database)
+                mail_database.initialize()
                 mail_controller = BackgroundMailSyncController(
                     mail_database,
                     paths,
@@ -585,8 +737,7 @@ def main(argv: list[str] | None = None) -> None:
                 # unlock secret must never take the chat/wiki reader offline.
                 mail_database = None
                 mail_controller = None
-                mail_session_manager = None
-                mail_unavailable_reason = f"{type(exc).__name__}: {exc}"
+                mail_unavailable_reason = mail_unavailable_reason or f"{type(exc).__name__}: {exc}"
                 print(
                     "警告：邮件档案初始化失败，已降级为 503；"
                     "聊天与知识库阅读仍可用。",
@@ -603,6 +754,8 @@ def main(argv: list[str] | None = None) -> None:
                 mail_sync_controller=mail_controller,
                 mail_session_manager=mail_session_manager,
                 mail_unavailable_reason=mail_unavailable_reason,
+                insights_database=insights_database,
+                insights_unavailable_reason=insights_unavailable_reason,
                 sync_schedule={
                     "enabled": True,
                     "hour": DEFAULT_SYNC_HOUR,
@@ -629,6 +782,16 @@ def main(argv: list[str] | None = None) -> None:
                     "description": (
                         f"每天 {DEFAULT_MAIL_SYNC_HOUR:02d}:"
                         f"{DEFAULT_MAIL_SYNC_MINUTE:02d} 自动同步邮箱"
+                    ),
+                },
+                insights_schedule={
+                    "enabled": True,
+                    "hour": DEFAULT_INSIGHTS_SYNC_HOUR,
+                    "minute": DEFAULT_INSIGHTS_SYNC_MINUTE,
+                    "timezone": DEFAULT_INSIGHTS_TIMEZONE,
+                    "description": (
+                        f"每天 {DEFAULT_INSIGHTS_SYNC_HOUR:02d}:"
+                        f"{DEFAULT_INSIGHTS_SYNC_MINUTE:02d} 生成昨日洞察"
                     ),
                 },
             )
@@ -667,6 +830,14 @@ def _app_config(
         f"http://127.0.0.1:{oauth_port}/oauth/callback",
     ).strip()
     return FeishuAppConfig(app_id=app_id, app_secret=app_secret, redirect_uri=redirect_uri)
+
+
+def _yesterday(timezone: str) -> str:
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"未知时区：{timezone}") from exc
+    return (datetime.now(zone).date() - timedelta(days=1)).isoformat()
 
 
 def _mail_app_config(

@@ -4,4 +4,5 @@ set -eu
 PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
-exec python3 -m feishu_archive "$@"
+FEISHU_ARCHIVE_PYTHON=${FEISHU_ARCHIVE_PYTHON:-python3}
+exec "$FEISHU_ARCHIVE_PYTHON" -m feishu_archive "$@"

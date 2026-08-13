@@ -23,6 +23,7 @@ const state = {
   mailLoaded: false,
   mailSyncWasRunning: false,
   mailPollTimer: null,
+  insightsLoaded: false,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -64,20 +65,133 @@ function formatSourceTime(value) {
 }
 
 function setMode(mode) {
-  if (!["messages", "wiki", "mail"].includes(mode)) mode = "messages";
+  if (!["messages", "wiki", "mail", "insights"].includes(mode)) mode = "messages";
   state.mode = mode;
   const messages = mode === "messages";
   const wiki = mode === "wiki";
   const mail = mode === "mail";
+  const insights = mode === "insights";
   $("message-sidebar").hidden = !messages;
   $("wiki-sidebar").hidden = !wiki;
   $("mail-sidebar").hidden = !mail;
+  $("insights-sidebar").hidden = !insights;
   $("message-view").hidden = !messages;
   $("wiki-view").hidden = !wiki;
   $("mail-view").hidden = !mail;
+  $("insights-view").hidden = !insights;
   $("mode-messages").classList.toggle("active", messages);
   $("mode-wiki").classList.toggle("active", wiki);
   $("mode-mail").classList.toggle("active", mail);
+  $("mode-insights").classList.toggle("active", insights);
+}
+
+function yesterdayIso() {
+  const value = new Date();
+  value.setDate(value.getDate() - 1);
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function renderInsightItems(rootId, items) {
+  const root = $(rootId);
+  root.replaceChildren();
+  if (!Array.isArray(items) || !items.length) {
+    const empty = document.createElement("p");
+    empty.className = "insights-item";
+    empty.textContent = "暂无可验证结论。";
+    root.append(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("p");
+    row.className = "insights-item";
+    const summary = document.createElement("span");
+    summary.textContent = item.summary || "";
+    row.append(summary);
+    const labels = [];
+    const categoryLabels = {
+      committed: "已承诺",
+      project_followup: "项目跟进",
+      ai_recommendation: "AI 建议",
+      carryover: "累计待办",
+    };
+    const strengthLabels = {
+      confirmed: "已确认机会",
+      qualification: "待核实机会",
+      weak: "弱信号",
+    };
+    if (categoryLabels[item.category]) labels.push(categoryLabels[item.category]);
+    if (strengthLabels[item.strength]) labels.push(strengthLabels[item.strength]);
+    if (item.status) labels.push(`状态：${item.status}`);
+    if (labels.length) {
+      const semantics = document.createElement("span");
+      semantics.className = "insights-semantics";
+      semantics.textContent = labels.join(" · ");
+      row.append(semantics);
+    }
+    if (Array.isArray(item.evidence_gaps) && item.evidence_gaps.length) {
+      const gaps = document.createElement("span");
+      gaps.className = "insights-semantics";
+      gaps.textContent = `证据缺口：${item.evidence_gaps.join("；")}`;
+      row.append(gaps);
+    }
+    if (item.next_validation_step) {
+      const next = document.createElement("span");
+      next.className = "insights-semantics";
+      next.textContent = `下一步核实：${item.next_validation_step}`;
+      row.append(next);
+    }
+    const citations = Array.isArray(item.citations) ? item.citations.filter(Boolean) : [];
+    if (citations.length) {
+      const evidence = document.createElement("span");
+      evidence.className = "insights-citations";
+      evidence.textContent = `证据：${citations.join(" · ")}`;
+      row.append(evidence);
+    }
+    root.append(row);
+  });
+}
+
+async function loadInsights(updateHistory = true) {
+  const reportDate = $("insights-date").value || yesterdayIso();
+  $("insights-date").value = reportDate;
+  $("insights-meta").textContent = "正在从本机洞察数据库读取…";
+  try {
+    const data = await request(`/api/insights/daily?date=${encodeURIComponent(reportDate)}`);
+    const run = data.item || {};
+    const report = run.report || run;
+    const counts = report.coverage?.counts || {};
+    const ledger = report.task_ledger || {};
+    $("insights-title").textContent = `每日洞察 · ${report.report_date || reportDate}`;
+    $("insights-meta").textContent = `${report.timezone || ""} · 模型 ${report.model || "未记录"} · 状态 ${report.model_status || run.status || "unknown"}`;
+    const ledgerText = ledger.historical_backfill_complete
+      ? `累计待办已回填：${ledger.coverage_start || ""} 至 ${ledger.coverage_end || ""}。`
+      : `累计待办仅覆盖已成功日报；全历史回填尚未完成。`;
+    $("insights-coverage").textContent = `覆盖：聊天 ${counts.chat || 0} 条；收到邮件 ${counts.mail_received || 0} 封；发出邮件 ${counts.mail_sent || 0} 封；知识库新增 ${counts.wiki_created || 0} 篇、编辑 ${counts.wiki_edited || 0} 篇。${ledgerText}`;
+    renderInsightItems("insights-yesterday", report.yesterday_summary);
+    renderInsightItems("insights-today", report.today_plan);
+    renderInsightItems("insights-opportunities", report.commercial_opportunities);
+    const publication = report.published === false ? "未发布（部分结果）" : "已发布";
+    $("insights-status").textContent = `${publication}；当前显示 ${report.report_date || reportDate}`;
+    state.insightsLoaded = true;
+    if (updateHistory) {
+      const url = new URL(window.location.href);
+      url.search = "";
+      url.searchParams.set("mode", "insights");
+      url.searchParams.set("date", reportDate);
+      history.pushState({}, "", url);
+    }
+  } catch (error) {
+    const message = mailAccessMessage(error);
+    $("insights-status").textContent = message;
+    $("insights-meta").textContent = message;
+    $("insights-coverage").textContent = "日报不可用；三条源档案不会因此受影响。";
+    renderInsightItems("insights-yesterday", []);
+    renderInsightItems("insights-today", []);
+    renderInsightItems("insights-opportunities", []);
+  }
 }
 
 function writeWikiLocation(nodeToken = null, replace = false) {
@@ -1009,6 +1123,12 @@ $("mode-mail").addEventListener("click", async () => {
   const loaded = await ensureMailLoaded(true);
   if (!loaded) writeMailLocation(null);
 });
+$("mode-insights").addEventListener("click", async () => {
+  setMode("insights");
+  if (!$("insights-date").value) $("insights-date").value = yesterdayIso();
+  await loadInsights(true);
+});
+$("insights-load").addEventListener("click", () => loadInsights(true));
 $("wiki-sync-now").addEventListener("click", startWikiSync);
 $("wiki-search").addEventListener("click", searchWiki);
 $("wiki-query").addEventListener("input", () => { if (state.wikiView === "nodes") renderWikiNodes(); });
@@ -1042,6 +1162,12 @@ $("mail-next").addEventListener("click", async () => {
 async function restoreLocation() {
   const params = new URLSearchParams(window.location.search);
   const mode = params.get("mode");
+  if (mode === "insights") {
+    setMode("insights");
+    $("insights-date").value = params.get("date") || yesterdayIso();
+    await loadInsights(false);
+    return;
+  }
   if (mode === "mail") {
     setMode("mail");
     if (!state.mailLoaded) {

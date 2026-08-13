@@ -69,6 +69,11 @@ def acquire_mail_sync_lock(paths: ArchivePaths) -> SyncFileLock:
     return SyncFileLock(paths.mail_sync_lock)
 
 
+def acquire_insights_lock(paths: ArchivePaths) -> SyncFileLock:
+    paths.ensure()
+    return SyncFileLock(paths.insights_lock)
+
+
 def run_sync_cycle(
     database: ArchiveDatabase,
     paths: ArchivePaths,

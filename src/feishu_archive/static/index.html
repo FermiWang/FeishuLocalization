@@ -17,6 +17,7 @@
         <button id="mode-messages" class="mode-button active">聊天记录</button>
         <button id="mode-wiki" class="mode-button">知识库</button>
         <button id="mode-mail" class="mode-button">邮箱</button>
+        <button id="mode-insights" class="mode-button">每日洞察</button>
       </nav>
       <section id="message-sidebar">
         <div id="archive-status" class="status-card">正在读取档案…</div>
@@ -55,6 +56,13 @@
         </div>
         <p class="mail-folder-heading">邮件文件夹</p>
         <nav id="mail-folder-list" class="mail-folder-list" aria-label="邮件文件夹列表"></nav>
+      </section>
+      <section id="insights-sidebar" hidden>
+        <div id="insights-status" class="status-card">正在读取每日洞察…</div>
+        <label class="search-label" for="insights-date">报告日期</label>
+        <input id="insights-date" class="input" type="date">
+        <button id="insights-load" class="button insights-load">查看报告</button>
+        <p class="insights-security-note">报告包含邮件派生内容，沿用本机邮箱解锁策略。</p>
       </section>
     </aside>
 
@@ -131,6 +139,22 @@
         <article id="mail-detail" class="mail-detail" aria-live="polite">
           <div class="mail-empty-state"><strong>请选择一封邮件</strong><span>邮件 HTML 不会在此处执行或渲染。</span></div>
         </article>
+      </section>
+    </main>
+
+    <main id="insights-view" class="content insights-content" hidden>
+      <header class="content-header insights-header">
+        <div>
+          <p class="eyebrow">本机派生洞察</p>
+          <h2 id="insights-title">每日洞察</h2>
+          <p id="insights-meta" class="insights-meta">只读分析聊天、知识库和邮箱档案，不自动写回飞书。</p>
+        </div>
+      </header>
+      <section id="insights-coverage" class="insights-coverage" aria-live="polite"></section>
+      <section class="insights-grid">
+        <article class="insights-section"><h3>昨日小结</h3><div id="insights-yesterday"></div></article>
+        <article class="insights-section"><h3>今日规划</h3><div id="insights-today"></div></article>
+        <article class="insights-section"><h3>商业机会识别</h3><div id="insights-opportunities"></div></article>
       </section>
     </main>
   </div>

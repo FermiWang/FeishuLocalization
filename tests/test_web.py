@@ -14,6 +14,7 @@ from feishu_archive.config import ArchivePaths
 from feishu_archive.database import ArchiveDatabase
 from feishu_archive.demo import seed_demo
 from feishu_archive.mail_database import MailDatabase
+from feishu_archive.insights_database import InsightsDatabase
 from feishu_archive.reader_auth import (
     ReaderSessionManager,
     SESSION_COOKIE,
@@ -24,6 +25,65 @@ from feishu_archive.web import ArchiveHTTPServer, is_loopback_host, serve
 
 
 class WebTests(unittest.TestCase):
+    def test_insights_api_reuses_mail_unlock_and_returns_active_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            mail_database = MailDatabase(paths.mail_database)
+            mail_database.initialize()
+            insights = InsightsDatabase(paths.insights_database)
+            insights.initialize()
+            run = insights.start_run(
+                report_date="2026-08-12",
+                timezone="Europe/Amsterdam",
+                run_key="web-report",
+            )
+            insights.finish_run(
+                run,
+                {
+                    "status": "success",
+                    "report": {
+                        "report_date": "2026-08-12",
+                        "yesterday_summary": [],
+                        "today_plan": [],
+                        "commercial_opportunities": [],
+                    },
+                    "activate": True,
+                },
+            )
+            sessions = ReaderSessionManager(
+                paths.reader_secret,
+                ttl_seconds=60,
+                permanent_unlock_path=paths.mail_reader_permanent_unlock,
+            )
+            server = ArchiveHTTPServer(
+                ("127.0.0.1", 0),
+                database,
+                paths,
+                mail_database=mail_database,
+                mail_session_manager=sessions,
+                insights_database=insights,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(f"{base}/api/insights/daily?date=2026-08-12", timeout=2)
+                self.assertEqual(context.exception.code, 401)
+                enable_permanent_unlock(paths.mail_reader_permanent_unlock)
+                with urllib.request.urlopen(
+                    f"{base}/api/insights/daily?date=2026-08-12", timeout=2
+                ) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual(payload["item"]["report"]["report_date"], "2026-08-12")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_loopback_policy(self) -> None:
         self.assertTrue(is_loopback_host("127.0.0.1"))
         self.assertTrue(is_loopback_host("localhost"))

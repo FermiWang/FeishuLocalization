@@ -278,12 +278,51 @@ command -v python3
 - 注册每天 03:30 的消息同步任务；
 - 注册每天 03:45 的知识库同步任务；
 - 注册每天 04:00 的独立邮箱同步任务 `com.fermiwang.feishu-archive-mail-sync`；
+- 注册每天 04:30 的独立每日洞察任务 `com.fermiwang.feishu-archive-insights`；
 - 把日志写入 `~/Library/Application Support/Feishu Archive/logs`；
 - 只让阅读器监听 <http://127.0.0.1:8765>。
 
 候选运行时通过预检后，脚本会临时保留上一版运行时和 LaunchAgent；如果后续正文重建、plist 安装、服务启动或健康检查失败，会自动恢复上一版并重新注册原服务。只有新版阅读器通过 `/api/status` 健康检查后，回滚副本才会删除。
 
 邮箱计划任务使用独立的 `mail-sync.lock`。开放平台权限尚未发布、尚未执行 `mail-auth` 或授权已经失效时，任务会安全跳过，不会降级到 IMAP，也不会影响 03:30 的聊天同步或 03:45 的知识库同步。
+
+### 7. 每日洞察与本地 vMLX
+
+每日洞察是聊天、知识库和邮箱三条同步通道之上的只读派生层，保存到独立的
+`insights.sqlite3`，不会自动发送消息、创建飞书任务或修改知识库。默认以
+`Europe/Amsterdam` 自然日生成昨日小结、今日规划和商业机会识别；页面入口为
+<http://127.0.0.1:8765/?mode=insights>。因为报告可能包含邮件派生信息，相关 API
+沿用邮箱的本机会话与永久解锁策略。
+
+当前计划任务默认通过 SSH 回环隧道直达 `192.168.100.179` 的回环引擎 `11435`，
+正文不会在局域网明文传输；该路线不使用远端 `8067` 代理的认证和队列。若已经取得
+8067 的独立 Bearer，可显式切换到代理路线，凭据只从标准输入进入 macOS 钥匙串：
+
+```bash
+printf '%s' "$VMLINUX_BEARER_TOKEN" | ./bin/feishu-archive insights-configure --bearer-token-stdin
+./bin/feishu-archive insights-run --date 2026-08-12 --remote-port 8067
+./bin/feishu-archive insights-status
+```
+
+默认受控路线为：
+
+```bash
+./bin/feishu-archive insights-run --remote-port 11435
+```
+
+只验证本地抽取、日期口径和覆盖数量，不调用模型也不写洞察库：
+
+```bash
+./bin/feishu-archive insights-run --no-model --dry-run
+```
+
+模型接收的正文均标记为不可信数据；不发送 raw JSON、BCC、HTML/MIME、认证信息
+或附件二进制。当前附件仅纳入名称、类型、大小、哈希和归档状态。模型不可用时，
+系统降级为确定性覆盖统计，不推断新待办或商业机会，且不会影响三条源同步。
+降级或任一源通道覆盖不完整的运行记为 `partial`，不会替换上一份已发布日报，也不会
+更新任务或机会台账。累计待办仅覆盖已经成功生成的日报；当前页面会明确显示历史回填
+尚未完成，不能把它解释为 2024 年以来全部未结事项。按当前本地档案规模，完整历史模型
+回填需要数千次串行推理，应作为可恢复的独立长任务执行，而不放进每天 04:30 的日报任务。
 
 验证服务：
 
