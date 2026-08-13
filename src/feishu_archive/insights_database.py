@@ -403,6 +403,40 @@ class InsightsDatabase:
             ).fetchone()
         return _decode_row(row)
 
+    def find_reusable_run(
+        self, run: int | str | dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the newest successful run with the same immutable request identity."""
+        with self.connection() as con:
+            if isinstance(run, dict):
+                run_id = _optional_int(run.get("id"))
+                run_key = str(run.get("run_key") or "")
+            elif isinstance(run, int):
+                run_id = run
+                run_key = ""
+            else:
+                run_id = None
+                run_key = str(run)
+            if run_id is not None:
+                source = con.execute(
+                    "SELECT request_json FROM analysis_runs WHERE id=?", (run_id,)
+                ).fetchone()
+            else:
+                source = con.execute(
+                    "SELECT request_json FROM analysis_runs WHERE run_key=?", (run_key,)
+                ).fetchone()
+            if source is None:
+                return None
+            row = con.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE request_json=? AND status='success'
+                ORDER BY finished_at DESC, id DESC LIMIT 1
+                """,
+                (str(source["request_json"]),),
+            ).fetchone()
+            return self._run_with_citations(con, row) if row else None
+
     def add_evidence(
         self,
         run: int | dict[str, Any],

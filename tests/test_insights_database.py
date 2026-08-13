@@ -206,6 +206,33 @@ class InsightsDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(same["id"], invalid["id"])
 
+    def test_failed_base_run_reuses_successful_retry_with_same_identity(self) -> None:
+        base = self.database.start_run(
+            run_key="retry-base",
+            report_date="2026-08-12",
+            source_snapshot_hash="snapshot",
+            prompt_version="v3",
+            model_id="model",
+            config={"max_chunk_chars": 24000},
+        )
+        self.database.finish_run(base["id"], status="error", error="first attempt")
+        retry = self.database.start_run(
+            run_key="retry-base:retry:1",
+            report_date="2026-08-12",
+            source_snapshot_hash="snapshot",
+            prompt_version="v3",
+            model_id="model",
+            config={"max_chunk_chars": 24000},
+        )
+        self.database.finish_run(
+            retry["id"], status="success", report={"summary": "usable"}
+        )
+
+        reusable = self.database.find_reusable_run(base)
+        self.assertIsNotNone(reusable)
+        self.assertEqual(reusable["id"], retry["id"])
+        self.assertEqual(reusable["report"], {"summary": "usable"})
+
     def test_manual_task_status_has_priority_and_events_are_append_only(self) -> None:
         run = self.start_run("tasks")
         evidence = self.add_evidence(run["id"], "task-evidence")

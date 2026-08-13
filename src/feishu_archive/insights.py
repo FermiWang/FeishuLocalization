@@ -119,6 +119,9 @@ def run_daily_insights(
         )
         if run.get("status") == "success" and isinstance(run.get("report"), dict):
             return dict(run["report"])
+        reusable = insights_database.find_reusable_run(run)
+        if reusable is not None and isinstance(reusable.get("report"), dict):
+            return dict(reusable["report"])
         if run.get("status") != "running":
             run = insights_database.start_run(
                 trigger=options.trigger,
