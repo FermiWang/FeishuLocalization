@@ -976,6 +976,64 @@ class InsightsDatabase:
                 return None
             return self._get_evidence_with_connection(con, int(row["id"]))
 
+    def resolve_manual_task_projection(
+        self,
+        *,
+        source_scope: str,
+        title: str,
+        project_key: str = "",
+        owner_key: str = "",
+    ) -> dict[str, Any] | None:
+        """Reuse a provably matching manual task across projection upgrades.
+
+        A unique legacy multi-scope task remains one manual anchor pending an
+        explicit human split; machine replay must not copy or reopen it.
+        """
+        scope = str(source_scope).strip()
+        if not scope:
+            return None
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status_source='manual' AND task_key NOT LIKE 'archived:%'
+                """
+            ).fetchall()
+        candidates: list[tuple[sqlite3.Row, dict[str, Any], list[str]]] = []
+        for row in rows:
+            payload = _json_load_mapping(str(row["payload_json"]))
+            scopes = _source_scopes(payload)
+            if scope not in scopes:
+                continue
+            if str(row["title"]).strip().casefold() != str(title).strip().casefold():
+                continue
+            if str(row["project_key"]).strip().casefold() != str(project_key).strip().casefold():
+                continue
+            if str(row["owner_key"]).strip().casefold() != str(owner_key).strip().casefold():
+                continue
+            candidates.append((row, payload, scopes))
+        exact = [candidate for candidate in candidates if len(candidate[2]) == 1]
+        selected = exact or candidates
+        if len(selected) != 1:
+            return (
+                {
+                    "ambiguous": True,
+                    "candidate_count": len(selected),
+                    "source_scope": scope,
+                }
+                if selected
+                else None
+            )
+        row, payload, scopes = selected[0]
+        return {
+            "task_key": str(row["task_key"]),
+            "requires_split": len(scopes) > 1,
+            "source_scopes": scopes,
+            "source_projection_version": str(
+                payload.get("projection_version") or "legacy"
+            ),
+        }
+
     def upsert_task_observation(self, item: dict[str, Any]) -> dict[str, Any]:
         data = dict(item)
         task_data = dict(data.get("task") or {})
@@ -1645,6 +1703,58 @@ class InsightsDatabase:
                 rows = con.execute(sql + " LIMIT ?", (*params, bounded_limit)).fetchall()
         return [_decode_row(row) for row in rows]
 
+    def resolve_manual_opportunity_projection(
+        self,
+        *,
+        source_scope: str,
+        title: str,
+        entity_key: str = "",
+    ) -> dict[str, Any] | None:
+        """Reuse a unique, source-backed manual opportunity across upgrades."""
+        scope = str(source_scope).strip()
+        if not scope:
+            return None
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM opportunities
+                WHERE status_source='manual'
+                  AND opportunity_key NOT LIKE 'archived:%'
+                """
+            ).fetchall()
+        candidates: list[tuple[sqlite3.Row, dict[str, Any], list[str]]] = []
+        for row in rows:
+            payload = _json_load_mapping(str(row["payload_json"]))
+            scopes = _source_scopes(payload)
+            if scope not in scopes:
+                continue
+            if str(row["title"]).strip().casefold() != str(title).strip().casefold():
+                continue
+            if str(row["entity_key"]).strip().casefold() != str(entity_key).strip().casefold():
+                continue
+            candidates.append((row, payload, scopes))
+        exact = [candidate for candidate in candidates if len(candidate[2]) == 1]
+        selected = exact or candidates
+        if len(selected) != 1:
+            return (
+                {
+                    "ambiguous": True,
+                    "candidate_count": len(selected),
+                    "source_scope": scope,
+                }
+                if selected
+                else None
+            )
+        row, payload, scopes = selected[0]
+        return {
+            "opportunity_key": str(row["opportunity_key"]),
+            "requires_split": len(scopes) > 1,
+            "source_scopes": scopes,
+            "source_projection_version": str(
+                payload.get("projection_version") or "legacy"
+            ),
+        }
+
     def upsert_opportunity_signal(self, item: dict[str, Any]) -> dict[str, Any]:
         data = dict(item)
         opportunity_data = dict(data.get("opportunity") or {})
@@ -2142,6 +2252,13 @@ def _validate_task_status(status: str) -> None:
 
 def _is_closed(status: str) -> bool:
     return status in {"done", "canceled", "superseded"}
+
+
+def _source_scopes(payload: Mapping[str, Any]) -> list[str]:
+    raw = payload.get("source_scopes")
+    if not isinstance(raw, list):
+        return []
+    return sorted({str(value).strip() for value in raw if str(value).strip()})
 
 
 def _same_evidence(
