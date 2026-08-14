@@ -32,6 +32,7 @@ from .automation import (
 from .config import (
     DEFAULT_INSIGHTS_BACKFILL_END_HOUR,
     DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
     DEFAULT_INSIGHTS_SYNC_HOUR,
@@ -94,6 +95,7 @@ from .backfill import (
     record_backfill_deferred,
     record_backfill_error,
     record_backfill_success,
+    scheduled_backfill_step_budget_seconds,
     within_backfill_window,
 )
 from .reader_auth import (
@@ -338,6 +340,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--minimum-idle-seconds",
         type=int,
         default=DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
+    )
+    insights_backfill.add_argument(
+        "--maximum-step-seconds",
+        type=int,
+        default=DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
+        help=(
+            "单次计划回填的最长运行时间；默认 "
+            f"{DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS} 秒"
+        ),
     )
     insights_backfill.add_argument(
         "--start-hour", type=int, default=DEFAULT_INSIGHTS_BACKFILL_START_HOUR
@@ -919,6 +930,7 @@ def main(argv: list[str] | None = None) -> None:
                     "backfill": {
                         "enabled": True,
                         "interval_seconds": DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS,
+                        "maximum_step_seconds": DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
                         "start_hour": DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
                         "end_hour": DEFAULT_INSIGHTS_BACKFILL_END_HOUR,
                         "minimum_idle_seconds": DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
@@ -968,10 +980,26 @@ def _run_insights_backfill_step(
     try:
         local_now = datetime.now(ZoneInfo(args.timezone))
         remaining_window_seconds = backfill_window_remaining_seconds(local_now, policy)
+        maximum_step_seconds = int(
+            getattr(
+                args,
+                "maximum_step_seconds",
+                DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
+            )
+        )
+        scheduled_step_seconds = (
+            scheduled_backfill_step_budget_seconds(
+                local_now,
+                policy,
+                maximum_step_seconds=maximum_step_seconds,
+            )
+            if args.scheduled
+            else remaining_window_seconds
+        )
         if args.scheduled and not within_backfill_window(local_now, policy):
             print(json.dumps({"outcome": "deferred", "reason": "outside_backfill_window"}))
             return
-        if args.scheduled and remaining_window_seconds < 900:
+        if args.scheduled and scheduled_step_seconds < 900:
             print(
                 json.dumps(
                     {"outcome": "deferred", "reason": "insufficient_backfill_window"}
@@ -979,7 +1007,7 @@ def _run_insights_backfill_step(
             )
             return
         hard_deadline_monotonic = (
-            time.monotonic() + remaining_window_seconds if args.scheduled else None
+            time.monotonic() + scheduled_step_seconds if args.scheduled else None
         )
 
         bounds = archive_history_bounds(database, mail_database, args.timezone)
@@ -1295,6 +1323,15 @@ def _run_insights_backfill_step(
                             client=client,
                             source=source,
                         )
+                        if client.step_budget_exhausted:
+                            state = record_backfill_deferred(
+                                paths.insights_backfill_state,
+                                state,
+                                reason="scheduled_step_budget_exhausted",
+                                health=health_summary,
+                            )
+                            _print_backfill_progress(state, outcome="deferred")
+                            return
                     except Exception as exc:
                         state = record_backfill_error(
                             paths.insights_backfill_state,
@@ -1453,6 +1490,12 @@ class _LoadAwareBackfillClient:
         self.minimum_call_budget_seconds = max(0.0, float(minimum_call_budget_seconds))
         self.blocked = False
         self.cold_start_warmup_attempted = False
+        self.step_budget_exhausted = False
+
+    def _raise_step_budget_exhausted(self) -> None:
+        self.blocked = True
+        self.step_budget_exhausted = True
+        raise RuntimeError("historical_backfill_window_closed")
 
     def chat_json(self, messages: Any, *, max_tokens: int, temperature: float) -> dict[str, Any]:
         if self.blocked:
@@ -1464,16 +1507,14 @@ class _LoadAwareBackfillClient:
             else None
         )
         if admission_deadline is not None and now >= admission_deadline:
-            self.blocked = True
-            raise RuntimeError("historical_backfill_window_closed")
+            self._raise_step_budget_exhausted()
         deadline = now + self.maximum_wait_seconds
         if admission_deadline is not None:
             deadline = min(deadline, admission_deadline)
         ready_samples = 0
         while True:
             if admission_deadline is not None and time.monotonic() >= admission_deadline:
-                self.blocked = True
-                raise RuntimeError("historical_backfill_window_closed")
+                self._raise_step_budget_exhausted()
             try:
                 load = evaluate_vmlx_load(
                     self.client.health(),
@@ -1497,8 +1538,7 @@ class _LoadAwareBackfillClient:
                 if ready_samples >= 2 or self.stability_seconds == 0:
                     break
                 if time.monotonic() + self.stability_seconds >= deadline:
-                    self.blocked = True
-                    raise RuntimeError("historical_backfill_window_closed")
+                    self._raise_step_budget_exhausted()
                 time.sleep(self.stability_seconds)
                 continue
             ready_samples = 0
@@ -1508,8 +1548,7 @@ class _LoadAwareBackfillClient:
             self.blocked = True
             raise RuntimeError("historical_backfill_load_gate_closed")
         if admission_deadline is not None and time.monotonic() >= admission_deadline:
-            self.blocked = True
-            raise RuntimeError("historical_backfill_window_closed")
+            self._raise_step_budget_exhausted()
         try:
             return self.client.chat_json(
                 messages,

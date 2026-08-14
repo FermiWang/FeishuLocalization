@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from datetime import datetime
@@ -16,6 +17,7 @@ from feishu_archive.backfill import (
     record_backfill_audit,
     record_backfill_deferred,
     record_backfill_success,
+    scheduled_backfill_step_budget_seconds,
     within_backfill_window,
 )
 
@@ -432,6 +434,39 @@ class BackfillStateTests(unittest.TestCase):
             datetime(2026, 8, 14, 19, 50, tzinfo=ZoneInfo("UTC")), policy
         )
         self.assertEqual(remaining, 600)
+
+    def test_full_day_policy_has_no_midnight_deadline(self) -> None:
+        policy = BackfillPolicy(
+            timezone="Europe/Amsterdam",
+            model="model",
+            start_hour=0,
+            end_hour=24,
+            minimum_idle_seconds=60,
+        )
+        for moment in (
+            datetime(2026, 8, 14, 0, 0, tzinfo=ZoneInfo("Europe/Amsterdam")),
+            datetime(2026, 8, 14, 23, 59, 59, tzinfo=ZoneInfo("Europe/Amsterdam")),
+        ):
+            with self.subTest(moment=moment):
+                self.assertTrue(within_backfill_window(moment, policy))
+                self.assertTrue(
+                    math.isinf(backfill_window_remaining_seconds(moment, policy))
+                )
+                self.assertEqual(
+                    scheduled_backfill_step_budget_seconds(
+                        moment,
+                        policy,
+                        maximum_step_seconds=1800,
+                    ),
+                    1800,
+                )
+
+        with self.assertRaisesRegex(ValueError, "不能少于 900 秒"):
+            scheduled_backfill_step_budget_seconds(
+                datetime(2026, 8, 14, 12, tzinfo=ZoneInfo("Europe/Amsterdam")),
+                policy,
+                maximum_step_seconds=899,
+            )
 
 
 class VMLXLoadGateTests(unittest.TestCase):

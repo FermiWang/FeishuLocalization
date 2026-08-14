@@ -39,11 +39,15 @@ class BackfillPolicy:
 
 
 def within_backfill_window(now: datetime, policy: BackfillPolicy) -> bool:
+    if policy.start_hour == 0 and policy.end_hour == 24:
+        return True
     local = now.astimezone(ZoneInfo(policy.timezone))
     return policy.start_hour <= local.hour < policy.end_hour
 
 
 def backfill_window_remaining_seconds(now: datetime, policy: BackfillPolicy) -> float:
+    if policy.start_hour == 0 and policy.end_hour == 24:
+        return math.inf
     local = now.astimezone(ZoneInfo(policy.timezone))
     if not within_backfill_window(local, policy):
         return 0.0
@@ -61,6 +65,20 @@ def backfill_window_remaining_seconds(now: datetime, policy: BackfillPolicy) -> 
             microsecond=0,
         )
     return max(0.0, (end - local).total_seconds())
+
+
+def scheduled_backfill_step_budget_seconds(
+    now: datetime,
+    policy: BackfillPolicy,
+    *,
+    maximum_step_seconds: int,
+) -> float:
+    if maximum_step_seconds < 900:
+        raise ValueError("计划回填单步最长时间不能少于 900 秒")
+    return min(
+        backfill_window_remaining_seconds(now, policy),
+        float(maximum_step_seconds),
+    )
 
 
 def load_backfill_state(path: Path) -> dict[str, Any] | None:

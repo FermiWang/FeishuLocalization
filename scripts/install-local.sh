@@ -18,6 +18,7 @@ MAIL_SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$MAIL_SYNC_LABEL.plist"
 INSIGHTS_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_LABEL.plist"
 INSIGHTS_BACKFILL_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_BACKFILL_LABEL.plist"
 PYTHON_BIN=$(command -v python3)
+INSIGHTS_BACKFILL_INTERVAL_SECONDS=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS; print(DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS)')
 USER_DOMAIN="gui/$(id -u)"
 STAGING_DIR=""
 BACKUP_DIR=""
@@ -295,9 +296,9 @@ rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MA
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FEISHU_ARCHIVE_PYTHON string $PYTHON_BIN" "$TEMP_INSIGHTS_BACKFILL_PLIST"
-/usr/libexec/PlistBuddy -c "Add :StartInterval integer 1800" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StartInterval integer $INSIGHTS_BACKFILL_INTERVAL_SECONDS" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProcessType string Background" "$TEMP_INSIGHTS_BACKFILL_PLIST"
-/usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer 60" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer $INSIGHTS_BACKFILL_INTERVAL_SECONDS" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :Umask integer 63" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/insights-backfill.log" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/insights-backfill.error.log" "$TEMP_INSIGHTS_BACKFILL_PLIST"
@@ -349,7 +350,7 @@ while [ "$ATTEMPT" -lt 20 ]; do
     echo "知识库同步：${WIKI_SYNC_LABEL}（每天 03:45）"
     echo "邮箱同步：${MAIL_SYNC_LABEL}（每天 04:00；未授权时安全跳过，不影响其他通道）"
     echo "每日洞察：${INSIGHTS_LABEL}（每天 04:30，失败时 05:00/05:30 断点重试）"
-    echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（启动时及每 30 分钟尝试一个受控步骤）"
+    echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（全天候，启动时及每 ${INSIGHTS_BACKFILL_INTERVAL_SECONDS} 秒尝试一个受控步骤）"
     exit 0
   fi
   ATTEMPT=$((ATTEMPT + 1))

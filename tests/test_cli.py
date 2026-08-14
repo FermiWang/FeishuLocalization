@@ -175,6 +175,7 @@ class AppConfigTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "window_closed"):
             gate.chat_json([], max_tokens=1, temperature=0.1)
+        self.assertTrue(gate.step_budget_exhausted)
         client.health.assert_not_called()
         client.chat_json.assert_not_called()
 
@@ -419,8 +420,9 @@ class AppConfigTests(unittest.TestCase):
         self.assertFalse(args.dry_run)
         backfill = build_parser().parse_args(["insights-backfill-step", "--scheduled"])
         self.assertEqual(backfill.remote_port, 11435)
-        self.assertEqual(backfill.minimum_idle_seconds, 300)
-        self.assertEqual((backfill.start_hour, backfill.end_hour), (6, 22))
+        self.assertEqual(backfill.minimum_idle_seconds, 60)
+        self.assertEqual(backfill.maximum_step_seconds, 1800)
+        self.assertEqual((backfill.start_hour, backfill.end_hour), (0, 24))
         self.assertTrue(backfill.scheduled)
         configure = build_parser().parse_args(
             ["insights-configure", "--bearer-token-stdin"]
