@@ -121,10 +121,89 @@ class InsightsDatabaseTests(unittest.TestCase):
                 },
             )
 
+    def test_matching_success_requires_snapshot_timezone_and_full_config(self) -> None:
+        run = self.start_run("matching-run")
+        self.database.finish_run(
+            run["id"],
+            status="success",
+            report={"analysis_mode": "historical_backfill"},
+        )
+        match = self.database.matching_successful_report(
+            report_date="2026-08-13",
+            timezone="Europe/Amsterdam",
+            model_id="local-test",
+            prompt_version="v1",
+            source_snapshot_hash="matching-run",
+            config={"language": "zh-CN"},
+        )
+        self.assertEqual(match["id"], run["id"])
+        self.assertIsNone(
+            self.database.matching_successful_report(
+                report_date="2026-08-13",
+                timezone="Europe/Amsterdam",
+                model_id="local-test",
+                prompt_version="v1",
+                source_snapshot_hash="changed-snapshot",
+                config={"language": "zh-CN"},
+            )
+        )
+        self.assertIsNone(
+            self.database.matching_successful_report(
+                report_date="2026-08-13",
+                timezone="Europe/Amsterdam",
+                model_id="local-test",
+                prompt_version="v1",
+                source_snapshot_hash="matching-run",
+                config={"language": "zh-CN", "max_chunk_chars": 1},
+            )
+        )
+
         with self.assertRaisesRegex(ValueError, "安全序列化"):
             self.database.start_run(
                 {"run_key": "nan-run", "config": {"bad": float("nan")}}
             )
+
+    def test_date_lookup_prefers_daily_current_over_newer_history_run(self) -> None:
+        daily = self.database.start_run(
+            run_key="daily-date",
+            report_date="2026-08-10",
+            timezone="Europe/Amsterdam",
+            trigger="scheduled",
+            config={"analysis_mode": "daily_current"},
+            started_at=100,
+        )
+        self.database.finish_run(
+            daily["id"], status="success", report={"analysis_mode": "daily_current"}
+        )
+        newer_active = self.database.start_run(
+            run_key="daily-newer",
+            report_date="2026-08-11",
+            timezone="Europe/Amsterdam",
+            trigger="scheduled",
+            config={"analysis_mode": "daily_current"},
+            started_at=200,
+        )
+        self.database.finish_run(
+            newer_active["id"],
+            status="success",
+            report={"analysis_mode": "daily_current"},
+        )
+        history = self.database.start_run(
+            run_key="history-date",
+            report_date="2026-08-10",
+            timezone="Europe/Amsterdam",
+            trigger="historical_backfill",
+            config={"analysis_mode": "historical_backfill"},
+            started_at=300,
+        )
+        self.database.finish_run(
+            history["id"],
+            status="success",
+            report={"analysis_mode": "historical_backfill"},
+            activate=False,
+        )
+        selected = self.database.latest_report("2026-08-10")
+        self.assertEqual(selected["id"], daily["id"])
 
         same_snapshot_request = self.database.start_run(
             {
@@ -331,6 +410,312 @@ class InsightsDatabaseTests(unittest.TestCase):
         self.assertFalse(second["created"])
         self.assertEqual(second["signal_count"], 1)
         self.assertEqual(self.database.list_opportunities()[0]["opportunity_key"], "opportunity-mail")
+
+    def test_out_of_order_history_does_not_regress_current_task_projection(self) -> None:
+        current = self.database.upsert_task_observation(
+            {
+                "task": {"title": "提交项目资料", "description": "当前描述"},
+                "observed_status": "open",
+                "confidence": 0.9,
+                "observed_at": 200,
+            }
+        )
+        historical = self.database.upsert_task_observation(
+            {
+                "task": {"title": "提交项目资料", "description": "旧描述"},
+                "observed_status": "done",
+                "confidence": 0.2,
+                "observed_at": 100,
+            }
+        )
+        self.assertFalse(historical["applied"])
+        self.assertEqual(historical["status"], "open")
+        self.assertEqual(historical["description"], "当前描述")
+        self.assertEqual(historical["confidence"], 0.9)
+        self.assertEqual(historical["first_seen_at"], 100)
+        self.assertEqual(historical["last_seen_at"], 200)
+
+        manual = self.database.set_task_status(
+            current["id"], "done", actor_kind="human", occurred_at=300
+        )
+        self.assertEqual(manual["status"], "done")
+        machine = self.database.upsert_task_observation(
+            {
+                "task": {"title": "提交项目资料"},
+                "observed_status": "open",
+                "observed_at": 400,
+            }
+        )
+        self.assertFalse(machine["applied"])
+        self.assertEqual(machine["status"], "done")
+        self.assertEqual(machine["status_source"], "manual")
+
+    def test_equal_timestamp_does_not_replace_task_projection(self) -> None:
+        current = self.database.upsert_task_observation(
+            {
+                "task": {"title": "提交同刻资料", "description": "先写入描述"},
+                "observed_status": "open",
+                "confidence": 0.9,
+                "observed_at": 200,
+            }
+        )
+        self.assertTrue(current["applied"])
+
+        conflicting = self.database.upsert_task_observation(
+            {
+                "task": {"title": "提交同刻资料", "description": "后写入描述"},
+                "observed_status": "done",
+                "confidence": 0.2,
+                "observed_at": 200,
+            }
+        )
+        self.assertFalse(conflicting["applied"])
+        self.assertEqual(conflicting["status"], "open")
+        self.assertEqual(conflicting["description"], "先写入描述")
+        self.assertEqual(conflicting["confidence"], 0.9)
+        self.assertEqual(conflicting["first_seen_at"], 200)
+        self.assertEqual(conflicting["last_seen_at"], 200)
+
+    def test_out_of_order_history_does_not_regress_opportunity_projection(self) -> None:
+        self.database.upsert_opportunity_signal(
+            {
+                "opportunity": {
+                    "entity_key": "客户甲",
+                    "title": "尽调服务",
+                    "summary": "当前机会",
+                },
+                "score": 1.0,
+                "confidence": 0.9,
+                "observed_at": 200,
+            }
+        )
+        historical = self.database.upsert_opportunity_signal(
+            {
+                "opportunity": {
+                    "entity_key": "客户甲",
+                    "title": "尽调服务",
+                    "summary": "较旧弱信号",
+                },
+                "score": 0.25,
+                "confidence": 0.3,
+                "observed_at": 100,
+            }
+        )
+        self.assertEqual(historical["summary"], "当前机会")
+        self.assertEqual(historical["score"], 1.0)
+        self.assertEqual(historical["confidence"], 0.9)
+        self.assertEqual(historical["signal_count"], 2)
+        self.assertEqual(historical["first_seen_at"], 100)
+        self.assertEqual(historical["last_seen_at"], 200)
+
+    def test_equal_timestamp_does_not_replace_opportunity_projection(self) -> None:
+        current = self.database.upsert_opportunity_signal(
+            {
+                "opportunity": {
+                    "entity_key": "客户乙",
+                    "title": "同刻尽调服务",
+                    "summary": "先写入机会",
+                },
+                "score": 1.0,
+                "confidence": 0.9,
+                "observed_at": 200,
+            }
+        )
+        self.assertEqual(current["summary"], "先写入机会")
+
+        conflicting = self.database.upsert_opportunity_signal(
+            {
+                "opportunity": {
+                    "entity_key": "客户乙",
+                    "title": "同刻尽调服务",
+                    "summary": "后写入弱信号",
+                },
+                "score": 0.25,
+                "confidence": 0.3,
+                "observed_at": 200,
+            }
+        )
+        self.assertEqual(conflicting["summary"], "先写入机会")
+        self.assertEqual(conflicting["score"], 1.0)
+        self.assertEqual(conflicting["confidence"], 0.9)
+        self.assertEqual(conflicting["signal_count"], 2)
+        self.assertEqual(conflicting["first_seen_at"], 200)
+        self.assertEqual(conflicting["last_seen_at"], 200)
+
+    def test_mode_match_scans_past_newer_incompatible_success(self) -> None:
+        compatible = self.database.start_run(
+            run_key="compatible-daily",
+            report_date="2026-08-13",
+            timezone="Europe/Amsterdam",
+            model_id="model-a",
+            prompt_version="v4",
+            source_snapshot_hash="snapshot-a",
+            config={
+                "analysis_mode": "daily_current",
+                "projection_version": "p2",
+                "max_chunk_chars": 24000,
+            },
+            started_at=100,
+        )
+        self.database.finish_run(
+            compatible["id"],
+            status="success",
+            report={
+                "analysis_mode": "daily_current",
+                "published": True,
+                "model_status": "success",
+            },
+            finished_at=110,
+        )
+        newer = self.database.start_run(
+            run_key="newer-incompatible-daily",
+            report_date="2026-08-13",
+            timezone="Europe/Amsterdam",
+            model_id="model-b",
+            prompt_version="v4",
+            source_snapshot_hash="snapshot-a",
+            config={"analysis_mode": "daily_current"},
+            started_at=200,
+        )
+        self.database.finish_run(
+            newer["id"],
+            status="success",
+            report={"analysis_mode": "daily_current", "published": True},
+            finished_at=210,
+        )
+
+        match = self.database.matching_successful_report_for_mode(
+            report_date="2026-08-13",
+            analysis_mode="daily_current",
+            timezone="Europe/Amsterdam",
+            model_id="model-a",
+            prompt_version="v4",
+            source_snapshot_hash="snapshot-a",
+            config_requirements={
+                "projection_version": "p2",
+                "max_chunk_chars": 24000,
+            },
+            report_requirements={"published": True},
+        )
+
+        self.assertEqual(match["id"], compatible["id"])
+
+    def test_projection_reset_removes_only_selected_machine_rows(self) -> None:
+        legacy = self.database.upsert_task_observation(
+            {"task": {"task_key": "legacy", "title": "旧任务"}, "observed_at": 1}
+        )
+        current = self.database.upsert_task_observation(
+            {
+                "task": {
+                    "task_key": "current",
+                    "title": "新任务",
+                    "payload": {"projection_version": "p2"},
+                },
+                "observed_at": 2,
+            }
+        )
+        manual = self.database.upsert_task_observation(
+            {"task": {"task_key": "manual", "title": "人工任务"}, "observed_at": 3}
+        )
+        self.database.set_task_status(manual["id"], "waiting", actor_kind="human")
+
+        first = self.database.reset_machine_projections(projection_version="p2")
+        self.assertEqual(first["tasks_archived"], 1)
+        self.assertEqual(
+            {item["task_key"] for item in self.database.list_tasks(limit=None)},
+            {"current", "manual"},
+        )
+        second = self.database.reset_machine_projections(
+            projection_version="p2", include_current=True
+        )
+        self.assertEqual(second["tasks_archived"], 1)
+        self.assertEqual(
+            {item["task_key"] for item in self.database.list_tasks(limit=None)},
+            {"manual"},
+        )
+
+    def test_cached_run_projection_can_be_replayed_after_reset(self) -> None:
+        run = self.database.start_run(run_key="replay-run")
+        evidence = self.database.add_evidence(
+            run["id"],
+            {
+                "evidence_key": "mail:1/a",
+                "source_kind": "mail",
+                "source_id": "a",
+                "source_version": "v1",
+                "content_text": "请跟进",
+            },
+        )
+        self.database.upsert_task_observation(
+            {
+                "run_id": run["id"],
+                "evidence_id": evidence["id"],
+                "observation_key": "original-task-observation",
+                "task": {
+                    "task_key": "task:scoped",
+                    "title": "跟进 A",
+                    "payload": {"projection_version": "p2"},
+                },
+                "observed_status": "open",
+                "observed_at": 10,
+            }
+        )
+        self.database.upsert_opportunity_signal(
+            {
+                "run_id": run["id"],
+                "evidence_id": evidence["id"],
+                "signal_key": "original-opportunity-signal",
+                "opportunity": {
+                    "opportunity_key": "opportunity:scoped",
+                    "title": "服务 A",
+                    "payload": {"projection_version": "p2"},
+                },
+                "signal_kind": "qualification",
+                "score": 0.6,
+                "confidence": 0.8,
+                "observed_at": 10,
+            }
+        )
+        self.database.reset_machine_projections(
+            projection_version="p2", include_current=True
+        )
+        self.assertEqual(self.database.list_tasks(limit=None), [])
+        self.assertEqual(self.database.list_opportunities(), [])
+
+        first = self.database.replay_run_projections(
+            run["id"], campaign_id="campaign-2", projection_version="p2"
+        )
+        second = self.database.replay_run_projections(
+            run["id"], campaign_id="campaign-2", projection_version="p2"
+        )
+
+        self.assertEqual(first["task_observations_replayed"], 1)
+        self.assertEqual(second["opportunity_signals_replayed"], 1)
+        self.assertEqual(self.database.list_tasks(limit=None)[0]["task_key"], "task:scoped")
+        opportunity = self.database.list_opportunities()[0]
+        self.assertEqual(opportunity["opportunity_key"], "opportunity:scoped")
+        self.assertEqual(opportunity["signal_count"], 1)
+
+        later_run = self.database.start_run(run_key="post-reset-run")
+        self.database.upsert_opportunity_signal(
+            {
+                "run_id": later_run["id"],
+                "signal_key": "post-reset-original-signal",
+                "opportunity": {
+                    "opportunity_key": "opportunity:scoped",
+                    "title": "服务 A",
+                    "payload": {"projection_version": "p2"},
+                },
+                "score": 0.7,
+                "confidence": 0.8,
+                "observed_at": 20,
+            }
+        )
+        skipped = self.database.replay_run_projections(
+            later_run["id"], campaign_id="campaign-2", projection_version="p2"
+        )
+        self.assertEqual(skipped["opportunity_signals_replayed"], 0)
+        self.assertEqual(self.database.list_opportunities()[0]["signal_count"], 2)
 
 
 if __name__ == "__main__":

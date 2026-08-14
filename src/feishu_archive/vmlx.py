@@ -145,6 +145,7 @@ class VMLXClient:
         resource: str,
         *,
         payload: Mapping[str, Any] | None = None,
+        versioned: bool = True,
     ) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
         body: bytes | None = None
@@ -161,7 +162,9 @@ class VMLXClient:
         if self.bearer_token is not None:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = urllib.request.Request(
-            self._endpoint(resource),
+            self._endpoint(resource)
+            if versioned
+            else f"{self.base_url.removesuffix('/v1').rstrip('/')}/{resource.lstrip('/')}",
             data=body,
             headers=headers,
             method=method,
@@ -220,6 +223,10 @@ class VMLXClient:
         if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
             raise VMLXError("vMLX models response has an invalid data field")
         return items
+
+    def health(self) -> dict[str, Any]:
+        """Return the engine health object from the non-versioned endpoint."""
+        return self._request_json("GET", "health", versioned=False)
 
     def list_models(self) -> list[dict[str, Any]]:
         return self.models()

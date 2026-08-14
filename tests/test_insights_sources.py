@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from feishu_archive.database import ArchiveDatabase
 from feishu_archive.insights_sources import (
+    archive_history_bounds,
     calendar_day_window,
     chunk_evidence,
     extract_daily_sources,
@@ -273,6 +274,103 @@ class InsightsSourcesTests(unittest.TestCase):
         self.assertEqual(wiki[0]["metadata"]["node_tokens"], ["node-origin", "node-shortcut"])
         self.assertEqual(result["coverage"]["counts"]["wiki_created"], 1)
         self.assertEqual(result["coverage"]["counts"]["wiki_edited"], 1)
+
+    def test_historical_wiki_creation_does_not_send_newer_revision_text(self) -> None:
+        with self.archive.connection() as con:
+            con.execute(
+                "INSERT INTO wiki_spaces(space_id, name) VALUES ('space-history', 'History')"
+            )
+        created_s = self.window["start_s"] + 60
+        later_edit_s = self.window["end_s"] + 60
+        self.archive.upsert_wiki_node(
+            {
+                "node_token": "node-history",
+                "obj_token": "doc-history",
+                "obj_type": "docx",
+                "node_type": "origin",
+                "title": "Historical title",
+                "obj_create_time": created_s,
+                "obj_edit_time": later_edit_s,
+            },
+            space_id="space-history",
+            parent_node_token=None,
+            path="Historical title",
+            position=0,
+            seen_at=self.window["start_ms"],
+        )
+        self.archive.upsert_wiki_document(
+            {
+                "obj_token": "doc-history",
+                "obj_type": "docx",
+                "title": "Historical title",
+                "revision_id": 9,
+                "source_edit_time": later_edit_s,
+                "content_text": "FUTURE REVISION TEXT",
+                "content_sha256": "future-digest",
+                "status": "synced",
+            }
+        )
+
+        result = extract_daily_sources(self.archive, self.mail, DAY, TIMEZONE)
+        item = next(value for value in result["evidence"] if value["source_kind"] == "wiki")
+        self.assertEqual(item["text"], "")
+        self.assertFalse(item["metadata"]["actionable"])
+        self.assertNotIn("FUTURE REVISION TEXT", json.dumps(result, ensure_ascii=False))
+        self.assertTrue(any("仅使用元数据" in warning for warning in result["coverage"]["warnings"]))
+
+    def test_archive_history_bounds_are_reported_as_snapshot_dates(self) -> None:
+        self.archive.upsert_conversation({"chat_id": "bounds", "name": "Bounds"})
+        with self.archive.connection() as con:
+            con.execute(
+                """
+                INSERT INTO messages(
+                    message_id, chat_id, message_type, created_at,
+                    body_text, raw_json, archived_at
+                ) VALUES ('bounds-message', 'bounds', 'text', ?, 'body', '{}', ?)
+                """,
+                (self.window["start_ms"] + 1, self.window["start_ms"] + 1),
+            )
+        bounds = archive_history_bounds(self.archive, self.mail, TIMEZONE)
+        self.assertEqual(bounds["earliest_date"], DAY.isoformat())
+        self.assertEqual(bounds["latest_date"], DAY.isoformat())
+        self.assertEqual(bounds["lanes"]["chat"]["observed_records"], 1)
+        self.assertEqual(bounds["basis"], "current_local_archive_snapshot")
+
+    def test_mail_bounds_include_sent_date_when_received_date_is_next_day(self) -> None:
+        mailbox_id = self._mailbox_with_folders()
+        prior = calendar_day_window("2026-03-28", TIMEZONE)
+        send_date = prior["end_ms"] - 60_000
+        received_date = prior["end_ms"] + 60_000
+        message_id, _ = self.mail.upsert_message(
+            mailbox_id,
+            {
+                "message_id": "sent-before-midnight",
+                "subject": "跨午夜发件",
+                "head_from": {"mail_address": "owner@example.com"},
+                "to": [{"mail_address": "recipient@example.com"}],
+                "date": received_date,
+                "internal_date": received_date,
+                "folder_id": "SENT",
+                "body_plain_text": "sent body",
+            },
+        )
+        with self.mail.connection() as con:
+            con.execute(
+                "UPDATE messages SET send_date=?, received_date=? WHERE id=?",
+                (send_date, received_date, message_id),
+            )
+
+        bounds = archive_history_bounds(self.archive, self.mail, TIMEZONE)
+        self.assertEqual(bounds["lanes"]["mail"]["earliest_date"], "2026-03-28")
+        extracted = extract_daily_sources(
+            self.archive, self.mail, "2026-03-28", TIMEZONE
+        )
+        sent_ids = {
+            item["source_id"]
+            for item in extracted["evidence"]
+            if item["source_kind"] == "mail" and item["direction"] == "sent"
+        }
+        self.assertIn("sent-before-midnight", sent_ids)
 
     def test_chunking_groups_threads_honors_budget_and_removes_duplicates(self) -> None:
         base = {

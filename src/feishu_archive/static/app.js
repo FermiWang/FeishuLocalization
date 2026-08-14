@@ -160,15 +160,28 @@ async function loadInsights(updateHistory = true) {
   $("insights-meta").textContent = "正在从本机洞察数据库读取…";
   try {
     const data = await request(`/api/insights/daily?date=${encodeURIComponent(reportDate)}`);
+    let insightStatus = {};
+    try {
+      insightStatus = await request("/api/insights/status");
+    } catch (_) {
+      insightStatus = {};
+    }
     const run = data.item || {};
     const report = run.report || run;
     const counts = report.coverage?.counts || {};
     const ledger = report.task_ledger || {};
+    const backfill = insightStatus.backfill || {};
     $("insights-title").textContent = `每日洞察 · ${report.report_date || reportDate}`;
     $("insights-meta").textContent = `${report.timezone || ""} · 模型 ${report.model || "未记录"} · 状态 ${report.model_status || run.status || "unknown"}`;
-    const ledgerText = ledger.historical_backfill_complete
-      ? `累计待办已回填：${ledger.coverage_start || ""} 至 ${ledger.coverage_end || ""}。`
-      : `累计待办仅覆盖已成功日报；全历史回填尚未完成。`;
+    const ledgerText = backfill.historical_analysis_complete && backfill.cumulative_ledger_complete
+      ? `历史报告与累计台账已完成：${backfill.oldest_date || ""} 至 ${backfill.newest_date || ""}。`
+      : backfill.historical_analysis_complete
+        ? `历史报告分析已完成；累计台账状态 ${backfill.reconciliation_status || "unknown"}。`
+        : backfill.configured
+          ? `历史回填已处理 ${backfill.processed_days || 0} 日，下一日 ${backfill.next_date || "待定"}，状态 ${backfill.status || "unknown"}。`
+          : ledger.cumulative_ledger_complete
+            ? `累计待办已核对：${ledger.coverage_start || ""} 至 ${ledger.coverage_end || ""}。`
+            : `累计待办仅覆盖已成功日报；全历史回填尚未启动。`;
     $("insights-coverage").textContent = `覆盖：聊天 ${counts.chat || 0} 条；收到邮件 ${counts.mail_received || 0} 封；发出邮件 ${counts.mail_sent || 0} 封；知识库新增 ${counts.wiki_created || 0} 篇、编辑 ${counts.wiki_edited || 0} 篇。${ledgerText}`;
     renderInsightItems("insights-yesterday", report.yesterday_summary);
     renderInsightItems("insights-today", report.today_plan);

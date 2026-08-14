@@ -76,12 +76,13 @@ def extract_daily_sources(
     try:
         with _read_connection(archive_db) as archive:
             chat_items, chat_warnings = _extract_chat(archive, window)
-            wiki_items, wiki_counts = _extract_wiki(archive, window)
+            wiki_items, wiki_counts, wiki_warnings = _extract_wiki(archive, window)
             evidence.extend(chat_items)
             evidence.extend(wiki_items)
             counts["chat"] = len(chat_items)
             counts.update(wiki_counts)
             warnings.extend(chat_warnings)
+            warnings.extend(wiki_warnings)
             latest_sync["chat"] = _latest_chat_sync(archive)
             latest_sync["wiki"] = _latest_sync_row(archive, "wiki_sync_runs", "wiki")
             readable["chat"] = True
@@ -133,6 +134,110 @@ def extract_daily_sources(
             "blocking_issues": _stable_unique(blocking_issues),
         },
         "evidence": evidence,
+    }
+
+
+def archive_history_bounds(
+    archive_db: Any,
+    mail_db: Any | None,
+    timezone: str | ZoneInfo,
+) -> dict[str, Any]:
+    """Return observed local-date bounds for each archive lane and overall.
+
+    These are evidence bounds in the current local snapshot, not a claim that
+    the upstream service contains no older or missing material.
+    """
+
+    zone = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
+    if not isinstance(zone, ZoneInfo):
+        raise TypeError("timezone must be a ZoneInfo or an IANA timezone name")
+    lanes: dict[str, dict[str, Any]] = {}
+
+    with _read_connection(archive_db) as archive:
+        chat = archive.execute(
+            """
+            SELECT MIN(created_at) AS earliest, MAX(created_at) AS latest,
+                   COUNT(*) AS count
+            FROM messages WHERE deleted=0 AND recalled=0
+            """
+        ).fetchone()
+        lanes["chat"] = _date_bounds_from_values(
+            chat["earliest"], chat["latest"], int(chat["count"] or 0), zone
+        )
+
+        wiki_values: list[int] = []
+        for row in archive.execute(
+            """
+            SELECT obj_create_time, obj_edit_time, node_create_time
+            FROM wiki_nodes WHERE status<>'missing'
+            """
+        ):
+            for key in ("obj_create_time", "obj_edit_time", "node_create_time"):
+                value = _timestamp_ms(row[key])
+                if value is not None:
+                    wiki_values.append(value)
+        lanes["wiki"] = _date_bounds_from_values(
+            min(wiki_values) if wiki_values else None,
+            max(wiki_values) if wiki_values else None,
+            len(wiki_values),
+            zone,
+        )
+
+    if mail_db is not None:
+        with _read_connection(mail_db) as mail:
+            mail_row = mail.execute(
+                """
+                SELECT
+                       MIN(CASE
+                             WHEN received_date IS NULL THEN send_date
+                             WHEN send_date IS NULL THEN received_date
+                             WHEN received_date <= send_date THEN received_date
+                             ELSE send_date
+                           END) AS earliest,
+                       MAX(CASE
+                             WHEN received_date IS NULL THEN send_date
+                             WHEN send_date IS NULL THEN received_date
+                             WHEN received_date >= send_date THEN received_date
+                             ELSE send_date
+                           END) AS latest,
+                       COUNT(*) AS count
+                FROM messages WHERE tombstoned_at IS NULL
+                """
+            ).fetchone()
+            lanes["mail"] = _date_bounds_from_values(
+                mail_row["earliest"],
+                mail_row["latest"],
+                int(mail_row["count"] or 0),
+                zone,
+            )
+    else:
+        lanes["mail"] = _date_bounds_from_values(None, None, 0, zone)
+
+    earliest_values = [value["earliest_date"] for value in lanes.values() if value["earliest_date"]]
+    latest_values = [value["latest_date"] for value in lanes.values() if value["latest_date"]]
+    return {
+        "earliest_date": min(earliest_values) if earliest_values else None,
+        "latest_date": max(latest_values) if latest_values else None,
+        "lanes": lanes,
+        "basis": "current_local_archive_snapshot",
+    }
+
+
+def _date_bounds_from_values(
+    earliest: Any,
+    latest: Any,
+    count: int,
+    zone: ZoneInfo,
+) -> dict[str, Any]:
+    def render(value: Any) -> str | None:
+        if value is None:
+            return None
+        return datetime.fromtimestamp(int(value) / 1000, zone).date().isoformat()
+
+    return {
+        "earliest_date": render(earliest),
+        "latest_date": render(latest),
+        "observed_records": int(count),
     }
 
 
@@ -588,7 +693,7 @@ def _folder_markers(folders: Sequence[Mapping[str, Any]]) -> set[str]:
 def _extract_wiki(
     connection: sqlite3.Connection,
     window: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, int], list[str]]:
     rows = connection.execute(
         """
         SELECT n.node_token, n.space_id, n.obj_token, n.obj_type,
@@ -614,6 +719,7 @@ def _extract_wiki(
 
     evidence: list[dict[str, Any]] = []
     counts = {"wiki_created": 0, "wiki_edited": 0}
+    temporal_metadata_only = 0
     for obj_token in sorted(grouped):
         nodes = grouped[obj_token]
         representative = nodes[0]
@@ -658,6 +764,13 @@ def _extract_wiki(
             if value is not None
         )
         node_tokens = sorted({str(node["node_token"]) for node in nodes})
+        content_is_temporally_exact = not (
+            created_on_day
+            and edited_at is not None
+            and edited_at >= int(window["end_ms"])
+        )
+        if not content_is_temporally_exact:
+            temporal_metadata_only += 1
         evidence.append(
             {
                 "evidence_id": f"wiki:{obj_token}",
@@ -667,7 +780,11 @@ def _extract_wiki(
                 "title": str(representative["document_title"] or representative["node_title"] or obj_token),
                 "occurred_at": occurred_at,
                 "direction": "created" if created_on_day else "edited",
-                "text": str(representative["content_text"] or ""),
+                "text": (
+                    str(representative["content_text"] or "")
+                    if content_is_temporally_exact
+                    else ""
+                ),
                 "metadata": {
                     "events": events,
                     "created_at": created_at,
@@ -685,11 +802,22 @@ def _extract_wiki(
                     "path": representative["path"],
                     "creator": representative["creator"],
                     "owner": representative["owner"],
+                    "actionable": content_is_temporally_exact,
+                    "content_temporal_status": (
+                        "current_revision_matches_event_day"
+                        if content_is_temporally_exact
+                        else "metadata_only_current_revision_is_newer"
+                    ),
                 },
                 "citation": f"wiki:{obj_token}",
             }
         )
-    return evidence, counts
+    warnings = []
+    if temporal_metadata_only:
+        warnings.append(
+            f"{temporal_metadata_only} 篇历史知识库事件仅使用元数据；当前正文版本晚于目标日期"
+        )
+    return evidence, counts, warnings
 
 
 def _latest_chat_sync(connection: sqlite3.Connection) -> dict[str, Any] | None:

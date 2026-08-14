@@ -94,6 +94,18 @@ class VMLXClientTests(unittest.TestCase):
         VMLXClient("http://127.0.0.1:11435", bearer_token=None, opener=no_token_opener).models()
         self.assertIsNone(no_token_opener.calls[0][0].get_header("Authorization"))
 
+    def test_health_uses_non_versioned_engine_endpoint(self) -> None:
+        opener = RecordingOpener(
+            FakeResponse(b'{"status":"healthy","scheduler":{"num_running":0}}')
+        )
+        health = VMLXClient(
+            "http://127.0.0.1:11435/v1", opener=opener
+        ).health()
+        self.assertEqual(health["status"], "healthy")
+        request, _ = opener.calls[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:11435/health")
+        self.assertEqual(request.method, "GET")
+
     def test_chat_json_posts_openai_payload_and_parses_json_fence(self) -> None:
         response = {
             "choices": [

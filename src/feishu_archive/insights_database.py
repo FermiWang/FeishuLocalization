@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 
 INSIGHTS_SCHEMA_VERSION = 1
@@ -729,15 +729,147 @@ class InsightsDatabase:
                     """
                 ).fetchone()
             else:
-                row = con.execute(
+                rows = con.execute(
                     """
                     SELECT * FROM analysis_runs
                     WHERE status='success' AND report_date=?
-                    ORDER BY is_active DESC, finished_at DESC, id DESC LIMIT 1
+                    ORDER BY is_active DESC, finished_at DESC, id DESC
                     """,
                     (str(report_date),),
-                ).fetchone()
+                ).fetchall()
+                fallback: dict[str, Any] | None = None
+                for item in rows:
+                    decoded = self._run_with_citations(con, item)
+                    fallback = fallback or decoded
+                    config = decoded.get("config") or {}
+                    report = decoded.get("report") or {}
+                    mode = (
+                        config.get("analysis_mode")
+                        or report.get("analysis_mode")
+                        or (
+                            "historical_backfill"
+                            if decoded.get("trigger") == "historical_backfill"
+                            else "daily_current"
+                        )
+                    )
+                    if mode == "daily_current":
+                        return decoded
+                return fallback
             return self._run_with_citations(con, row) if row else None
+
+    def matching_successful_report(
+        self,
+        *,
+        report_date: str,
+        timezone: str,
+        model_id: str,
+        prompt_version: str,
+        source_snapshot_hash: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Find a success only when the complete immutable request matches."""
+        expected_config = _json_value(_mapping(config))
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE status='success' AND report_date=? AND timezone=?
+                  AND model_id=? AND prompt_version=? AND source_snapshot_hash=?
+                ORDER BY finished_at DESC, id DESC
+                """,
+                (
+                    str(report_date),
+                    str(timezone),
+                    str(model_id),
+                    str(prompt_version),
+                    str(source_snapshot_hash),
+                ),
+            ).fetchall()
+            for row in rows:
+                if str(row["config_json"]) == expected_config:
+                    return self._run_with_citations(con, row)
+        return None
+
+    def latest_successful_report_for_mode(
+        self, report_date: str, analysis_mode: str, *, timezone: str | None = None
+    ) -> dict[str, Any] | None:
+        with self.connection() as con:
+            params: list[Any] = [str(report_date)]
+            timezone_clause = ""
+            if timezone is not None:
+                timezone_clause = " AND timezone=?"
+                params.append(str(timezone))
+            rows = con.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE status='success' AND report_date=?
+                """
+                + timezone_clause
+                + " ORDER BY finished_at DESC, id DESC",
+                params,
+            ).fetchall()
+            for row in rows:
+                decoded = self._run_with_citations(con, row)
+                config = decoded.get("config") or {}
+                report = decoded.get("report") or {}
+                if (
+                    config.get("analysis_mode") == analysis_mode
+                    or report.get("analysis_mode") == analysis_mode
+                ):
+                    return decoded
+        return None
+
+    def matching_successful_report_for_mode(
+        self,
+        *,
+        report_date: str,
+        analysis_mode: str,
+        timezone: str,
+        model_id: str,
+        prompt_version: str,
+        source_snapshot_hash: str,
+        config_requirements: Mapping[str, Any] | None = None,
+        report_requirements: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Find any successful mode run satisfying the immutable requirements.
+
+        This deliberately scans all matching successes instead of filtering the
+        newest run after selection. A later manual run with another model must
+        not hide an earlier, fully compatible daily projection.
+        """
+        required_config = dict(config_requirements or {})
+        required_report = dict(report_requirements or {})
+        with self.connection() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE status='success' AND report_date=? AND timezone=?
+                  AND model_id=? AND prompt_version=? AND source_snapshot_hash=?
+                ORDER BY finished_at DESC, id DESC
+                """,
+                (
+                    str(report_date),
+                    str(timezone),
+                    str(model_id),
+                    str(prompt_version),
+                    str(source_snapshot_hash),
+                ),
+            ).fetchall()
+            for row in rows:
+                decoded = self._run_with_citations(con, row)
+                config = decoded.get("config") or {}
+                report = decoded.get("report") or {}
+                if not (
+                    config.get("analysis_mode") == analysis_mode
+                    or report.get("analysis_mode") == analysis_mode
+                ):
+                    continue
+                if any(config.get(key) != value for key, value in required_config.items()):
+                    continue
+                if any(report.get(key) != value for key, value in required_report.items()):
+                    continue
+                return decoded
+        return None
 
     def status(self) -> dict[str, Any]:
         with self.connection() as con:
@@ -749,7 +881,16 @@ class InsightsDatabase:
                     ).fetchone()[0]
                 ),
                 "evidence": int(con.execute("SELECT COUNT(*) FROM run_evidence").fetchone()[0]),
-                "tasks": int(con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]),
+                "tasks": int(
+                    con.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE task_key NOT LIKE 'archived:%'"
+                    ).fetchone()[0]
+                ),
+                "archived_tasks": int(
+                    con.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE task_key LIKE 'archived:%'"
+                    ).fetchone()[0]
+                ),
                 "open_tasks": int(
                     con.execute(
                         """
@@ -759,7 +900,20 @@ class InsightsDatabase:
                     ).fetchone()[0]
                 ),
                 "opportunities": int(
-                    con.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
+                    con.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunities
+                        WHERE opportunity_key NOT LIKE 'archived:%'
+                        """
+                    ).fetchone()[0]
+                ),
+                "archived_opportunities": int(
+                    con.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunities
+                        WHERE opportunity_key LIKE 'archived:%'
+                        """
+                    ).fetchone()[0]
                 ),
             }
             latest = con.execute(
@@ -904,6 +1058,7 @@ class InsightsDatabase:
             task = con.execute(
                 "SELECT * FROM tasks WHERE task_key=?", (task_key,)
             ).fetchone()
+            task_created = task is None
             if task is None:
                 initial_status = observed_status or "open"
                 cursor = con.execute(
@@ -939,40 +1094,72 @@ class InsightsDatabase:
 
             current_status = str(task["status"])
             manually_controlled = str(task["status_source"]) == "manual"
-            applied = observed_status is None or observed_status == current_status or not manually_controlled
+            latest_event = con.execute(
+                """
+                SELECT MAX(occurred_at) AS occurred_at FROM task_events
+                WHERE task_id=? AND applied=1 AND to_status IS NOT NULL
+                """,
+                (int(task["id"]),),
+            ).fetchone()
+            latest_event_at = (
+                int(latest_event["occurred_at"])
+                if latest_event is not None and latest_event["occurred_at"] is not None
+                else int(task["last_seen_at"])
+            )
+            projection_at = max(int(task["last_seen_at"]), latest_event_at)
+            chronologically_current = task_created or observed_at > projection_at
+            applied = chronologically_current and (
+                not manually_controlled
+                or observed_status is None
+                or observed_status == current_status
+            )
             new_status = observed_status if observed_status is not None and applied else current_status
-            new_confidence = confidence if confidence is not None else float(task["confidence"])
+            new_confidence = (
+                confidence
+                if confidence is not None and chronologically_current
+                else float(task["confidence"])
+            )
             closed_at = (
                 observed_at
-                if _is_closed(new_status) and not _is_closed(current_status)
+                if applied and _is_closed(new_status) and not _is_closed(current_status)
                 else (None if not _is_closed(new_status) else task["closed_at"])
             )
             con.execute(
                 """
                 UPDATE tasks SET
-                    dedupe_key=CASE WHEN ?='' THEN dedupe_key ELSE ? END,
-                    title=?, description=CASE WHEN ?='' THEN description ELSE ? END,
-                    project_key=CASE WHEN ?='' THEN project_key ELSE ? END,
-                    owner_key=CASE WHEN ?='' THEN owner_key ELSE ? END,
-                    due_at=COALESCE(?, due_at), status=?,
+                    dedupe_key=CASE WHEN ?=1 AND ?<>'' THEN ? ELSE dedupe_key END,
+                    title=CASE WHEN ?=1 THEN ? ELSE title END,
+                    description=CASE WHEN ?=1 AND ?<>'' THEN ? ELSE description END,
+                    project_key=CASE WHEN ?=1 AND ?<>'' THEN ? ELSE project_key END,
+                    owner_key=CASE WHEN ?=1 AND ?<>'' THEN ? ELSE owner_key END,
+                    due_at=CASE WHEN ?=1 THEN COALESCE(?, due_at) ELSE due_at END,
+                    status=?,
                     status_source=CASE WHEN status_source='manual' THEN 'manual' ELSE 'machine' END,
-                    confidence=?, last_seen_at=MAX(last_seen_at, ?), closed_at=?,
+                    confidence=?, first_seen_at=MIN(first_seen_at, ?),
+                    last_seen_at=MAX(last_seen_at, ?), closed_at=?,
                     version=version+1, updated_at=?
                 WHERE id=?
                 """,
                 (
+                    int(chronologically_current),
                     str(task_data.get("dedupe_key") or ""),
                     str(task_data.get("dedupe_key") or ""),
+                    int(chronologically_current),
                     title,
+                    int(chronologically_current),
                     str(task_data.get("description") or ""),
                     str(task_data.get("description") or ""),
+                    int(chronologically_current),
                     str(task_data.get("project_key") or ""),
                     str(task_data.get("project_key") or ""),
+                    int(chronologically_current),
                     str(task_data.get("owner_key") or ""),
                     str(task_data.get("owner_key") or ""),
+                    int(chronologically_current),
                     _optional_int(task_data.get("due_at")),
                     new_status,
                     new_confidence,
+                    observed_at,
                     observed_at,
                     closed_at,
                     now,
@@ -1160,20 +1347,275 @@ class InsightsDatabase:
             result["applied"] = applied
             return result
 
+    def reset_machine_projections(
+        self,
+        *,
+        projection_version: str,
+        include_current: bool = False,
+    ) -> dict[str, int]:
+        """Archive rebuildable machine projections while preserving their audit rows.
+
+        Tasks or opportunities touched by a human are never removed. Their
+        source reports and evidence also remain immutable; only the derived
+        machine ledger and its projection rows are rebuilt chronologically.
+        """
+        expected = str(projection_version)
+        now = _now_ms()
+        with self.transaction() as con:
+            task_rows: list[sqlite3.Row] = []
+            for row in con.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status_source='machine' AND task_key NOT LIKE 'archived:%'
+                """
+            ).fetchall():
+                payload = _json_load_mapping(str(row["payload_json"]))
+                if include_current or payload.get("projection_version") != expected:
+                    task_rows.append(row)
+            for row in task_rows:
+                task_id = int(row["id"])
+                archived_key = f"archived:{expected}:task:{task_id}:{row['task_key']}"
+                payload = _json_load_mapping(str(row["payload_json"]))
+                con.execute(
+                    """
+                    INSERT INTO task_events(
+                        task_id, run_id, event_key, event_type, actor_kind,
+                        from_status, to_status, applied, occurred_at,
+                        payload_json, created_at
+                    ) VALUES (?, NULL, ?, 'projection_reset', 'system', ?,
+                              'superseded', 1, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        f"projection-reset:{expected}:{task_id}",
+                        str(row["status"]),
+                        now,
+                        _json_value(
+                            {
+                                "projection_version": expected,
+                                "include_current": bool(include_current),
+                                "previous_task_key": str(row["task_key"]),
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                con.execute(
+                    """
+                    UPDATE tasks SET task_key=?, status='superseded',
+                        closed_at=?, version=version+1, payload_json=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        archived_key,
+                        now,
+                        _json_value(
+                            {
+                                **payload,
+                                "projection_archived": True,
+                                "projection_archived_for": expected,
+                                "projection_original_key": str(row["task_key"]),
+                            }
+                        ),
+                        now,
+                        task_id,
+                    ),
+                )
+
+            opportunity_rows: list[sqlite3.Row] = []
+            for row in con.execute(
+                """
+                SELECT * FROM opportunities
+                WHERE status_source='machine' AND opportunity_key NOT LIKE 'archived:%'
+                """
+            ).fetchall():
+                payload = _json_load_mapping(str(row["payload_json"]))
+                if include_current or payload.get("projection_version") != expected:
+                    opportunity_rows.append(row)
+            for row in opportunity_rows:
+                opportunity_id = int(row["id"])
+                payload = _json_load_mapping(str(row["payload_json"]))
+                con.execute(
+                    """
+                    UPDATE opportunities SET opportunity_key=?, status='expired',
+                        payload_json=?, updated_at=? WHERE id=?
+                    """,
+                    (
+                        f"archived:{expected}:opportunity:{opportunity_id}:{row['opportunity_key']}",
+                        _json_value(
+                            {
+                                **payload,
+                                "projection_archived": True,
+                                "projection_archived_for": expected,
+                                "projection_original_key": str(
+                                    row["opportunity_key"]
+                                ),
+                                "projection_original_status": str(row["status"]),
+                            }
+                        ),
+                        now,
+                        opportunity_id,
+                    ),
+                )
+        return {
+            "tasks_archived": len(task_rows),
+            "opportunities_archived": len(opportunity_rows),
+            "include_current": int(bool(include_current)),
+        }
+
+    def replay_run_projections(
+        self,
+        run_id: int,
+        *,
+        campaign_id: str,
+        projection_version: str,
+    ) -> dict[str, int]:
+        """Idempotently project a cached successful run into a rebuilt ledger."""
+        with self.connection() as con:
+            task_rows = con.execute(
+                """
+                SELECT o.id AS observation_id, o.run_evidence_id,
+                       o.observed_status, o.confidence, o.observed_at,
+                       o.payload_json AS observation_payload_json,
+                       t.task_key, t.dedupe_key, t.title, t.description,
+                       t.project_key, t.owner_key, t.due_at,
+                       t.payload_json AS task_payload_json
+                FROM task_observations o
+                JOIN tasks t ON t.id=o.task_id
+                WHERE o.run_id=? AND o.observation_key NOT LIKE 'replay:%'
+                  AND t.task_key LIKE 'archived:%'
+                ORDER BY o.observed_at, o.id
+                """,
+                (int(run_id),),
+            ).fetchall()
+            signal_rows = con.execute(
+                """
+                SELECT s.id AS signal_id, s.run_evidence_id, s.signal_kind,
+                       s.score, s.confidence, s.observed_at,
+                       s.payload_json AS signal_payload_json,
+                       o.opportunity_key, o.entity_key, o.title, o.summary,
+                       o.payload_json AS opportunity_payload_json
+                FROM opportunity_signals s
+                JOIN opportunities o ON o.id=s.opportunity_id
+                WHERE s.run_id=? AND s.signal_key NOT LIKE 'replay:%'
+                  AND o.opportunity_key LIKE 'archived:%'
+                ORDER BY s.observed_at, s.id
+                """,
+                (int(run_id),),
+            ).fetchall()
+
+        task_count = 0
+        for row in task_rows:
+            task_payload = _json_load_mapping(str(row["task_payload_json"]))
+            original_key = str(
+                task_payload.get("projection_original_key") or row["task_key"]
+            )
+            clean_task_payload = {
+                key: value
+                for key, value in task_payload.items()
+                if not key.startswith("projection_archived")
+                and key != "projection_original_key"
+            }
+            clean_task_payload["projection_version"] = str(projection_version)
+            self.upsert_task_observation(
+                {
+                    "run_id": int(run_id),
+                    "evidence_id": _nullable_int(row["run_evidence_id"]),
+                    "observation_key": (
+                        f"replay:{campaign_id}:task:{int(row['observation_id'])}"
+                    ),
+                    "task": {
+                        "task_key": original_key,
+                        "dedupe_key": str(row["dedupe_key"]),
+                        "title": str(row["title"]),
+                        "description": str(row["description"]),
+                        "project_key": str(row["project_key"]),
+                        "owner_key": str(row["owner_key"]),
+                        "due_at": _nullable_int(row["due_at"]),
+                        "payload": clean_task_payload,
+                    },
+                    "observed_status": row["observed_status"],
+                    "confidence": row["confidence"],
+                    "observed_at": int(row["observed_at"]),
+                    "payload": {
+                        **_json_load_mapping(str(row["observation_payload_json"])),
+                        "replayed_for_campaign": str(campaign_id),
+                    },
+                }
+            )
+            task_count += 1
+
+        signal_count = 0
+        for row in signal_rows:
+            opportunity_payload = _json_load_mapping(
+                str(row["opportunity_payload_json"])
+            )
+            original_key = str(
+                opportunity_payload.get("projection_original_key")
+                or row["opportunity_key"]
+            )
+            clean_opportunity_payload = {
+                key: value
+                for key, value in opportunity_payload.items()
+                if not key.startswith("projection_archived")
+                and key not in {"projection_original_key", "projection_original_status"}
+            }
+            clean_opportunity_payload["projection_version"] = str(
+                projection_version
+            )
+            self.upsert_opportunity_signal(
+                {
+                    "run_id": int(run_id),
+                    "evidence_id": _nullable_int(row["run_evidence_id"]),
+                    "signal_key": (
+                        f"replay:{campaign_id}:opportunity:{int(row['signal_id'])}"
+                    ),
+                    "opportunity": {
+                        "opportunity_key": original_key,
+                        "entity_key": str(row["entity_key"]),
+                        "title": str(row["title"]),
+                        "summary": str(row["summary"]),
+                        "status": "active",
+                        "payload": clean_opportunity_payload,
+                    },
+                    "signal_kind": str(row["signal_kind"]),
+                    "score": float(row["score"]),
+                    "confidence": float(row["confidence"]),
+                    "observed_at": int(row["observed_at"]),
+                    "payload": {
+                        **_json_load_mapping(str(row["signal_payload_json"])),
+                        "replayed_for_campaign": str(campaign_id),
+                    },
+                }
+            )
+            signal_count += 1
+        return {
+            "task_observations_replayed": task_count,
+            "opportunity_signals_replayed": signal_count,
+        }
+
     def list_tasks(
         self,
         *,
         status: str | None = None,
+        open_only: bool = False,
         project_key: str | None = None,
         owner_key: str | None = None,
-        limit: int = 200,
+        limit: int | None = 200,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
+        if not include_archived:
+            clauses.append("task_key NOT LIKE 'archived:%'")
         if status:
             _validate_task_status(status)
             clauses.append("status=?")
             params.append(status)
+        if open_only:
+            if status is not None:
+                raise ValueError("status 与 open_only 不能同时使用")
+            clauses.append("status NOT IN ('done', 'canceled', 'superseded')")
         if project_key is not None:
             clauses.append("project_key=?")
             params.append(str(project_key))
@@ -1181,9 +1623,8 @@ class InsightsDatabase:
             clauses.append("owner_key=?")
             params.append(str(owner_key))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        bounded_limit = max(1, min(int(limit), 2000))
         with self.connection() as con:
-            rows = con.execute(
+            sql = (
                 """
                 SELECT t.*,
                        (
@@ -1195,9 +1636,13 @@ class InsightsDatabase:
                 """
                 + where
                 + " ORDER BY CASE WHEN due_at IS NULL THEN 1 ELSE 0 END, "
-                "due_at, last_seen_at DESC, id DESC LIMIT ?",
-                (*params, bounded_limit),
-            ).fetchall()
+                "due_at, last_seen_at DESC, id DESC"
+            )
+            if limit is None:
+                rows = con.execute(sql, params).fetchall()
+            else:
+                bounded_limit = max(1, min(int(limit), 10_000))
+                rows = con.execute(sql + " LIMIT ?", (*params, bounded_limit)).fetchall()
         return [_decode_row(row) for row in rows]
 
     def upsert_opportunity_signal(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -1276,6 +1721,7 @@ class InsightsDatabase:
                 "SELECT * FROM opportunities WHERE opportunity_key=?",
                 (opportunity_key,),
             ).fetchone()
+            opportunity_created = opportunity is None
             if opportunity is None:
                 requested_status = str(opportunity_data.get("status") or "active")
                 if requested_status not in _OPPORTUNITY_STATUSES:
@@ -1330,9 +1776,17 @@ class InsightsDatabase:
             )
             common_update = (
                 "signal_count=signal_count+1, "
+                "first_seen_at=MIN(first_seen_at, ?), "
                 "last_seen_at=MAX(last_seen_at, ?), updated_at=?"
             )
-            if str(opportunity["status_source"]) != "manual":
+            chronologically_current = (
+                opportunity_created
+                or observed_at > int(opportunity["last_seen_at"])
+            )
+            if (
+                str(opportunity["status_source"]) != "manual"
+                and chronologically_current
+            ):
                 con.execute(
                     f"""
                     UPDATE opportunities SET
@@ -1350,6 +1804,7 @@ class InsightsDatabase:
                         score,
                         confidence,
                         observed_at,
+                        observed_at,
                         now,
                         int(opportunity["id"]),
                     ),
@@ -1357,7 +1812,7 @@ class InsightsDatabase:
             else:
                 con.execute(
                     f"UPDATE opportunities SET {common_update} WHERE id=?",
-                    (observed_at, now, int(opportunity["id"])),
+                    (observed_at, observed_at, now, int(opportunity["id"])),
                 )
             result = self._opportunity_with_connection(con, int(opportunity["id"]))
             signal = con.execute(
@@ -1372,14 +1827,18 @@ class InsightsDatabase:
         *,
         status: str | None = None,
         limit: int = 200,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
-        where = ""
+        clauses: list[str] = []
+        if not include_archived:
+            clauses.append("opportunity_key NOT LIKE 'archived:%'")
         if status is not None:
             if status not in _OPPORTUNITY_STATUSES:
                 raise ValueError(f"无效的机会状态: {status}")
-            where = " WHERE status=?"
+            clauses.append("status=?")
             params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         bounded_limit = max(1, min(int(limit), 2000))
         with self.connection() as con:
             rows = con.execute(

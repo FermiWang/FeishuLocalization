@@ -5,12 +5,13 @@ import json
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 import urllib.parse
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -29,6 +30,10 @@ from .automation import (
     run_wiki_sync_cycle,
 )
 from .config import (
+    DEFAULT_INSIGHTS_BACKFILL_END_HOUR,
+    DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
     DEFAULT_INSIGHTS_SYNC_HOUR,
     DEFAULT_INSIGHTS_SYNC_MINUTE,
     DEFAULT_INSIGHTS_TIMEZONE,
@@ -66,8 +71,31 @@ from .feishu_mail import FeishuMailProvider
 from .keychain import KeychainError, KeychainStore
 from .mail_database import MailDatabase
 from .mail_sync import MailAuthorizationError, MailCapacityError, MailSyncPartialError
-from .insights import InsightsRunOptions, export_report, run_daily_insights
+from .insights import (
+    InsightsRunOptions,
+    export_report,
+    insights_analysis_config,
+    insights_run_identity,
+    run_daily_insights,
+)
+from .insights import PROJECTION_VERSION, PROMPT_VERSION
 from .insights_database import InsightsDatabase
+from .insights_sources import archive_history_bounds, extract_daily_sources
+from .backfill import (
+    BACKFILL_ANALYSIS_MODE,
+    BackfillPolicy,
+    backfill_window_remaining_seconds,
+    ensure_backfill_state,
+    evaluate_vmlx_load,
+    load_backfill_state,
+    mark_backfill_projection_initialized,
+    public_backfill_status,
+    record_backfill_audit,
+    record_backfill_deferred,
+    record_backfill_error,
+    record_backfill_success,
+    within_backfill_window,
+)
 from .reader_auth import (
     ReaderSessionManager,
     disable_permanent_unlock,
@@ -294,6 +322,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     insights_run.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
 
+    insights_backfill = subparsers.add_parser(
+        "insights-backfill-step",
+        help="按 vMLX 空闲负荷从最早日期向最近日期自动回填一步",
+    )
+    insights_backfill.add_argument("--timezone", default=DEFAULT_INSIGHTS_TIMEZONE)
+    insights_backfill.add_argument("--host", default=DEFAULT_VMLX_HOST)
+    insights_backfill.add_argument("--user", default=DEFAULT_VMLX_USER)
+    insights_backfill.add_argument("--model", default=DEFAULT_VMLX_MODEL)
+    insights_backfill.add_argument("--local-port", type=int, default=DEFAULT_VMLX_LOCAL_PORT)
+    insights_backfill.add_argument(
+        "--remote-port", type=int, choices=(11435,), default=DEFAULT_VMLX_REMOTE_PORT
+    )
+    insights_backfill.add_argument(
+        "--minimum-idle-seconds",
+        type=int,
+        default=DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
+    )
+    insights_backfill.add_argument(
+        "--start-hour", type=int, default=DEFAULT_INSIGHTS_BACKFILL_START_HOUR
+    )
+    insights_backfill.add_argument(
+        "--end-hour", type=int, default=DEFAULT_INSIGHTS_BACKFILL_END_HOUR
+    )
+    insights_backfill.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+
     subparsers.add_parser("insights-status", help="显示每日洞察状态")
 
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
@@ -350,6 +403,7 @@ def main(argv: list[str] | None = None) -> None:
         "wiki-rebuild",
         "serve",
         "doctor",
+        "insights-backfill-step",
     }
     mail_database_commands = {
         "init",
@@ -358,6 +412,7 @@ def main(argv: list[str] | None = None) -> None:
         "mail-status",
         "mail-doctor",
         "mail-preflight",
+        "insights-backfill-step",
     }
 
     if args.command in archive_commands:
@@ -617,7 +672,25 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "insights-status":
             insights_database = InsightsDatabase(paths.insights_database)
             insights_database.initialize()
-            print(json.dumps(insights_database.status(), ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        **insights_database.status(),
+                        "backfill": public_backfill_status(paths.insights_backfill_state),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        elif args.command == "insights-backfill-step":
+            assert database is not None
+            assert mail_database is not None
+            _run_insights_backfill_step(
+                args,
+                paths,
+                database,
+                mail_database,
+            )
         elif args.command == "insights-run":
             if not paths.database.is_file():
                 raise ValueError(f"聊天与知识库档案不存在：{paths.database}")
@@ -627,7 +700,27 @@ def main(argv: list[str] | None = None) -> None:
             insights_database = None if args.dry_run else InsightsDatabase(paths.insights_database)
             if insights_database is not None:
                 insights_database.initialize()
-            lock = None if args.dry_run else acquire_insights_lock(paths)
+            lock = None
+            if not args.dry_run:
+                lock_deadline = time.monotonic() + (5400 if args.scheduled else 0)
+                while lock is None:
+                    try:
+                        lock = acquire_insights_lock(paths)
+                    except SyncBusyError:
+                        if not args.scheduled:
+                            raise ValueError("另一个洞察任务正在运行，请稍后重试") from None
+                        if time.monotonic() >= lock_deadline:
+                            print(
+                                json.dumps(
+                                    {
+                                        "outcome": "deferred",
+                                        "reason": "insights_lock_busy_timeout",
+                                    },
+                                    separators=(",", ":"),
+                                )
+                            )
+                            raise SystemExit(75) from None
+                        time.sleep(15.0)
             try:
                 client = None
                 tunnel = None
@@ -661,6 +754,16 @@ def main(argv: list[str] | None = None) -> None:
                         }
                         if args.model not in available_models:
                             raise ValueError(f"远端未提供指定模型：{args.model}")
+                        if args.remote_port == 11435:
+                            # The scheduled daily lane shares the same engine as
+                            # historical backfill. Recheck scheduler admission
+                            # before every Map/Reduce request so neither lane
+                            # blindly submits while vMLX is already occupied.
+                            client = _LoadAwareBackfillClient(
+                                client,
+                                models=[{"id": value} for value in available_models],
+                                requested_model=args.model,
+                            )
                     except (ValueError, VMLXError) as exc:
                         if tunnel is not None:
                             tunnel.__exit__(*sys.exc_info())
@@ -680,6 +783,12 @@ def main(argv: list[str] | None = None) -> None:
                             dry_run=args.dry_run,
                             trigger="scheduled" if args.scheduled else "manual",
                             model_unavailable_reason=model_unavailable_reason,
+                            map_checkpoint_path=(
+                                None
+                                if args.dry_run
+                                else paths.insights_backfill_checkpoints
+                                / f"daily-{report_date}.json"
+                            ),
                         ),
                         client=client,
                     )
@@ -692,7 +801,21 @@ def main(argv: list[str] | None = None) -> None:
                         "json": str(json_path),
                         "markdown": str(markdown_path),
                     }
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+                if args.scheduled:
+                    print(
+                        json.dumps(
+                            {
+                                "outcome": "success" if report.get("published") else "partial",
+                                "report_date": report.get("report_date"),
+                                "model_status": report.get("model_status"),
+                                "published": bool(report.get("published")),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                else:
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
             finally:
                 if lock is not None:
                     lock.release()
@@ -793,6 +916,14 @@ def main(argv: list[str] | None = None) -> None:
                         f"每天 {DEFAULT_INSIGHTS_SYNC_HOUR:02d}:"
                         f"{DEFAULT_INSIGHTS_SYNC_MINUTE:02d} 生成昨日洞察"
                     ),
+                    "backfill": {
+                        "enabled": True,
+                        "interval_seconds": DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS,
+                        "start_hour": DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
+                        "end_hour": DEFAULT_INSIGHTS_BACKFILL_END_HOUR,
+                        "minimum_idle_seconds": DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
+                        "direction": "forward",
+                    },
                 },
             )
         elif args.command == "doctor":
@@ -809,6 +940,521 @@ def main(argv: list[str] | None = None) -> None:
     ) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         raise SystemExit(2) from exc
+
+
+def _run_insights_backfill_step(
+    args: argparse.Namespace,
+    paths: ArchivePaths,
+    database: ArchiveDatabase,
+    mail_database: MailDatabase,
+) -> None:
+    """Run at most one historical date and emit metadata-only progress."""
+
+    policy = BackfillPolicy(
+        timezone=args.timezone,
+        model=args.model,
+        start_hour=args.start_hour,
+        end_hour=args.end_hour,
+        minimum_idle_seconds=args.minimum_idle_seconds,
+    )
+    insights_database = InsightsDatabase(paths.insights_database)
+    insights_database.initialize()
+    try:
+        lock = acquire_insights_lock(paths)
+    except SyncBusyError:
+        print(json.dumps({"outcome": "deferred", "reason": "insights_lock_busy"}))
+        return
+
+    try:
+        local_now = datetime.now(ZoneInfo(args.timezone))
+        remaining_window_seconds = backfill_window_remaining_seconds(local_now, policy)
+        if args.scheduled and not within_backfill_window(local_now, policy):
+            print(json.dumps({"outcome": "deferred", "reason": "outside_backfill_window"}))
+            return
+        if args.scheduled and remaining_window_seconds < 900:
+            print(
+                json.dumps(
+                    {"outcome": "deferred", "reason": "insufficient_backfill_window"}
+                )
+            )
+            return
+        hard_deadline_monotonic = (
+            time.monotonic() + remaining_window_seconds if args.scheduled else None
+        )
+
+        bounds = archive_history_bounds(database, mail_database, args.timezone)
+        oldest = bounds.get("earliest_date")
+        if not oldest:
+            previous_state = load_backfill_state(paths.insights_backfill_state)
+            if previous_state is None:
+                print(
+                    json.dumps(
+                        {"outcome": "complete", "reason": "archive_has_no_evidence"}
+                    )
+                )
+                return
+            # A previously non-empty archive becoming empty is itself a source
+            # snapshot change. Keep the prior lower bound so the continuous
+            # audit can observe empty days and rebuild stale machine ledgers.
+            oldest = previous_state.get("oldest_date")
+        yesterday = _yesterday(args.timezone)
+        # Always include yesterday in the campaign. Whether it is already
+        # covered is an exact snapshot/model/prompt/projection decision made at
+        # that date, never an inference from the mere presence of a daily run.
+        newest = yesterday
+        campaign_options = InsightsRunOptions(
+            report_date=newest,
+            timezone=args.timezone,
+            model=args.model,
+            trigger=BACKFILL_ANALYSIS_MODE,
+            analysis_mode=BACKFILL_ANALYSIS_MODE,
+            activate=False,
+            include_carryover=False,
+        )
+        state = ensure_backfill_state(
+            paths.insights_backfill_state,
+            oldest_date=str(oldest),
+            newest_date=newest,
+            timezone=args.timezone,
+            model=args.model,
+            prompt_version=PROMPT_VERSION,
+            analysis_config=insights_analysis_config(campaign_options),
+            archive_bounds=bounds,
+            extend_newest=True,
+        )
+        reusable_source: dict[str, Any] | None = None
+        audit_date = state.get("audit_next_date")
+        if state.get("next_date") is None and audit_date:
+            audit_options = InsightsRunOptions(
+                report_date=str(audit_date),
+                timezone=args.timezone,
+                model=args.model,
+                trigger=BACKFILL_ANALYSIS_MODE,
+                analysis_mode=BACKFILL_ANALYSIS_MODE,
+                activate=False,
+                include_carryover=False,
+            )
+            audit_source = extract_daily_sources(
+                database, mail_database, str(audit_date), args.timezone
+            )
+            if not (audit_source.get("coverage") or {}).get("complete"):
+                state = record_backfill_deferred(
+                    paths.insights_backfill_state,
+                    state,
+                    reason="source_coverage_incomplete_during_audit",
+                )
+                _print_backfill_progress(state, outcome="deferred")
+                return
+            audit_identity = insights_run_identity(audit_source, audit_options)
+            state = record_backfill_audit(
+                paths.insights_backfill_state,
+                state,
+                report_date=str(audit_date),
+                source_snapshot_hash=str(audit_identity["source_snapshot_hash"]),
+            )
+            if not state.get("projection_reset_required"):
+                _print_backfill_progress(
+                    state, outcome=str(state.get("last_outcome") or "audit_match")
+                )
+                return
+            if state.get("next_date") == audit_date:
+                reusable_source = audit_source
+        if state.get("next_date") is None:
+            _print_backfill_progress(state, outcome="complete")
+            return
+        report_date = str(state["next_date"])
+        checkpoint_path = paths.insights_backfill_checkpoints / f"{report_date}.json"
+        run_options = InsightsRunOptions(
+            report_date=report_date,
+            timezone=args.timezone,
+            model=args.model,
+            trigger=BACKFILL_ANALYSIS_MODE,
+            analysis_mode=BACKFILL_ANALYSIS_MODE,
+            activate=False,
+            include_carryover=False,
+            map_checkpoint_path=checkpoint_path,
+        )
+        source = reusable_source or extract_daily_sources(
+            database, mail_database, report_date, args.timezone
+        )
+        coverage = source.get("coverage") or {}
+        if not coverage.get("complete"):
+            state = record_backfill_deferred(
+                paths.insights_backfill_state,
+                state,
+                reason="source_coverage_incomplete",
+            )
+            _print_backfill_progress(state, outcome="deferred")
+            return
+
+        identity = insights_run_identity(source, run_options)
+        if state.get("projection_reset_required"):
+            include_current = True
+            try:
+                reset_summary = insights_database.reset_machine_projections(
+                    projection_version=PROJECTION_VERSION,
+                    include_current=include_current,
+                )
+                state = mark_backfill_projection_initialized(
+                    paths.insights_backfill_state,
+                    state,
+                    reset_summary=reset_summary,
+                )
+            except Exception as exc:
+                state = record_backfill_error(
+                    paths.insights_backfill_state,
+                    state,
+                    reason=f"projection_reset_failed:{type(exc).__name__}",
+                )
+                _print_backfill_progress(state, outcome="error")
+                return
+        daily_coverage = insights_database.matching_successful_report_for_mode(
+            report_date=report_date,
+            analysis_mode="daily_current",
+            timezone=args.timezone,
+            model_id=args.model,
+            prompt_version=PROMPT_VERSION,
+            source_snapshot_hash=str(identity["source_snapshot_hash"]),
+            config_requirements={
+                "max_chunk_chars": run_options.max_chunk_chars,
+                "max_output_tokens": run_options.max_output_tokens,
+                "projection_version": PROJECTION_VERSION,
+            },
+            report_requirements={"published": True},
+        )
+        daily_report = (daily_coverage or {}).get("report") or {}
+        if (
+            daily_coverage is not None
+            and daily_report.get("model_status") in {"success", "not_required"}
+        ):
+            try:
+                # Repair the narrow crash window where the successful DB run
+                # committed before its JSON/Markdown files were exported.
+                export_report(paths, dict(daily_report))
+                if bool(
+                    (state.get("last_projection_reset") or {}).get(
+                        "include_current"
+                    )
+                ):
+                    insights_database.replay_run_projections(
+                        int(daily_coverage["id"]),
+                        campaign_id=str(state["campaign_id"]),
+                        projection_version=PROJECTION_VERSION,
+                    )
+                checkpoint_path.unlink(missing_ok=True)
+            except (OSError, ValueError, sqlite3.Error):
+                state = record_backfill_error(
+                    paths.insights_backfill_state,
+                    state,
+                    reason="historical_checkpoint_cleanup_failed",
+                )
+                _print_backfill_progress(state, outcome="error")
+                return
+            state = record_backfill_success(
+                paths.insights_backfill_state,
+                state,
+                report_date=report_date,
+                source_snapshot_hash=str(identity["source_snapshot_hash"]),
+                run_id=int(daily_coverage["id"]),
+                empty_day=not bool(source.get("evidence")),
+                covered_by_daily=True,
+            )
+            _print_backfill_progress(state, outcome="covered_by_daily")
+            return
+        existing = insights_database.matching_successful_report(
+            report_date=report_date,
+            timezone=args.timezone,
+            model_id=args.model,
+            prompt_version=PROMPT_VERSION,
+            source_snapshot_hash=str(identity["source_snapshot_hash"]),
+            config=dict(identity["config"]),
+        )
+        if existing is not None:
+            existing_report = dict(existing.get("report") or {})
+            try:
+                export_report(paths, existing_report)
+                if bool(
+                    (state.get("last_projection_reset") or {}).get(
+                        "include_current"
+                    )
+                ):
+                    insights_database.replay_run_projections(
+                        int(existing["id"]),
+                        campaign_id=str(state["campaign_id"]),
+                        projection_version=PROJECTION_VERSION,
+                    )
+                checkpoint_path.unlink(missing_ok=True)
+            except (OSError, ValueError, sqlite3.Error):
+                state = record_backfill_error(
+                    paths.insights_backfill_state,
+                    state,
+                    reason="historical_export_failed",
+                )
+                _print_backfill_progress(state, outcome="error")
+                return
+            state = record_backfill_success(
+                paths.insights_backfill_state,
+                state,
+                report_date=report_date,
+                source_snapshot_hash=str(identity["source_snapshot_hash"]),
+                run_id=int(existing["id"]),
+                empty_day=not bool(source.get("evidence")),
+                reused=True,
+            )
+            _print_backfill_progress(state, outcome="reused")
+            return
+
+        health_summary: dict[str, Any] = {}
+        report: dict[str, Any]
+        if not source.get("evidence"):
+            # The report engine recognizes an empty, complete day without making
+            # a model request.  A non-None sentinel keeps that path publishable.
+            try:
+                report = run_daily_insights(
+                    database,
+                    mail_database,
+                    insights_database,
+                    paths,
+                    run_options,
+                    client=object(),
+                    source=source,
+                )
+            except Exception as exc:
+                state = record_backfill_error(
+                    paths.insights_backfill_state,
+                    state,
+                    reason=f"analysis_failed:{type(exc).__name__}",
+                )
+                _print_backfill_progress(state, outcome="error")
+                return
+        else:
+            from .vmlx import Tunnel, VMLXClient, VMLXError
+
+            try:
+                with Tunnel(
+                    host=args.host,
+                    user=args.user,
+                    local_port=args.local_port,
+                    remote_port=args.remote_port,
+                ) as base_url:
+                    raw_client = VMLXClient(base_url, model=args.model, timeout=360.0)
+                    models = raw_client.models()
+                    first = evaluate_vmlx_load(
+                        raw_client.health(),
+                        models,
+                        requested_model=args.model,
+                        minimum_idle_seconds=args.minimum_idle_seconds,
+                    )
+                    if not first["ready"]:
+                        state = record_backfill_deferred(
+                            paths.insights_backfill_state,
+                            state,
+                            reason=str(first["reason"]),
+                            health=first["summary"],
+                        )
+                        _print_backfill_progress(state, outcome="deferred")
+                        return
+                    time.sleep(2.0)
+                    second = evaluate_vmlx_load(
+                        raw_client.health(),
+                        models,
+                        requested_model=args.model,
+                        minimum_idle_seconds=args.minimum_idle_seconds,
+                    )
+                    health_summary = dict(second["summary"])
+                    health_summary["idle_samples"] = 2
+                    if not second["ready"]:
+                        state = record_backfill_deferred(
+                            paths.insights_backfill_state,
+                            state,
+                            reason=str(second["reason"]),
+                            health=health_summary,
+                        )
+                        _print_backfill_progress(state, outcome="deferred")
+                        return
+                    client = _LoadAwareBackfillClient(
+                        raw_client,
+                        models=models,
+                        requested_model=args.model,
+                        hard_deadline_monotonic=hard_deadline_monotonic,
+                    )
+                    try:
+                        report = run_daily_insights(
+                            database,
+                            mail_database,
+                            insights_database,
+                            paths,
+                            run_options,
+                            client=client,
+                            source=source,
+                        )
+                    except Exception as exc:
+                        state = record_backfill_error(
+                            paths.insights_backfill_state,
+                            state,
+                            reason=f"analysis_failed:{type(exc).__name__}",
+                        )
+                        _print_backfill_progress(state, outcome="error")
+                        return
+            except (ValueError, VMLXError, OSError, OverflowError):
+                state = record_backfill_deferred(
+                    paths.insights_backfill_state,
+                    state,
+                    reason="vmlx_probe_failed",
+                )
+                _print_backfill_progress(state, outcome="deferred")
+                return
+
+        if not report.get("published") or report.get("model_status") not in {
+            "success",
+            "not_required",
+        }:
+            state = record_backfill_error(
+                paths.insights_backfill_state,
+                state,
+                reason=f"analysis_not_publishable:{report.get('model_status') or 'unknown'}",
+            )
+            _print_backfill_progress(state, outcome="error")
+            return
+        try:
+            export_report(paths, report)
+        except OSError:
+            state = record_backfill_error(
+                paths.insights_backfill_state,
+                state,
+                reason="historical_export_failed",
+            )
+            _print_backfill_progress(state, outcome="error")
+            return
+        stored = insights_database.matching_successful_report(
+            report_date=report_date,
+            timezone=args.timezone,
+            model_id=args.model,
+            prompt_version=PROMPT_VERSION,
+            source_snapshot_hash=str(identity["source_snapshot_hash"]),
+            config=dict(identity["config"]),
+        )
+        state = record_backfill_success(
+            paths.insights_backfill_state,
+            state,
+            report_date=report_date,
+            source_snapshot_hash=str(identity["source_snapshot_hash"]),
+            run_id=int(stored["id"]) if stored else None,
+            empty_day=not bool(source.get("evidence")),
+            health=health_summary,
+        )
+        _print_backfill_progress(state, outcome="success")
+    finally:
+        lock.release()
+
+
+def _print_backfill_progress(state: dict[str, Any], *, outcome: str) -> None:
+    """Keep LaunchAgent logs free of report or evidence text."""
+    print(
+        json.dumps(
+            {
+                "outcome": outcome,
+                "status": state.get("status"),
+                "last_report_date": state.get("last_report_date"),
+                "next_date": state.get("next_date"),
+                "audit_next_date": state.get("audit_next_date"),
+                "oldest_date": state.get("oldest_date"),
+                "newest_date": state.get("newest_date"),
+                "processed_days": state.get("processed_days"),
+                "audit_cycles_completed": state.get("audit_cycles_completed"),
+                "projection_reset_required": state.get("projection_reset_required"),
+                "deferred_attempts": state.get("deferred_attempts"),
+                "error_attempts": state.get("error_attempts"),
+                "reason": state.get("last_reason"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+
+class _LoadAwareBackfillClient:
+    """Recheck direct-engine scheduler admission before every model request."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        models: list[dict[str, Any]],
+        requested_model: str,
+        maximum_wait_seconds: float = 900.0,
+        poll_seconds: float = 5.0,
+        stability_seconds: float = 2.0,
+        hard_deadline_monotonic: float | None = None,
+        minimum_call_budget_seconds: float = 420.0,
+    ) -> None:
+        self.client = client
+        self.models = models
+        self.requested_model = requested_model
+        self.maximum_wait_seconds = max(0.0, float(maximum_wait_seconds))
+        self.poll_seconds = max(0.1, float(poll_seconds))
+        self.stability_seconds = max(0.0, float(stability_seconds))
+        self.hard_deadline_monotonic = hard_deadline_monotonic
+        self.minimum_call_budget_seconds = max(0.0, float(minimum_call_budget_seconds))
+        self.blocked = False
+
+    def chat_json(self, messages: Any, *, max_tokens: int, temperature: float) -> dict[str, Any]:
+        if self.blocked:
+            raise RuntimeError("historical_backfill_load_gate_closed")
+        now = time.monotonic()
+        admission_deadline = (
+            self.hard_deadline_monotonic - self.minimum_call_budget_seconds
+            if self.hard_deadline_monotonic is not None
+            else None
+        )
+        if admission_deadline is not None and now >= admission_deadline:
+            self.blocked = True
+            raise RuntimeError("historical_backfill_window_closed")
+        deadline = now + self.maximum_wait_seconds
+        if admission_deadline is not None:
+            deadline = min(deadline, admission_deadline)
+        ready_samples = 0
+        while True:
+            if admission_deadline is not None and time.monotonic() >= admission_deadline:
+                self.blocked = True
+                raise RuntimeError("historical_backfill_window_closed")
+            try:
+                load = evaluate_vmlx_load(
+                    self.client.health(),
+                    self.models,
+                    requested_model=self.requested_model,
+                    minimum_idle_seconds=0,
+                )
+            except Exception:
+                self.blocked = True
+                raise RuntimeError("historical_backfill_load_gate_closed") from None
+            if load["ready"]:
+                ready_samples += 1
+                if ready_samples >= 2 or self.stability_seconds == 0:
+                    break
+                if time.monotonic() + self.stability_seconds >= deadline:
+                    self.blocked = True
+                    raise RuntimeError("historical_backfill_window_closed")
+                time.sleep(self.stability_seconds)
+                continue
+            ready_samples = 0
+            if load.get("state") in {"busy", "cooldown"} and time.monotonic() < deadline:
+                time.sleep(self.poll_seconds)
+                continue
+            self.blocked = True
+            raise RuntimeError("historical_backfill_load_gate_closed")
+        if admission_deadline is not None and time.monotonic() >= admission_deadline:
+            self.blocked = True
+            raise RuntimeError("historical_backfill_window_closed")
+        try:
+            return self.client.chat_json(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception:
+            self.blocked = True
+            raise
 
 
 def _app_config(

@@ -17,6 +17,7 @@ from .config import ArchivePaths
 from .database import ArchiveDatabase
 from .mail_database import MailDatabase
 from .insights_database import InsightsDatabase
+from .backfill import public_backfill_status
 from .reader_auth import ReaderSessionManager
 
 
@@ -129,7 +130,15 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/insights/status":
                 database = self._insights_database()
                 if database is not None:
-                    self._json({**database.status(), "schedule": self.server.insights_schedule})
+                    self._json(
+                        {
+                            **database.status(),
+                            "schedule": self.server.insights_schedule,
+                            "backfill": public_backfill_status(
+                                self.server.paths.insights_backfill_state
+                            ),
+                        }
+                    )
             elif parsed.path == "/api/insights/daily":
                 database = self._insights_database()
                 if database is not None:

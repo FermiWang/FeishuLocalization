@@ -6,9 +6,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from feishu_archive.cli import (
+    _LoadAwareBackfillClient,
+    _run_insights_backfill_step,
     _app_config,
     _client,
     _mail_client,
@@ -18,16 +21,215 @@ from feishu_archive.cli import (
     main,
 )
 from feishu_archive.config import (
+    ArchivePaths,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
     DEFAULT_SCOPES,
     MAIL_SCOPES,
     MAIL_TOKEN_NAMESPACE,
 )
+from feishu_archive.backfill import load_backfill_state
+from feishu_archive.database import ArchiveDatabase
+from feishu_archive.insights import (
+    PROJECTION_VERSION,
+    PROMPT_VERSION,
+    InsightsRunOptions,
+    insights_run_identity,
+)
+from feishu_archive.insights_database import InsightsDatabase
+from feishu_archive.insights_sources import calendar_day_window, extract_daily_sources
 from feishu_archive.keychain import MemoryTokenStore
+from feishu_archive.mail_database import MailDatabase
 
 
 class AppConfigTests(unittest.TestCase):
+    def test_backfill_load_gate_latches_closed_after_health_failure(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.chat_calls = 0
+
+            def health(self):
+                raise RuntimeError("probe failed")
+
+            def chat_json(self, messages, *, max_tokens, temperature):
+                self.chat_calls += 1
+                return {}
+
+        client = Client()
+        gate = _LoadAwareBackfillClient(
+            client,
+            models=[{"id": "model"}],
+            requested_model="model",
+            maximum_wait_seconds=0,
+            poll_seconds=0.1,
+        )
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "load_gate_closed"):
+                gate.chat_json([], max_tokens=1, temperature=0.1)
+        self.assertEqual(client.chat_calls, 0)
+
+    def test_backfill_load_gate_refuses_calls_past_window_budget(self) -> None:
+        client = MagicMock()
+        gate = _LoadAwareBackfillClient(
+            client,
+            models=[{"id": "model"}],
+            requested_model="model",
+            hard_deadline_monotonic=0,
+        )
+        with self.assertRaisesRegex(RuntimeError, "window_closed"):
+            gate.chat_json([], max_tokens=1, temperature=0.1)
+        client.health.assert_not_called()
+        client.chat_json.assert_not_called()
+
+    def test_backfill_step_replays_cached_daily_and_resets_when_archive_empties(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            archive = ArchiveDatabase(paths.database)
+            archive.initialize()
+            mail = MailDatabase(paths.mail_database)
+            mail.initialize()
+            insights = InsightsDatabase(paths.insights_database)
+            insights.initialize()
+            with archive.connection() as con:
+                con.execute(
+                    "INSERT INTO sync_jobs(trigger, started_at, finished_at, status) "
+                    "VALUES ('test', 1, 2, 'success')"
+                )
+                con.execute(
+                    "INSERT INTO wiki_sync_runs(trigger, started_at, finished_at, status) "
+                    "VALUES ('test', 1, 2, 'success')"
+                )
+            with mail.connection() as con:
+                con.execute(
+                    "INSERT INTO sync_runs(trigger, started_at, finished_at, status) "
+                    "VALUES ('test', 1, 2, 'success')"
+                )
+            archive.upsert_conversation({"chat_id": "oc-backfill", "name": "回填群"})
+            window = calendar_day_window("2026-08-12", "Europe/Amsterdam")
+            occurred_at = int(window["start_ms"]) + 1000
+            with archive.connection() as con:
+                con.execute(
+                    """
+                    INSERT INTO messages(
+                        message_id, chat_id, message_type, sender_id,
+                        created_at, body_text, raw_json, archived_at
+                    ) VALUES ('om-backfill', 'oc-backfill', 'text', 'other', ?,
+                              '请跟进 A 项目', '{}', ?)
+                    """,
+                    (occurred_at, occurred_at),
+                )
+
+            source = extract_daily_sources(
+                archive, mail, "2026-08-12", "Europe/Amsterdam"
+            )
+            historical_options = InsightsRunOptions(
+                report_date="2026-08-12",
+                analysis_mode="historical_backfill",
+                activate=False,
+                include_carryover=False,
+            )
+            identity = insights_run_identity(source, historical_options)
+            daily_run = insights.start_run(
+                run_key="compatible-daily-for-backfill",
+                report_date="2026-08-12",
+                timezone="Europe/Amsterdam",
+                model_id=historical_options.model,
+                prompt_version=PROMPT_VERSION,
+                source_snapshot_hash=identity["source_snapshot_hash"],
+                config={
+                    "analysis_mode": "daily_current",
+                    "max_chunk_chars": historical_options.max_chunk_chars,
+                    "max_output_tokens": historical_options.max_output_tokens,
+                    "projection_version": PROJECTION_VERSION,
+                },
+            )
+            evidence_item = source["evidence"][0]
+            evidence = insights.add_evidence(
+                daily_run["id"],
+                {
+                    **evidence_item,
+                    "evidence_key": evidence_item["evidence_id"],
+                    "source_version": "v1",
+                    "content_text": evidence_item["text"],
+                },
+            )
+            insights.upsert_task_observation(
+                {
+                    "run_id": daily_run["id"],
+                    "evidence_id": evidence["id"],
+                    "observation_key": "daily-original-task",
+                    "task": {
+                        "task_key": "task:daily-scoped",
+                        "title": "跟进 A 项目",
+                        "payload": {"projection_version": PROJECTION_VERSION},
+                    },
+                    "observed_status": "open",
+                    "observed_at": occurred_at,
+                }
+            )
+            daily_report = {
+                "report_date": "2026-08-12",
+                "timezone": "Europe/Amsterdam",
+                "model": historical_options.model,
+                "prompt_version": PROMPT_VERSION,
+                "analysis_mode": "daily_current",
+                "model_status": "success",
+                "published": True,
+                "coverage": source["coverage"],
+                "yesterday_summary": [],
+                "today_plan": [],
+                "commercial_opportunities": [],
+            }
+            insights.finish_run(
+                daily_run["id"],
+                status="success",
+                report=daily_report,
+                stats={"evidence": 1},
+            )
+            args = SimpleNamespace(
+                timezone="Europe/Amsterdam",
+                model=historical_options.model,
+                start_hour=6,
+                end_hour=22,
+                minimum_idle_seconds=300,
+                scheduled=False,
+                host="192.168.100.179",
+                user="apple",
+                local_port=11435,
+                remote_port=11435,
+            )
+
+            with patch("feishu_archive.cli._yesterday", return_value="2026-08-12"):
+                _run_insights_backfill_step(args, paths, archive, mail)
+                state = load_backfill_state(paths.insights_backfill_state)
+                self.assertEqual(state["last_outcome"], "daily_current_covered")
+                self.assertEqual(
+                    insights.list_tasks(limit=None)[0]["task_key"],
+                    "task:daily-scoped",
+                )
+                self.assertEqual(insights.status()["archived_tasks"], 1)
+
+                _run_insights_backfill_step(args, paths, archive, mail)
+                state = load_backfill_state(paths.insights_backfill_state)
+                self.assertTrue(state["cumulative_ledger_complete"])
+                original_campaign = state["campaign_id"]
+
+                with archive.connection() as con:
+                    con.execute(
+                        "UPDATE messages SET deleted=1 WHERE message_id='om-backfill'"
+                    )
+                _run_insights_backfill_step(args, paths, archive, mail)
+
+            state = load_backfill_state(paths.insights_backfill_state)
+            self.assertNotEqual(state["campaign_id"], original_campaign)
+            self.assertEqual(state["campaign_change_reason"], "source_snapshot_changed")
+            self.assertEqual(state["last_report_date"], "2026-08-12")
+            self.assertEqual(state["last_outcome"], "empty")
+            self.assertFalse(state["cumulative_ledger_complete"])
+            self.assertEqual(state["last_projection_reset"]["include_current"], 1)
+            self.assertEqual(insights.list_tasks(limit=None), [])
+
     def test_mail_preflight_is_independent_of_archive_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch(
             "feishu_archive.cli.ArchiveDatabase"
@@ -118,6 +320,11 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(args.remote_port, 11435)
         self.assertFalse(args.no_model)
         self.assertFalse(args.dry_run)
+        backfill = build_parser().parse_args(["insights-backfill-step", "--scheduled"])
+        self.assertEqual(backfill.remote_port, 11435)
+        self.assertEqual(backfill.minimum_idle_seconds, 300)
+        self.assertEqual((backfill.start_hour, backfill.end_hour), (6, 22))
+        self.assertTrue(backfill.scheduled)
         configure = build_parser().parse_args(
             ["insights-configure", "--bearer-token-stdin"]
         )

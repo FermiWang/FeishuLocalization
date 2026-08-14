@@ -19,6 +19,10 @@ DEFAULT_MAIL_SYNC_HOUR = 4
 DEFAULT_MAIL_SYNC_MINUTE = 0
 DEFAULT_INSIGHTS_SYNC_HOUR = 4
 DEFAULT_INSIGHTS_SYNC_MINUTE = 30
+DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS = 30 * 60
+DEFAULT_INSIGHTS_BACKFILL_START_HOUR = 6
+DEFAULT_INSIGHTS_BACKFILL_END_HOUR = 22
+DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS = 5 * 60
 DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
@@ -103,6 +107,14 @@ class ArchivePaths:
         return self.insights / "exports"
 
     @property
+    def insights_backfill_state(self) -> Path:
+        return self.insights / "backfill-state.json"
+
+    @property
+    def insights_backfill_checkpoints(self) -> Path:
+        return self.insights / "backfill-checkpoints"
+
+    @property
     def mail(self) -> Path:
         return self.root / "mail"
 
@@ -157,6 +169,7 @@ class ArchivePaths:
         self.mail_quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.mail_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.insights_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.insights_backfill_checkpoints.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
         for directory in (
             self.mail,
@@ -166,6 +179,7 @@ class ArchivePaths:
             self.mail_exports,
             self.insights,
             self.insights_exports,
+            self.insights_backfill_checkpoints,
         ):
             os.chmod(directory, 0o700)
 
