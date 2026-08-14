@@ -498,9 +498,13 @@ def evaluate_vmlx_load(
         return decision("unknown", "vmlx_scheduler_invalid")
     if running_value > 0 or waiting_value > 0:
         return decision("busy", "vmlx_scheduler_busy")
-    last_request = health.get("last_request_time")
-    if isinstance(last_request, bool) or not isinstance(last_request, (int, float)):
+    if "last_request_time" not in health:
         return decision("unknown", "vmlx_last_request_missing")
+    last_request = health["last_request_time"]
+    if last_request is None:
+        return decision("unknown", "vmlx_last_request_uninitialized")
+    if isinstance(last_request, bool) or not isinstance(last_request, (int, float)):
+        return decision("unknown", "vmlx_last_request_invalid")
     try:
         idle_seconds = now_seconds - float(last_request)
     except (TypeError, ValueError, OverflowError):

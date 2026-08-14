@@ -484,6 +484,37 @@ class VMLXLoadGateTests(unittest.TestCase):
         )
         self.assertEqual(unknown["state"], "unknown")
 
+        cold_start = evaluate_vmlx_load(
+            self.health(last_request=None),
+            models,
+            requested_model="model",
+            minimum_idle_seconds=300,
+            now_seconds=500,
+        )
+        self.assertEqual(cold_start["reason"], "vmlx_last_request_uninitialized")
+
+        missing_field_health = self.health()
+        del missing_field_health["last_request_time"]
+        missing_field = evaluate_vmlx_load(
+            missing_field_health,
+            models,
+            requested_model="model",
+            minimum_idle_seconds=300,
+            now_seconds=500,
+        )
+        self.assertEqual(missing_field["reason"], "vmlx_last_request_missing")
+
+        for malformed in (True, "100", [], {}):
+            invalid = evaluate_vmlx_load(
+                self.health(last_request=malformed),
+                models,
+                requested_model="model",
+                minimum_idle_seconds=300,
+                now_seconds=500,
+            )
+            with self.subTest(last_request=malformed):
+                self.assertEqual(invalid["reason"], "vmlx_last_request_invalid")
+
         mismatch = evaluate_vmlx_load(
             self.health(),
             [{"id": "other"}],

@@ -1245,6 +1245,13 @@ def _run_insights_backfill_step(
                         requested_model=args.model,
                         minimum_idle_seconds=args.minimum_idle_seconds,
                     )
+                    first = _warm_cold_start_vmlx(
+                        raw_client,
+                        first,
+                        models=models,
+                        requested_model=args.model,
+                        minimum_idle_seconds=args.minimum_idle_seconds,
+                    )
                     if not first["ready"]:
                         state = record_backfill_deferred(
                             paths.insights_backfill_state,
@@ -1373,6 +1380,54 @@ def _print_backfill_progress(state: dict[str, Any], *, outcome: str) -> None:
     )
 
 
+_VMLX_COLD_START_WARMUP_MESSAGES = [
+    {
+        "role": "system",
+        "content": 'Return exactly one JSON object: {"ready":true}',
+    },
+    {"role": "user", "content": "local engine warmup"},
+]
+
+
+def _attempt_vmlx_cold_start_warmup(client: Any) -> None:
+    """Issue a content-free inference so vMLX starts its idle timer."""
+    try:
+        client.chat_json(
+            _VMLX_COLD_START_WARMUP_MESSAGES,
+            max_tokens=16,
+            temperature=0.0,
+        )
+    except Exception:
+        # vMLX records inference arrival before response parsing. The fresh
+        # health probe remains the source of truth if parsing or transport fails.
+        pass
+
+
+def _warm_cold_start_vmlx(
+    client: Any,
+    decision: dict[str, Any],
+    *,
+    models: list[dict[str, Any]],
+    requested_model: str,
+    minimum_idle_seconds: int,
+) -> dict[str, Any]:
+    """Prime a healthy idle engine whose last-request clock is uninitialized."""
+    if decision.get("reason") != "vmlx_last_request_uninitialized":
+        return decision
+    _attempt_vmlx_cold_start_warmup(client)
+    refreshed = evaluate_vmlx_load(
+        client.health(),
+        models,
+        requested_model=requested_model,
+        minimum_idle_seconds=minimum_idle_seconds,
+    )
+    refreshed["summary"] = {
+        **dict(refreshed.get("summary") or {}),
+        "cold_start_warmup_attempted": True,
+    }
+    return refreshed
+
+
 class _LoadAwareBackfillClient:
     """Recheck direct-engine scheduler admission before every model request."""
 
@@ -1397,6 +1452,7 @@ class _LoadAwareBackfillClient:
         self.hard_deadline_monotonic = hard_deadline_monotonic
         self.minimum_call_budget_seconds = max(0.0, float(minimum_call_budget_seconds))
         self.blocked = False
+        self.cold_start_warmup_attempted = False
 
     def chat_json(self, messages: Any, *, max_tokens: int, temperature: float) -> dict[str, Any]:
         if self.blocked:
@@ -1428,6 +1484,14 @@ class _LoadAwareBackfillClient:
             except Exception:
                 self.blocked = True
                 raise RuntimeError("historical_backfill_load_gate_closed") from None
+            if (
+                load.get("reason") == "vmlx_last_request_uninitialized"
+                and not self.cold_start_warmup_attempted
+            ):
+                self.cold_start_warmup_attempted = True
+                _attempt_vmlx_cold_start_warmup(self.client)
+                ready_samples = 0
+                continue
             if load["ready"]:
                 ready_samples += 1
                 if ready_samples >= 2 or self.stability_seconds == 0:

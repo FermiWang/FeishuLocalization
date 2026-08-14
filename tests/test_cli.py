@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from feishu_archive.cli import (
     _LoadAwareBackfillClient,
+    _warm_cold_start_vmlx,
     _run_insights_backfill_step,
     _app_config,
     _client,
@@ -43,6 +45,101 @@ from feishu_archive.mail_database import MailDatabase
 
 
 class AppConfigTests(unittest.TestCase):
+    def test_cold_start_warmup_initializes_idle_clock_then_defers(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.last_request_time = None
+                self.chat_calls = 0
+
+            def health(self):
+                return {
+                    "status": "healthy",
+                    "model_loaded": True,
+                    "model_name": "model",
+                    "last_request_time": self.last_request_time,
+                    "scheduler": {"num_running": 0, "num_waiting": 0},
+                }
+
+            def chat_json(self, messages, *, max_tokens, temperature):
+                self.chat_calls += 1
+                self.last_request_time = time.time()
+                return {"ready": True}
+
+        client = Client()
+        missing = {
+            "ready": False,
+            "state": "unknown",
+            "reason": "vmlx_last_request_uninitialized",
+            "summary": {},
+        }
+        refreshed = _warm_cold_start_vmlx(
+            client,
+            missing,
+            models=[{"id": "model"}],
+            requested_model="model",
+            minimum_idle_seconds=300,
+        )
+
+        self.assertEqual(client.chat_calls, 1)
+        self.assertFalse(refreshed["ready"])
+        self.assertEqual(refreshed["reason"], "vmlx_idle_cooldown")
+        self.assertTrue(refreshed["summary"]["cold_start_warmup_attempted"])
+
+        missing_field = {
+            "ready": False,
+            "state": "unknown",
+            "reason": "vmlx_last_request_missing",
+            "summary": {},
+        }
+        unchanged = _warm_cold_start_vmlx(
+            client,
+            missing_field,
+            models=[{"id": "model"}],
+            requested_model="model",
+            minimum_idle_seconds=300,
+        )
+        self.assertIs(unchanged, missing_field)
+        self.assertEqual(client.chat_calls, 1)
+
+    def test_per_request_gate_can_self_prime_a_cold_engine(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.last_request_time = None
+                self.calls = []
+
+            def health(self):
+                return {
+                    "status": "healthy",
+                    "model_loaded": True,
+                    "model_name": "model",
+                    "last_request_time": self.last_request_time,
+                    "scheduler": {"num_running": 0, "num_waiting": 0},
+                }
+
+            def chat_json(self, messages, *, max_tokens, temperature):
+                self.calls.append(messages)
+                self.last_request_time = time.time()
+                return {"ok": True}
+
+        client = Client()
+        gate = _LoadAwareBackfillClient(
+            client,
+            models=[{"id": "model"}],
+            requested_model="model",
+            maximum_wait_seconds=1,
+            stability_seconds=0,
+        )
+
+        result = gate.chat_json(
+            [{"role": "user", "content": "actual request"}],
+            max_tokens=10,
+            temperature=0.1,
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1][0]["content"], "actual request")
+
     def test_backfill_load_gate_latches_closed_after_health_failure(self) -> None:
         class Client:
             def __init__(self) -> None:
