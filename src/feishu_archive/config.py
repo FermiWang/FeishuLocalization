@@ -19,16 +19,33 @@ DEFAULT_MAIL_SYNC_HOUR = 4
 DEFAULT_MAIL_SYNC_MINUTE = 0
 DEFAULT_INSIGHTS_SYNC_HOUR = 4
 DEFAULT_INSIGHTS_SYNC_MINUTE = 30
+# The backfill LaunchAgent is a KeepAlive daemon; this interval is only its
+# launchd ThrottleInterval (minimum seconds between restarts after a crash).
 DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS = 60
 DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS = 30 * 60
 DEFAULT_INSIGHTS_BACKFILL_START_HOUR = 0
 DEFAULT_INSIGHTS_BACKFILL_END_HOUR = 24
 DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS = 60
+# Between two backfill steps where the previous step occupied the engine
+# itself, a short settle is enough; the full MIN_IDLE cooldown only applies
+# after external engine activity or on process start.
+DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS = 10
+# Loop pacing: retry delay while the engine is busy, while waiting for new
+# work in the monitoring state, and after a step error.
+DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS = 30
+DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS = 300
+DEFAULT_INSIGHTS_BACKFILL_LOOP_ERROR_SECONDS = 60
+# After this many consecutive step errors the loop exits and lets launchd
+# apply ThrottleInterval before restarting it.
+DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS = 10
 DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
 DEFAULT_VMLX_MODEL = "vmlx/gemma-4-31b-it-8bit"
 DEFAULT_VMLX_LOCAL_PORT = 18135
+# The resident backfill loop uses a separate tunnel port so its frequent SSH
+# forwards never collide with a manual or scheduled `insights-run` on 18135.
+DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT = 18136
 DEFAULT_VMLX_REMOTE_PORT = 11435
 DEFAULT_MAIL_INITIAL_DAYS: int | None = None
 DEFAULT_MAIL_OVERLAP_DAYS = 2

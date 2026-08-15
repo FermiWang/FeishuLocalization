@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from feishu_archive.cli import (
     _LoadAwareBackfillClient,
     _warm_cold_start_vmlx,
+    _run_insights_backfill_loop,
     _run_insights_backfill_step,
     _app_config,
     _client,
@@ -24,6 +25,12 @@ from feishu_archive.cli import (
 )
 from feishu_archive.config import (
     ArchivePaths,
+    DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_ERROR_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
     DEFAULT_SCOPES,
@@ -327,6 +334,112 @@ class AppConfigTests(unittest.TestCase):
             self.assertFalse(state["cumulative_ledger_complete"])
             self.assertEqual(state["last_projection_reset"]["include_current"], 1)
             self.assertEqual(insights.list_tasks(limit=None), [])
+
+    def test_backfill_parser_exposes_loop_mode_and_dedicated_tunnel_port(self) -> None:
+        args = build_parser().parse_args(["insights-backfill-step"])
+        self.assertFalse(args.loop)
+        self.assertEqual(args.local_port, DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT)
+        args = build_parser().parse_args(["insights-backfill-step", "--loop"])
+        self.assertTrue(args.loop)
+
+    def test_backfill_loop_continues_immediately_after_own_engine_step(self) -> None:
+        outcomes = [
+            {"outcome": "success", "reason": None, "last_outcome": "success"},
+            {
+                "outcome": "deferred",
+                "reason": "scheduled_step_budget_exhausted",
+                "last_outcome": None,
+            },
+            {"outcome": "success", "reason": None, "last_outcome": "empty"},
+            {"outcome": "complete", "reason": None, "last_outcome": "audit_match"},
+        ]
+        calls: list[int | None] = []
+        sleeps: list[float] = []
+
+        def fake_step(args, paths, database, mail_database, *, min_idle_seconds=None):
+            calls.append(min_idle_seconds)
+            if not outcomes:
+                raise SystemExit(0)
+            return outcomes.pop(0)
+
+        args = SimpleNamespace(scheduled=False)
+        with patch(
+            "feishu_archive.cli._run_insights_backfill_step", side_effect=fake_step
+        ), patch("time.sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+            with self.assertRaises(SystemExit) as caught:
+                _run_insights_backfill_loop(args, None, None, None)
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertTrue(args.scheduled)
+        self.assertEqual(
+            calls,
+            [
+                None,
+                DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS,
+                DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS,
+                None,
+                None,
+            ],
+        )
+        self.assertEqual(sleeps, [DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS])
+
+    def test_backfill_loop_waits_and_keeps_full_idle_after_external_activity(self) -> None:
+        outcomes = [
+            {"outcome": "deferred", "reason": "vmlx_scheduler_busy", "last_outcome": None},
+            {"outcome": "deferred", "reason": "vmlx_idle_cooldown", "last_outcome": None},
+            {"outcome": "audit_match", "reason": None, "last_outcome": "audit_match"},
+        ]
+        calls: list[int | None] = []
+        sleeps: list[float] = []
+
+        def fake_step(args, paths, database, mail_database, *, min_idle_seconds=None):
+            calls.append(min_idle_seconds)
+            if not outcomes:
+                raise SystemExit(0)
+            return outcomes.pop(0)
+
+        with patch(
+            "feishu_archive.cli._run_insights_backfill_step", side_effect=fake_step
+        ), patch("time.sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+            with self.assertRaises(SystemExit) as caught:
+                _run_insights_backfill_loop(SimpleNamespace(scheduled=False), None, None, None)
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(calls, [None, None, None, None])
+        self.assertEqual(
+            sleeps,
+            [
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
+            ],
+        )
+
+    def test_backfill_loop_aborts_after_consecutive_errors(self) -> None:
+        calls = 0
+        sleeps: list[float] = []
+
+        def fake_step(args, paths, database, mail_database, *, min_idle_seconds=None):
+            nonlocal calls
+            calls += 1
+            return {
+                "outcome": "error",
+                "reason": "analysis_failed:RuntimeError",
+                "last_outcome": None,
+            }
+
+        with patch(
+            "feishu_archive.cli._run_insights_backfill_step", side_effect=fake_step
+        ), patch("time.sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+            with self.assertRaises(SystemExit) as caught:
+                _run_insights_backfill_loop(SimpleNamespace(scheduled=False), None, None, None)
+
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(calls, DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS)
+        self.assertEqual(
+            sleeps,
+            [DEFAULT_INSIGHTS_BACKFILL_LOOP_ERROR_SECONDS]
+            * (DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS - 1),
+        )
 
     def test_mail_preflight_is_independent_of_archive_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch(

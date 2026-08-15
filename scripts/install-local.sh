@@ -291,12 +291,12 @@ rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MA
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:1 string --archive-dir" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $ARCHIVE_DIR" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:3 string insights-backfill-step" "$TEMP_INSIGHTS_BACKFILL_PLIST"
-/usr/libexec/PlistBuddy -c "Add :ProgramArguments:4 string --scheduled" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:4 string --loop" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $RUNTIME_DIR" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FEISHU_ARCHIVE_PYTHON string $PYTHON_BIN" "$TEMP_INSIGHTS_BACKFILL_PLIST"
-/usr/libexec/PlistBuddy -c "Add :StartInterval integer $INSIGHTS_BACKFILL_INTERVAL_SECONDS" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+/usr/libexec/PlistBuddy -c "Add :KeepAlive bool true" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProcessType string Background" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer $INSIGHTS_BACKFILL_INTERVAL_SECONDS" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :Umask integer 63" "$TEMP_INSIGHTS_BACKFILL_PLIST"
@@ -350,7 +350,7 @@ while [ "$ATTEMPT" -lt 20 ]; do
     echo "知识库同步：${WIKI_SYNC_LABEL}（每天 03:45）"
     echo "邮箱同步：${MAIL_SYNC_LABEL}（每天 04:00；未授权时安全跳过，不影响其他通道）"
     echo "每日洞察：${INSIGHTS_LABEL}（每天 04:30，失败时 05:00/05:30 断点重试）"
-    echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（全天候，启动时及每 ${INSIGHTS_BACKFILL_INTERVAL_SECONDS} 秒尝试一个受控步骤）"
+    echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（常驻；vMLX 引擎空闲时从最早日期向最近日期连续回填，繁忙时轮询等待）"
     exit 0
   fi
   ATTEMPT=$((ATTEMPT + 1))

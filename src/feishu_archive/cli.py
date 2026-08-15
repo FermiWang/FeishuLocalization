@@ -30,8 +30,13 @@ from .automation import (
     run_wiki_sync_cycle,
 )
 from .config import (
+    DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_END_HOUR,
-    DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_ERROR_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
@@ -332,7 +337,9 @@ def build_parser() -> argparse.ArgumentParser:
     insights_backfill.add_argument("--host", default=DEFAULT_VMLX_HOST)
     insights_backfill.add_argument("--user", default=DEFAULT_VMLX_USER)
     insights_backfill.add_argument("--model", default=DEFAULT_VMLX_MODEL)
-    insights_backfill.add_argument("--local-port", type=int, default=DEFAULT_VMLX_LOCAL_PORT)
+    insights_backfill.add_argument(
+        "--local-port", type=int, default=DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT
+    )
     insights_backfill.add_argument(
         "--remote-port", type=int, choices=(11435,), default=DEFAULT_VMLX_REMOTE_PORT
     )
@@ -357,6 +364,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--end-hour", type=int, default=DEFAULT_INSIGHTS_BACKFILL_END_HOUR
     )
     insights_backfill.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    insights_backfill.add_argument(
+        "--loop",
+        action="store_true",
+        help=(
+            "常驻循环：只要 vMLX 引擎空闲就连续执行回填步骤，"
+            "引擎繁忙或无任务时按内置间隔轮询等待"
+        ),
+    )
 
     subparsers.add_parser("insights-status", help="显示每日洞察状态")
 
@@ -696,12 +711,15 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "insights-backfill-step":
             assert database is not None
             assert mail_database is not None
-            _run_insights_backfill_step(
-                args,
-                paths,
-                database,
-                mail_database,
-            )
+            if args.loop:
+                _run_insights_backfill_loop(args, paths, database, mail_database)
+            else:
+                _run_insights_backfill_step(
+                    args,
+                    paths,
+                    database,
+                    mail_database,
+                )
         elif args.command == "insights-run":
             if not paths.database.is_file():
                 raise ValueError(f"聊天与知识库档案不存在：{paths.database}")
@@ -929,11 +947,16 @@ def main(argv: list[str] | None = None) -> None:
                     ),
                     "backfill": {
                         "enabled": True,
-                        "interval_seconds": DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS,
+                        "mode": "resident_idle_driven_loop",
+                        "poll_seconds": DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
+                        "monitor_seconds": DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
                         "maximum_step_seconds": DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
                         "start_hour": DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
                         "end_hour": DEFAULT_INSIGHTS_BACKFILL_END_HOUR,
                         "minimum_idle_seconds": DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
+                        "continue_minimum_idle_seconds": (
+                            DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS
+                        ),
                         "direction": "forward",
                     },
                 },
@@ -954,28 +977,60 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2) from exc
 
 
+def _backfill_step_result(state: dict[str, Any], *, outcome: str) -> dict[str, Any]:
+    _print_backfill_progress(state, outcome=outcome)
+    return {
+        "outcome": outcome,
+        "reason": state.get("last_reason"),
+        "status": state.get("status"),
+        "next_date": state.get("next_date"),
+        "last_outcome": state.get("last_outcome"),
+    }
+
+
+def _backfill_step_skip_result(outcome: str, reason: str) -> dict[str, Any]:
+    print(json.dumps({"outcome": outcome, "reason": reason}, separators=(",", ":")))
+    return {
+        "outcome": outcome,
+        "reason": reason,
+        "status": None,
+        "next_date": None,
+        "last_outcome": None,
+    }
+
+
 def _run_insights_backfill_step(
     args: argparse.Namespace,
     paths: ArchivePaths,
     database: ArchiveDatabase,
     mail_database: MailDatabase,
-) -> None:
-    """Run at most one historical date and emit metadata-only progress."""
+    *,
+    min_idle_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Run at most one historical date and emit metadata-only progress.
 
+    ``min_idle_seconds`` overrides the engine idle threshold for this step.
+    The resident loop uses it to apply the full cooldown only after external
+    engine activity, and a short settle after a step that occupied the engine
+    itself.
+    """
+
+    idle_threshold = (
+        args.minimum_idle_seconds if min_idle_seconds is None else int(min_idle_seconds)
+    )
     policy = BackfillPolicy(
         timezone=args.timezone,
         model=args.model,
         start_hour=args.start_hour,
         end_hour=args.end_hour,
-        minimum_idle_seconds=args.minimum_idle_seconds,
+        minimum_idle_seconds=idle_threshold,
     )
     insights_database = InsightsDatabase(paths.insights_database)
     insights_database.initialize()
     try:
         lock = acquire_insights_lock(paths)
     except SyncBusyError:
-        print(json.dumps({"outcome": "deferred", "reason": "insights_lock_busy"}))
-        return
+        return _backfill_step_skip_result("deferred", "insights_lock_busy")
 
     try:
         local_now = datetime.now(ZoneInfo(args.timezone))
@@ -997,15 +1052,11 @@ def _run_insights_backfill_step(
             else remaining_window_seconds
         )
         if args.scheduled and not within_backfill_window(local_now, policy):
-            print(json.dumps({"outcome": "deferred", "reason": "outside_backfill_window"}))
-            return
+            return _backfill_step_skip_result("deferred", "outside_backfill_window")
         if args.scheduled and scheduled_step_seconds < 900:
-            print(
-                json.dumps(
-                    {"outcome": "deferred", "reason": "insufficient_backfill_window"}
-                )
+            return _backfill_step_skip_result(
+                "deferred", "insufficient_backfill_window"
             )
-            return
         hard_deadline_monotonic = (
             time.monotonic() + scheduled_step_seconds if args.scheduled else None
         )
@@ -1015,12 +1066,7 @@ def _run_insights_backfill_step(
         if not oldest:
             previous_state = load_backfill_state(paths.insights_backfill_state)
             if previous_state is None:
-                print(
-                    json.dumps(
-                        {"outcome": "complete", "reason": "archive_has_no_evidence"}
-                    )
-                )
-                return
+                return _backfill_step_skip_result("complete", "archive_has_no_evidence")
             # A previously non-empty archive becoming empty is itself a source
             # snapshot change. Keep the prior lower bound so the continuous
             # audit can observe empty days and rebuild stale machine ledgers.
@@ -1071,8 +1117,7 @@ def _run_insights_backfill_step(
                     state,
                     reason="source_coverage_incomplete_during_audit",
                 )
-                _print_backfill_progress(state, outcome="deferred")
-                return
+                return _backfill_step_result(state, outcome="deferred")
             audit_identity = insights_run_identity(audit_source, audit_options)
             state = record_backfill_audit(
                 paths.insights_backfill_state,
@@ -1081,15 +1126,13 @@ def _run_insights_backfill_step(
                 source_snapshot_hash=str(audit_identity["source_snapshot_hash"]),
             )
             if not state.get("projection_reset_required"):
-                _print_backfill_progress(
+                return _backfill_step_result(
                     state, outcome=str(state.get("last_outcome") or "audit_match")
                 )
-                return
             if state.get("next_date") == audit_date:
                 reusable_source = audit_source
         if state.get("next_date") is None:
-            _print_backfill_progress(state, outcome="complete")
-            return
+            return _backfill_step_result(state, outcome="complete")
         report_date = str(state["next_date"])
         checkpoint_path = paths.insights_backfill_checkpoints / f"{report_date}.json"
         run_options = InsightsRunOptions(
@@ -1112,8 +1155,7 @@ def _run_insights_backfill_step(
                 state,
                 reason="source_coverage_incomplete",
             )
-            _print_backfill_progress(state, outcome="deferred")
-            return
+            return _backfill_step_result(state, outcome="deferred")
 
         identity = insights_run_identity(source, run_options)
         if state.get("projection_reset_required"):
@@ -1134,8 +1176,7 @@ def _run_insights_backfill_step(
                     state,
                     reason=f"projection_reset_failed:{type(exc).__name__}",
                 )
-                _print_backfill_progress(state, outcome="error")
-                return
+                return _backfill_step_result(state, outcome="error")
         daily_coverage = insights_database.matching_successful_report_for_mode(
             report_date=report_date,
             analysis_mode="daily_current",
@@ -1176,8 +1217,7 @@ def _run_insights_backfill_step(
                     state,
                     reason="historical_checkpoint_cleanup_failed",
                 )
-                _print_backfill_progress(state, outcome="error")
-                return
+                return _backfill_step_result(state, outcome="error")
             state = record_backfill_success(
                 paths.insights_backfill_state,
                 state,
@@ -1187,8 +1227,7 @@ def _run_insights_backfill_step(
                 empty_day=not bool(source.get("evidence")),
                 covered_by_daily=True,
             )
-            _print_backfill_progress(state, outcome="covered_by_daily")
-            return
+            return _backfill_step_result(state, outcome="covered_by_daily")
         existing = insights_database.matching_successful_report(
             report_date=report_date,
             timezone=args.timezone,
@@ -1218,8 +1257,7 @@ def _run_insights_backfill_step(
                     state,
                     reason="historical_export_failed",
                 )
-                _print_backfill_progress(state, outcome="error")
-                return
+                return _backfill_step_result(state, outcome="error")
             state = record_backfill_success(
                 paths.insights_backfill_state,
                 state,
@@ -1229,8 +1267,7 @@ def _run_insights_backfill_step(
                 empty_day=not bool(source.get("evidence")),
                 reused=True,
             )
-            _print_backfill_progress(state, outcome="reused")
-            return
+            return _backfill_step_result(state, outcome="reused")
 
         health_summary: dict[str, Any] = {}
         report: dict[str, Any]
@@ -1253,8 +1290,7 @@ def _run_insights_backfill_step(
                     state,
                     reason=f"analysis_failed:{type(exc).__name__}",
                 )
-                _print_backfill_progress(state, outcome="error")
-                return
+                return _backfill_step_result(state, outcome="error")
         else:
             from .vmlx import Tunnel, VMLXClient, VMLXError
 
@@ -1271,14 +1307,14 @@ def _run_insights_backfill_step(
                         raw_client.health(),
                         models,
                         requested_model=args.model,
-                        minimum_idle_seconds=args.minimum_idle_seconds,
+                        minimum_idle_seconds=idle_threshold,
                     )
                     first = _warm_cold_start_vmlx(
                         raw_client,
                         first,
                         models=models,
                         requested_model=args.model,
-                        minimum_idle_seconds=args.minimum_idle_seconds,
+                        minimum_idle_seconds=idle_threshold,
                     )
                     if not first["ready"]:
                         state = record_backfill_deferred(
@@ -1287,14 +1323,13 @@ def _run_insights_backfill_step(
                             reason=str(first["reason"]),
                             health=first["summary"],
                         )
-                        _print_backfill_progress(state, outcome="deferred")
-                        return
+                        return _backfill_step_result(state, outcome="deferred")
                     time.sleep(2.0)
                     second = evaluate_vmlx_load(
                         raw_client.health(),
                         models,
                         requested_model=args.model,
-                        minimum_idle_seconds=args.minimum_idle_seconds,
+                        minimum_idle_seconds=idle_threshold,
                     )
                     health_summary = dict(second["summary"])
                     health_summary["idle_samples"] = 2
@@ -1305,8 +1340,7 @@ def _run_insights_backfill_step(
                             reason=str(second["reason"]),
                             health=health_summary,
                         )
-                        _print_backfill_progress(state, outcome="deferred")
-                        return
+                        return _backfill_step_result(state, outcome="deferred")
                     client = _LoadAwareBackfillClient(
                         raw_client,
                         models=models,
@@ -1330,24 +1364,21 @@ def _run_insights_backfill_step(
                                 reason="scheduled_step_budget_exhausted",
                                 health=health_summary,
                             )
-                            _print_backfill_progress(state, outcome="deferred")
-                            return
+                            return _backfill_step_result(state, outcome="deferred")
                     except Exception as exc:
                         state = record_backfill_error(
                             paths.insights_backfill_state,
                             state,
                             reason=f"analysis_failed:{type(exc).__name__}",
                         )
-                        _print_backfill_progress(state, outcome="error")
-                        return
+                        return _backfill_step_result(state, outcome="error")
             except (ValueError, VMLXError, OSError, OverflowError):
                 state = record_backfill_deferred(
                     paths.insights_backfill_state,
                     state,
                     reason="vmlx_probe_failed",
                 )
-                _print_backfill_progress(state, outcome="deferred")
-                return
+                return _backfill_step_result(state, outcome="deferred")
 
         if not report.get("published") or report.get("model_status") not in {
             "success",
@@ -1358,8 +1389,7 @@ def _run_insights_backfill_step(
                 state,
                 reason=f"analysis_not_publishable:{report.get('model_status') or 'unknown'}",
             )
-            _print_backfill_progress(state, outcome="error")
-            return
+            return _backfill_step_result(state, outcome="error")
         try:
             export_report(paths, report)
         except OSError:
@@ -1368,8 +1398,7 @@ def _run_insights_backfill_step(
                 state,
                 reason="historical_export_failed",
             )
-            _print_backfill_progress(state, outcome="error")
-            return
+            return _backfill_step_result(state, outcome="error")
         stored = insights_database.matching_successful_report(
             report_date=report_date,
             timezone=args.timezone,
@@ -1387,7 +1416,7 @@ def _run_insights_backfill_step(
             empty_day=not bool(source.get("evidence")),
             health=health_summary,
         )
-        _print_backfill_progress(state, outcome="success")
+        return _backfill_step_result(state, outcome="success")
     finally:
         lock.release()
 
@@ -1415,6 +1444,96 @@ def _print_backfill_progress(state: dict[str, Any], *, outcome: str) -> None:
             separators=(",", ":"),
         )
     )
+
+
+def _run_insights_backfill_loop(
+    args: argparse.Namespace,
+    paths: ArchivePaths,
+    database: ArchiveDatabase,
+    mail_database: MailDatabase,
+) -> None:
+    """Drive chronological backfill from engine idleness instead of a timer.
+
+    Each iteration runs exactly one locked step, so the daily insights lane can
+    still acquire ``insights.lock`` between steps.  A step that occupied the
+    engine itself is followed immediately with only a short settle threshold;
+    any sign of external activity (busy, cooldown, probe failure, lock held by
+    another lane) restores the full minimum-idle requirement and waits before
+    the next attempt.  Persistent step errors eventually exit the process so
+    launchd applies its ThrottleInterval before restarting the loop.
+    """
+
+    # Loop steps reuse the scheduled semantics: the configured window and the
+    # per-step time budget still bound every single step.
+    args.scheduled = True
+    consecutive_errors = 0
+    continuation = False
+    while True:
+        result = _run_insights_backfill_step(
+            args,
+            paths,
+            database,
+            mail_database,
+            min_idle_seconds=(
+                DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS
+                if continuation
+                else None
+            ),
+        )
+        outcome = str(result.get("outcome") or "")
+        reason = str(result.get("reason") or "")
+        last_outcome = str(result.get("last_outcome") or "")
+        if outcome in {"audit_match", "audit_cycle_complete"}:
+            # Audit steps never touch the engine; continue immediately but keep
+            # the full idle threshold for the next model-backed step.
+            consecutive_errors = 0
+            continuation = False
+            continue
+        if outcome in {"covered_by_daily", "reused"} or (
+            outcome == "success" and last_outcome == "empty"
+        ):
+            # Completed without occupying the engine.
+            consecutive_errors = 0
+            continuation = False
+            continue
+        if outcome == "success" or (
+            outcome == "deferred" and reason == "scheduled_step_budget_exhausted"
+        ):
+            # The previous step occupied the engine itself; a short settle is
+            # enough before submitting the next date.
+            consecutive_errors = 0
+            continuation = True
+            continue
+        if outcome == "complete":
+            consecutive_errors = 0
+            continuation = False
+            time.sleep(DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS)
+            continue
+        if outcome == "error":
+            consecutive_errors += 1
+            continuation = False
+            if (
+                consecutive_errors
+                >= DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "outcome": "abort",
+                            "reason": "consecutive_step_errors",
+                            "attempts": consecutive_errors,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                raise SystemExit(1)
+            time.sleep(DEFAULT_INSIGHTS_BACKFILL_LOOP_ERROR_SECONDS)
+            continue
+        # deferred: engine busy/cooldown, probe failure, busy lock, incomplete
+        # source coverage, or outside the configured window.
+        consecutive_errors = 0
+        continuation = False
+        time.sleep(DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS)
 
 
 _VMLX_COLD_START_WARMUP_MESSAGES = [
