@@ -527,7 +527,7 @@ class AppConfigTests(unittest.TestCase):
         args = build_parser().parse_args(["insights-run"])
         self.assertEqual(args.timezone, "Europe/Amsterdam")
         self.assertEqual(args.host, "192.168.100.179")
-        self.assertEqual(args.model, "vmlx/gemma-4-31b-it-8bit")
+        self.assertEqual(args.model, "vmlx/qwen3.8-27b-8bit")
         self.assertEqual(args.remote_port, 11435)
         self.assertFalse(args.no_model)
         self.assertFalse(args.dry_run)

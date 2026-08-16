@@ -31,7 +31,7 @@ class BackfillStateTests(unittest.TestCase):
                 oldest_date="2026-08-09",
                 newest_date="2026-08-11",
                 timezone="Europe/Amsterdam",
-                model="vmlx/gemma-4-31b-it-8bit",
+                model="vmlx/qwen3.8-27b-8bit",
                 prompt_version="daily-insights-v3",
                 analysis_config={"max_chunk_chars": 24000},
                 archive_bounds={"earliest_date": "2026-08-09"},

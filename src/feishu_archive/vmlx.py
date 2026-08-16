@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 
-DEFAULT_VMLX_MODEL = "vmlx/gemma-4-31b-it-8bit"
+DEFAULT_VMLX_MODEL = "vmlx/qwen3.8-27b-8bit"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 

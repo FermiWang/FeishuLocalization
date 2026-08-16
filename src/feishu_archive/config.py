@@ -41,7 +41,7 @@ DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS = 10
 DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
-DEFAULT_VMLX_MODEL = "vmlx/gemma-4-31b-it-8bit"
+DEFAULT_VMLX_MODEL = "vmlx/qwen3.8-27b-8bit"
 DEFAULT_VMLX_LOCAL_PORT = 18135
 # The resident backfill loop uses a separate tunnel port so its frequent SSH
 # forwards never collide with a manual or scheduled `insights-run` on 18135.
