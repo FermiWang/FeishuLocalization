@@ -735,7 +735,9 @@ def _validated_reducer_report(
         field not in value or not isinstance(value[field], list) for field in fields
     ):
         raise InsightsError("Reducer 必须返回三个显式数组字段")
+    cleaned_by_field: dict[str, list[dict[str, Any]]] = {}
     for field in fields:
+        cleaned_items: list[dict[str, Any]] = []
         for item in value[field]:
             if not isinstance(item, dict):
                 raise InsightsError(f"Reducer 字段 {field} 包含非对象条目")
@@ -747,19 +749,32 @@ def _validated_reducer_report(
             ids = [str(evidence_id) for evidence_id in raw_ids]
             if any(evidence_id not in evidence_by_id for evidence_id in ids):
                 raise InsightsError(f"Reducer 字段 {field} 引用了未见证据")
-            if field in {"today_plan", "commercial_opportunities"} and any(
-                not _actionable_evidence(evidence_by_id[evidence_id])
-                for evidence_id in ids
-            ):
-                raise InsightsError(f"Reducer 字段 {field} 引用了不可行动证据")
+            if field in {"today_plan", "commercial_opportunities"}:
+                # The reducer only sees the observation JSON, so it cannot tell
+                # which cited evidence is actionable (spam/trash mail, deleted
+                # or recalled chat, metadata-only wiki events). Instead of
+                # failing the whole Reduce — which deterministically stalls a
+                # backfill day — strip inactionable citations and drop entries
+                # that lose all of their evidence.
+                actionable_ids = [
+                    evidence_id
+                    for evidence_id in ids
+                    if _actionable_evidence(evidence_by_id[evidence_id])
+                ]
+                if not actionable_ids:
+                    continue
+                if len(actionable_ids) != len(ids):
+                    item = {**item, "evidence_ids": actionable_ids}
+            cleaned_items.append(item)
+        cleaned_by_field[field] = cleaned_items
     result = {
-        "yesterday_summary": value["yesterday_summary"],
-        "today_plan": value["today_plan"],
-        "commercial_opportunities": value["commercial_opportunities"],
+        "yesterday_summary": cleaned_by_field["yesterday_summary"],
+        "today_plan": cleaned_by_field["today_plan"],
+        "commercial_opportunities": cleaned_by_field["commercial_opportunities"],
         "degraded": False,
     }
     validated = validate_report(result, evidence_by_id)
-    if any(len(validated[field]) != len(value[field]) for field in fields):
+    if any(len(validated[field]) != len(cleaned_by_field[field]) for field in fields):
         raise InsightsError("Reducer 输出未通过完整证据校验")
     return validated
 

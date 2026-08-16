@@ -18,6 +18,7 @@ from feishu_archive.insights import (
     _validate_cached_observations,
     _validated_map,
     _validated_map_result,
+    _validated_reducer_report,
     export_report,
     run_daily_insights,
     validate_report,
@@ -1094,6 +1095,58 @@ class DailyInsightsTests(unittest.TestCase):
                     "SELECT stats_json FROM analysis_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
             self.assertEqual(json.loads(row["stats_json"])["reduce_retries"], 1)
+
+    def test_reducer_inactionable_citations_are_stripped_not_fatal(self) -> None:
+        evidence_by_id = {
+            "chat:oc/om-ok": {
+                "source_kind": "chat",
+                "metadata": {},
+                "citation": "聊天 项目群",
+            },
+            "chat:oc/om-recalled": {
+                "source_kind": "chat",
+                "metadata": {"recalled": True},
+                "citation": "聊天 项目群(已撤回)",
+            },
+            "mail:1/spam": {
+                "source_kind": "mail",
+                "metadata": {"flags": {"spam": True}},
+                "citation": "邮件 垃圾",
+            },
+            "wiki:meta-only": {
+                "source_kind": "wiki",
+                "metadata": {"actionable": False},
+                "citation": "知识库 仅元数据",
+            },
+        }
+        value = {
+            "yesterday_summary": [
+                {
+                    "summary": " wiki 当日仅有元数据可用。",
+                    "evidence_ids": ["wiki:meta-only"],
+                }
+            ],
+            "today_plan": [
+                {
+                    "summary": "继续跟进项目资料。",
+                    "evidence_ids": ["chat:oc/om-ok", "chat:oc/om-recalled"],
+                },
+                {
+                    "summary": "回复垃圾邮件。",
+                    "evidence_ids": ["mail:1/spam"],
+                },
+            ],
+            "commercial_opportunities": [],
+        }
+
+        validated = _validated_reducer_report(value, evidence_by_id)
+
+        self.assertEqual(len(validated["yesterday_summary"]), 1)
+        self.assertEqual(len(validated["today_plan"]), 1)
+        self.assertEqual(
+            validated["today_plan"][0]["evidence_ids"], ["chat:oc/om-ok"]
+        )
+        self.assertEqual(validated["commercial_opportunities"], [])
 
     def test_reduce_failure_code_is_metadata_only(self) -> None:
         from feishu_archive.vmlx import VMLXError
