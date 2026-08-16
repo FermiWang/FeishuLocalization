@@ -8,10 +8,13 @@ from pathlib import Path
 from feishu_archive.config import ArchivePaths
 from feishu_archive.database import ArchiveDatabase
 from feishu_archive.insights import (
+    REDUCE_RETRY_USER_PROMPT,
+    InsightsError,
     InsightsRunOptions,
     _due_at_ms,
     _merge_carryover_tasks,
     _persist_validated_observations,
+    _reduce_failure_code,
     _validate_cached_observations,
     _validated_map,
     _validated_map_result,
@@ -85,6 +88,42 @@ class MalformedReducerClient(FakeJSONClient):
         if self.calls:
             self.calls += 1
             return {}
+        return super().chat_json(
+            messages, max_tokens=max_tokens, temperature=temperature
+        )
+
+
+class FlakyReducerClient(FakeJSONClient):
+    """First Reduce reply is malformed; the corrective retry succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reduce_attempts: list[list[dict]] = []
+
+    def chat_json(self, messages, *, max_tokens, temperature):
+        if self.calls:
+            self.reduce_attempts.append([dict(message) for message in messages])
+            self.calls += 1
+            if len(self.reduce_attempts) == 1:
+                return {}
+            return {
+                "yesterday_summary": [
+                    {
+                        "summary": "项目资料已经发送。",
+                        "evidence_ids": ["chat:oc/om"],
+                        "confidence": 0.9,
+                    }
+                ],
+                "today_plan": [
+                    {
+                        "summary": "今天跟进项目资料。",
+                        "category": "committed",
+                        "evidence_ids": ["chat:oc/om"],
+                        "confidence": 0.9,
+                    }
+                ],
+                "commercial_opportunities": [],
+            }
         return super().chat_json(
             messages, max_tokens=max_tokens, temperature=temperature
         )
@@ -970,6 +1009,123 @@ class DailyInsightsTests(unittest.TestCase):
             self.assertEqual(report["model_status"], "partial")
             self.assertFalse(report["published"])
             self.assertEqual(insights.status()["successful_runs"], 0)
+            self.assertEqual(
+                (report.get("reduce_failure") or {}).get("attempts"),
+                ["reduce_missing_fields", "reduce_missing_fields"],
+            )
+            with insights.connection() as con:
+                row = con.execute(
+                    "SELECT error, stats_json FROM analysis_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertIn(
+                "reduce_failure=reduce_missing_fields>reduce_missing_fields",
+                row["error"],
+            )
+            stats = json.loads(row["stats_json"])
+            self.assertEqual(
+                stats["reduce_failure"],
+                {
+                    "attempts": ["reduce_missing_fields", "reduce_missing_fields"],
+                    "retry_attempted": True,
+                },
+            )
+            self.assertEqual(stats["reduce_retries"], 0)
+
+    def test_reducer_retry_recovers_after_malformed_first_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            archive = ArchiveDatabase(paths.database)
+            archive.initialize()
+            mail = MailDatabase(paths.mail_database)
+            mail.initialize()
+            insights = InsightsDatabase(paths.insights_database)
+            insights.initialize()
+            archive.upsert_conversation({"chat_id": "oc", "name": "项目群"})
+            with archive.connection() as con:
+                con.execute(
+                    "INSERT INTO sync_jobs(trigger, started_at, finished_at, status) "
+                    "VALUES ('test', 1, 2, 'success')"
+                )
+                con.execute(
+                    "INSERT INTO wiki_sync_runs(trigger, started_at, finished_at, status) "
+                    "VALUES ('test', 1, 2, 'success')"
+                )
+                con.execute(
+                    """
+                    INSERT INTO messages(
+                        message_id, chat_id, message_type, sender_id,
+                        created_at, body_text, raw_json, archived_at
+                    ) VALUES ('om', 'oc', 'text', 'other', ?, '请跟进资料', '{}', ?)
+                    """,
+                    (1786485600001, 1786485600001),
+                )
+            with mail.connection() as con:
+                con.execute(
+                    "INSERT INTO sync_runs(trigger, started_at, finished_at, status) "
+                    "VALUES ('test', 1, 2, 'success')"
+                )
+
+            client = FlakyReducerClient()
+            report = run_daily_insights(
+                archive,
+                mail,
+                insights,
+                paths,
+                InsightsRunOptions(
+                    report_date="2026-08-12",
+                    analysis_mode="historical_backfill",
+                    trigger="historical_backfill",
+                    activate=False,
+                    include_carryover=False,
+                ),
+                client=client,
+            )
+
+            self.assertEqual(report["model_status"], "success")
+            self.assertTrue(report["published"])
+            self.assertEqual(report.get("reduce_retries"), 1)
+            self.assertEqual(len(client.reduce_attempts), 2)
+            self.assertEqual(
+                client.reduce_attempts[1][-1]["content"], REDUCE_RETRY_USER_PROMPT
+            )
+            with insights.connection() as con:
+                row = con.execute(
+                    "SELECT stats_json FROM analysis_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(json.loads(row["stats_json"])["reduce_retries"], 1)
+
+    def test_reduce_failure_code_is_metadata_only(self) -> None:
+        from feishu_archive.vmlx import VMLXError
+
+        self.assertEqual(
+            _reduce_failure_code(VMLXError("vMLX request timed out")), "reduce_timeout"
+        )
+        self.assertEqual(
+            _reduce_failure_code(VMLXError("vMLX response does not contain valid JSON")),
+            "reduce_invalid_json",
+        )
+        self.assertEqual(
+            _reduce_failure_code(
+                VMLXError("vMLX response does not contain a single JSON object")
+            ),
+            "reduce_no_json_object",
+        )
+        self.assertEqual(
+            _reduce_failure_code(InsightsError("Reducer 必须返回三个显式数组字段")),
+            "reduce_missing_fields",
+        )
+        self.assertEqual(
+            _reduce_failure_code(InsightsError("Reducer 字段 today_plan 引用了未见证据")),
+            "reduce_unknown_evidence",
+        )
+        self.assertEqual(
+            _reduce_failure_code(InsightsError("Reducer 字段 today_plan 引用了不可行动证据")),
+            "reduce_inactionable_evidence",
+        )
+        self.assertEqual(
+            _reduce_failure_code(RuntimeError("boom")), "reduce_request_failed"
+        )
 
     def test_historical_mode_does_not_activate_or_include_future_carryover(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -40,6 +40,11 @@ summary、evidence_ids、confidence。today_plan 另含 category（committed/pro
 commercial_opportunities 另含 strength（confirmed/qualification/weak）、evidence_gaps、next_validation_step。
 每项必须保留足以支持结论的 evidence_ids。不要把 AI 建议写成既定承诺，不要把弱信号写成已确认机会。"""
 
+REDUCE_RETRY_USER_PROMPT = """上一次回复未通过本地结构校验。请重新只返回一个 JSON 对象，不要包含任何
+其他文本或 Markdown 代码围栏。对象必须包含 yesterday_summary、today_plan、
+commercial_opportunities 三个数组字段；每个条目必须有非空 summary；evidence_ids 只能引用
+本轮输入中实际出现过的证据 ID，且 today_plan 与 commercial_opportunities 只引用可行动证据。"""
+
 
 class InsightsError(RuntimeError):
     pass
@@ -406,6 +411,8 @@ def run_daily_insights(
                     stats={
                         "evidence": len(evidence),
                         "chunks": int(report.get("chunk_count") or 0),
+                        "reduce_failure": report.get("reduce_failure"),
+                        "reduce_retries": int(report.get("reduce_retries") or 0),
                     },
                     citations=citations,
                     activate=publishable and options.activate,
@@ -653,20 +660,70 @@ def _reduce_report(
         for evidence_id in reducer_evidence_ids
         if evidence_id in evidence_by_id
     }
-    try:
-        value = client.chat_json(
-            [
-                {"role": "system", "content": REDUCE_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(observations, ensure_ascii=False)},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.1,
-        )
-        return _validated_reducer_report(value, reducer_evidence_by_id)
-    except Exception:
-        fallback = deterministic_report(source, model_status="partial")
-        fallback["degraded_reason"] = "综合归纳失败；保留确定性统计"
-        return fallback
+    messages = [
+        {"role": "system", "content": REDUCE_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(observations, ensure_ascii=False)},
+    ]
+    failure_codes: list[str] = []
+    for attempt in range(2):
+        try:
+            value = client.chat_json(
+                messages,
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
+            report = _validated_reducer_report(value, reducer_evidence_by_id)
+            if failure_codes:
+                report["reduce_retries"] = len(failure_codes)
+            return report
+        except Exception as exc:
+            failure_codes.append(_reduce_failure_code(exc))
+            if attempt == 0:
+                # One corrective retry: restate the structural contract without
+                # echoing any model output or archive content back.
+                messages = [
+                    *messages,
+                    {"role": "user", "content": REDUCE_RETRY_USER_PROMPT},
+                ]
+    fallback = deterministic_report(source, model_status="partial")
+    fallback["degraded_reason"] = "综合归纳失败；保留确定性统计"
+    fallback["reduce_failure"] = {
+        "attempts": failure_codes,
+        "retry_attempted": True,
+    }
+    return fallback
+
+
+def _reduce_failure_code(exc: Exception) -> str:
+    """Classify a Reduce failure into a metadata-only, log-safe code."""
+
+    message = str(exc)
+    if isinstance(exc, InsightsError):
+        if "三个显式数组字段" in message:
+            return "reduce_missing_fields"
+        if "非对象条目" in message:
+            return "reduce_non_object_item"
+        if "空摘要" in message:
+            return "reduce_empty_summary"
+        if "缺少证据数组" in message:
+            return "reduce_missing_evidence_ids"
+        if "未见证据" in message:
+            return "reduce_unknown_evidence"
+        if "不可行动证据" in message:
+            return "reduce_inactionable_evidence"
+        if "完整证据校验" in message:
+            return "reduce_evidence_validation"
+        return "reduce_invalid_output"
+    lowered = f"{type(exc).__name__} {message}".lower()
+    if "timed out" in lowered or "timeout" in lowered or "超时" in message:
+        return "reduce_timeout"
+    if "single json object" in lowered:
+        return "reduce_no_json_object"
+    if "valid json" in lowered or "json" in lowered:
+        return "reduce_invalid_json"
+    if "response" in lowered:
+        return "reduce_invalid_response"
+    return "reduce_request_failed"
 
 
 def _validated_reducer_report(
@@ -1315,6 +1372,11 @@ def _partial_run_reason(report: dict[str, Any], coverage: dict[str, Any]) -> str
     reasons = [str(value) for value in coverage.get("blocking_issues") or []]
     if report.get("model_status") != "success":
         reasons.append(f"model_status={report.get('model_status') or 'unknown'}")
+    reduce_failure = report.get("reduce_failure")
+    if isinstance(reduce_failure, dict):
+        attempts = [str(code) for code in reduce_failure.get("attempts") or []]
+        if attempts:
+            reasons.append(f"reduce_failure={'>'.join(attempts)}")
     return "；".join(reasons) or "洞察未通过发布门禁"
 
 
