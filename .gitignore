@@ -1,0 +1,6 @@
+data/
+.venv/
+.venv-spk/
+__pycache__/
+*.py[cod]
+.DS_Store

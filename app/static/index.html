@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>会议纪要整理</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #f5f6f8; color: #1f2329; }
+  header { background: #2b4acb; color: #fff; padding: 12px 24px; font-size: 18px; font-weight: 600; }
+  .layout { display: flex; min-height: calc(100vh - 48px); }
+  .sidebar { width: 300px; background: #fff; border-right: 1px solid #e5e6eb;
+             padding: 16px; flex-shrink: 0; }
+  .main { flex: 1; padding: 24px; overflow-x: hidden; }
+  h2 { font-size: 16px; margin-bottom: 12px; }
+  .meeting-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 6px;
+                  border: 1px solid #e5e6eb; }
+  .meeting-item:hover { background: #f2f3f5; }
+  .meeting-item.active { border-color: #2b4acb; background: #eef1fd; }
+  .meeting-item .title { font-weight: 600; font-size: 14px; }
+  .meeting-item .meta { font-size: 12px; color: #646a73; margin-top: 4px; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px;
+           background: #e5e6eb; margin-right: 4px; }
+  .badge.done { background: #d9f5e3; color: #187a3c; }
+  .badge.processing { background: #fdf3d7; color: #9a6a00; }
+  .badge.failed { background: #fde2e2; color: #c0392b; }
+  button { background: #2b4acb; color: #fff; border: none; border-radius: 6px;
+           padding: 8px 16px; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #a9b6e8; cursor: not-allowed; }
+  button.secondary { background: #fff; color: #2b4acb; border: 1px solid #2b4acb; }
+  button.danger { background: #fff; color: #c0392b; border: 1px solid #c0392b;
+                  padding: 5px 12px; font-size: 13px; }
+  button.danger:hover { background: #fde2e2; }
+  .card { background: #fff; border: 1px solid #e5e6eb; border-radius: 10px;
+          padding: 20px; margin-bottom: 16px; }
+  .card h3 { font-size: 15px; margin-bottom: 12px; color: #1f2329; }
+  label { display: block; font-size: 13px; color: #646a73; margin: 10px 0 4px; }
+  input[type=text], input[type=date], textarea {
+    width: 100%; border: 1px solid #dee0e3; border-radius: 6px; padding: 8px 10px;
+    font-size: 14px; font-family: inherit; }
+  textarea { resize: vertical; }
+  .attendee-row { display: flex; gap: 8px; margin-bottom: 6px; }
+  .attendee-row input { flex: 1; }
+  .attendee-row .del { background: none; color: #c0392b; border: none; padding: 0 8px;
+                       font-size: 16px; cursor: pointer; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .hint { font-size: 12px; color: #8f959e; }
+  audio { width: 100%; margin-top: 10px; }
+  .result h2 { font-size: 17px; margin: 20px 0 8px; padding-bottom: 6px;
+               border-bottom: 2px solid #2b4acb; display: inline-block; }
+  .result p { margin: 8px 0; line-height: 1.7; font-size: 14px; }
+  .result ul, .result ol { margin: 8px 0 8px 22px; }
+  .result li { line-height: 1.7; font-size: 14px; margin: 4px 0; }
+  .status { font-size: 13px; margin-top: 10px; }
+  .status.processing { color: #9a6a00; }
+  .status.failed { color: #c0392b; }
+  .empty { color: #8f959e; text-align: center; padding: 80px 0; font-size: 14px; }
+  .toggle { font-size: 13px; color: #2b4acb; cursor: pointer; margin-top: 8px;
+            display: inline-block; }
+  #transcript-view { white-space: pre-wrap; background: #f7f8fa; border-radius: 6px;
+                     padding: 12px; font-size: 13px; max-height: 240px; overflow-y: auto;
+                     margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>会议纪要整理 · 本地模型 vmlx/qwen3.8-27b-8bit</header>
+<div class="layout">
+  <aside class="sidebar">
+    <button style="width:100%" onclick="showCreate()">＋ 新建会议</button>
+    <h2 style="margin-top:16px">会议列表</h2>
+    <div id="meeting-list"></div>
+  </aside>
+  <main class="main" id="main">
+    <div class="empty">请选择左侧会议，或新建一场会议</div>
+  </main>
+</div>
+
+<script>
+let currentId = null;
+let pollTimer = null;
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  if (!resp.ok) {
+    let msg = resp.statusText;
+    try { msg = (await resp.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return resp.status === 204 ? null : resp.json();
+}
+
+// ---------- 轻量 Markdown 渲染 ----------
+function md(mdText) {
+  const lines = mdText.split("\n");
+  let html = "", inList = null;
+  const inline = (t) => esc(t)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/^- \[ \]\s*/, "☐ ");
+  const closeList = () => { if (inList) { html += `</${inList}>`; inList = null; } };
+  for (const line of lines) {
+    const t = line.trimEnd();
+    if (/^##\s+/.test(t)) { closeList(); html += `<h2>${inline(t.replace(/^##\s+/, ""))}</h2>`; }
+    else if (/^#{1,4}\s+/.test(t)) { closeList(); html += `<p><strong>${inline(t.replace(/^#+\s+/, ""))}</strong></p>`; }
+    else if (/^\s*[-*]\s+/.test(t)) {
+      if (inList !== "ul") { closeList(); html += "<ul>"; inList = "ul"; }
+      html += `<li>${inline(t.replace(/^\s*[-*]\s+/, ""))}</li>`;
+    } else if (/^\s*\d+[.、]\s*/.test(t)) {
+      if (inList !== "ol") { closeList(); html += "<ol>"; inList = "ol"; }
+      html += `<li>${inline(t.replace(/^\s*\d+[.、]\s*/, ""))}</li>`;
+    } else if (t === "") { closeList(); }
+    else { closeList(); html += `<p>${inline(t)}</p>`; }
+  }
+  closeList();
+  return html;
+}
+
+// ---------- 会议列表 ----------
+async function loadList() {
+  const list = await api("/api/meetings");
+  const el = $("#meeting-list");
+  el.innerHTML = list.map(m => `
+    <div class="meeting-item ${m.id === currentId ? "active" : ""}" onclick="selectMeeting(${m.id})">
+      <div class="title">${esc(m.title)}</div>
+      <div class="meta">${esc(m.meeting_date || m.created_at)}</div>
+      <div class="meta">
+        ${m.has_audio ? '<span class="badge">录音</span>' : ""}
+        ${m.has_transcript ? '<span class="badge">转写</span>' : ""}
+        ${m.minutes_status !== "pending" ? `<span class="badge ${m.minutes_status}">${statusText(m.minutes_status)}</span>` : ""}
+      </div>
+    </div>`).join("") || '<div class="hint">暂无会议</div>';
+}
+
+function statusText(s) {
+  return { processing: "整理中", done: "已整理", failed: "失败", pending: "" }[s] || s;
+}
+
+// ---------- 新建会议 ----------
+function showCreate() {
+  stopPoll();
+  currentId = null;
+  loadList();
+  $("#main").innerHTML = `
+    <div class="card">
+      <h3>新建会议</h3>
+      <label>会议标题 *</label>
+      <input type="text" id="f-title" placeholder="例如：Q3 产品排期评审">
+      <label>会议日期</label>
+      <input type="date" id="f-date">
+      <label>会议背景（可选）</label>
+      <textarea id="f-background" rows="3" placeholder="会议召开的背景、要解决的问题……"></textarea>
+      <label>主要参会人及角色（可选）</label>
+      <div id="attendee-rows"></div>
+      <button class="secondary" style="margin-top:4px" onclick="addAttendeeRow()">＋ 添加参会人</button>
+      <div class="row">
+        <button onclick="createMeeting()">创建会议</button>
+      </div>
+    </div>`;
+  addAttendeeRow();
+}
+
+function addAttendeeRow() {
+  const row = document.createElement("div");
+  row.className = "attendee-row";
+  row.innerHTML = `
+    <input type="text" class="a-name" placeholder="姓名">
+    <input type="text" class="a-role" placeholder="角色（如：产品负责人）">
+    <button class="del" onclick="this.parentElement.remove()">×</button>`;
+  $("#attendee-rows").appendChild(row);
+}
+
+async function createMeeting() {
+  const title = $("#f-title").value.trim();
+  if (!title) { alert("请填写会议标题"); return; }
+  const attendees = [...document.querySelectorAll(".attendee-row")]
+    .map(r => ({ name: r.querySelector(".a-name").value.trim(),
+                 role: r.querySelector(".a-role").value.trim() }))
+    .filter(a => a.name);
+  const { id } = await api("/api/meetings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title,
+      meeting_date: $("#f-date").value,
+      background: $("#f-background").value,
+      attendees,
+    }),
+  });
+  await selectMeeting(id);
+}
+
+// ---------- 删除会议 ----------
+async function deleteMeeting() {
+  if (currentId == null) return;
+  if (!confirm("确定删除该会议吗？\n服务器上的录音、转写文字、整理结果等所有记录将被永久删除，不可恢复。")) return;
+  if (!confirm("再次确认：永久删除此会议的全部记录？")) return;
+  await api(`/api/meetings/${currentId}`, { method: "DELETE" });
+  stopPoll();
+  currentId = null;
+  $("#main").innerHTML = '<div class="empty">会议已删除</div>';
+  await loadList();
+}
+
+// ---------- 会议详情 ----------
+async function selectMeeting(id) {
+  stopPoll();
+  currentId = id;
+  const m = await api(`/api/meetings/${id}`);
+  await loadList();
+  const people = m.attendees.length
+    ? m.attendees.map(a => a.role ? `${esc(a.name)}（${esc(a.role)}）` : esc(a.name)).join("、")
+    : '<span class="hint">未填写</span>';
+  $("#main").innerHTML = `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <h3>${esc(m.title)}</h3>
+        <button class="danger" onclick="deleteMeeting()">删除会议</button>
+      </div>
+      <div class="hint">日期：${esc(m.meeting_date || "未填写")} ｜ 创建于 ${esc(m.created_at)}</div>
+      ${m.background ? `<p style="margin-top:10px;font-size:14px;line-height:1.7">📌 ${esc(m.background)}</p>` : ""}
+      <p style="margin-top:8px;font-size:14px">👥 ${people}</p>
+    </div>
+
+    <div class="card">
+      <h3>会议录音（mp3）</h3>
+      <div class="row">
+        <input type="file" id="audio-file" accept="audio/*">
+        <button class="secondary" onclick="uploadAudio()">上传录音</button>
+      </div>
+      ${m.has_audio ? `<audio controls src="/api/meetings/${m.id}/audio"></audio>` : '<div class="hint" style="margin-top:8px">尚未上传录音</div>'}
+    </div>
+
+    <div class="card">
+      <h3>讯飞识别文字</h3>
+      <div class="row">
+        <input type="file" id="transcript-file" accept=".txt,.text,text/plain">
+        <button class="secondary" onclick="uploadTranscriptFile()">上传转写文件</button>
+      </div>
+      <label>或直接粘贴文字：</label>
+      <textarea id="transcript-text" rows="6" placeholder="把讯飞识别的文字粘贴到这里……"></textarea>
+      <div class="row">
+        <button class="secondary" onclick="uploadTranscriptText()">保存粘贴文字</button>
+        ${m.has_transcript ? `<span class="hint">已保存转写（${m.transcript.length} 字）
+          <span class="toggle" onclick="toggleTranscript()">查看/收起</span></span>` : ""}
+        ${m.transcript_spk ? `<span class="hint">｜已完成发言人区分
+          <span class="toggle" onclick="toggleSpkTranscript()">查看标注版</span></span>` : ""}
+      </div>
+      <div id="transcript-view" style="display:none">${esc(m.transcript)}</div>
+      <div id="transcript-spk-view" style="display:none;white-space:pre-wrap;background:#f0f4ff;border-radius:6px;padding:12px;font-size:13px;max-height:240px;overflow-y:auto;margin-top:8px">${esc(m.transcript_spk)}</div>
+    </div>
+
+    <div class="card">
+      <h3>整理结果</h3>
+      <div class="row">
+        <button id="btn-organize" onclick="organize()" ${m.has_transcript ? "" : "disabled"}>开始整理</button>
+        ${m.has_transcript ? "" : '<span class="hint">需先上传讯飞识别文字</span>'}
+      </div>
+      <div class="status" id="org-status"></div>
+      <div class="result" id="org-result"></div>
+    </div>`;
+  await refreshMinutes();
+  startPollIfProcessing();
+}
+
+function toggleTranscript() {
+  const el = $("#transcript-view");
+  el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+function toggleSpkTranscript() {
+  const el = $("#transcript-spk-view");
+  el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+async function uploadAudio() {
+  const f = $("#audio-file").files[0];
+  if (!f) { alert("请选择音频文件"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  await api(`/api/meetings/${currentId}/audio`, { method: "POST", body: fd });
+  await selectMeeting(currentId);
+}
+
+async function uploadTranscriptFile() {
+  const f = $("#transcript-file").files[0];
+  if (!f) { alert("请选择转写文件"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  await api(`/api/meetings/${currentId}/transcript`, { method: "POST", body: fd });
+  await selectMeeting(currentId);
+}
+
+async function uploadTranscriptText() {
+  const text = $("#transcript-text").value;
+  if (!text.trim()) { alert("请粘贴转写文字"); return; }
+  const fd = new FormData();
+  fd.append("text", text);
+  await api(`/api/meetings/${currentId}/transcript`, { method: "POST", body: fd });
+  await selectMeeting(currentId);
+}
+
+// ---------- 整理 ----------
+async function organize() {
+  try {
+    await api(`/api/meetings/${currentId}/organize`, { method: "POST" });
+    await refreshMinutes();
+    startPollIfProcessing();
+    loadList();
+  } catch (e) { alert(e.message); }
+}
+
+async function refreshMinutes() {
+  if (currentId == null) return;
+  const r = await api(`/api/meetings/${currentId}/minutes`);
+  const statusEl = $("#org-status");
+  const resultEl = $("#org-result");
+  if (!statusEl) return;
+  if (r.status === "processing") {
+    statusEl.className = "status processing";
+    statusEl.textContent = "⏳ " + (r.stage || "正在调用本地模型整理，请稍候（长会议可能需要几分钟）……");
+    $("#btn-organize").disabled = true;
+  } else if (r.status === "failed") {
+    statusEl.className = "status failed";
+    statusEl.textContent = "整理失败：" + r.error + "（可点击「开始整理」重试）";
+    $("#btn-organize").disabled = false;
+  } else {
+    statusEl.className = "status";
+    statusEl.textContent = r.status === "done" ? `✅ 整理完成（${r.updated_at}）` : "";
+    $("#btn-organize").disabled = false;
+  }
+  resultEl.innerHTML = r.status === "done" ? md(r.content) : "";
+}
+
+function startPollIfProcessing() {
+  stopPoll();
+  pollTimer = setInterval(async () => {
+    const r = await api(`/api/meetings/${currentId}/minutes`);
+    await refreshMinutes();
+    if (r.status !== "processing") { stopPoll(); loadList(); }
+  }, 3000);
+}
+
+function stopPoll() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+loadList();
+</script>
+</body>
+</html>
