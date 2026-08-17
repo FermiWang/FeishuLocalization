@@ -50,6 +50,33 @@ class InsightsError(RuntimeError):
     pass
 
 
+# On dense days a Map/Reduce reply can exceed the configured token budget;
+# the truncated reply then fails JSON parsing and would deterministically
+# stall the day. Retry JSON-invalid replies once with a larger budget. This
+# is an execution detail and intentionally not part of the analysis identity,
+# so adopting it does not restart an in-flight backfill campaign.
+_OUTPUT_TOKEN_RETRY_BUDGET = 16_384
+
+
+def _chat_json_with_token_retry(
+    client: Any,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    try:
+        return client.chat_json(messages, max_tokens=max_tokens, temperature=temperature)
+    except Exception as exc:
+        if "JSON" not in str(exc):
+            raise
+    return client.chat_json(
+        messages,
+        max_tokens=max(max_tokens, _OUTPUT_TOKEN_RETRY_BUDGET),
+        temperature=temperature,
+    )
+
+
 @dataclass(frozen=True)
 class InsightsRunOptions:
     report_date: str
@@ -281,7 +308,8 @@ def run_daily_insights(
                         observations.extend(cached_observations)
                         continue
                 try:
-                    value = client.chat_json(
+                    value = _chat_json_with_token_retry(
+                        client,
                         [
                             {"role": "system", "content": MAP_SYSTEM_PROMPT},
                             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -667,7 +695,8 @@ def _reduce_report(
     failure_codes: list[str] = []
     for attempt in range(2):
         try:
-            value = client.chat_json(
+            value = _chat_json_with_token_retry(
+                client,
                 messages,
                 max_tokens=max_tokens,
                 temperature=0.1,

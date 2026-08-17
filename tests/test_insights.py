@@ -1148,6 +1148,42 @@ class DailyInsightsTests(unittest.TestCase):
         )
         self.assertEqual(validated["commercial_opportunities"], [])
 
+    def test_chat_json_token_retry_on_truncated_json(self) -> None:
+        from feishu_archive.insights import (
+            _OUTPUT_TOKEN_RETRY_BUDGET,
+            _chat_json_with_token_retry,
+        )
+        from feishu_archive.vmlx import VMLXError
+
+        class TruncatedOnceClient:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def chat_json(self, messages, *, max_tokens, temperature):
+                self.calls.append(max_tokens)
+                if len(self.calls) == 1:
+                    raise VMLXError("vMLX response does not contain valid JSON")
+                return {"facts": []}
+
+        client = TruncatedOnceClient()
+        result = _chat_json_with_token_retry(
+            client, [{"role": "user", "content": "x"}], max_tokens=4096, temperature=0.1
+        )
+        self.assertEqual(result, {"facts": []})
+        self.assertEqual(client.calls, [4096, _OUTPUT_TOKEN_RETRY_BUDGET])
+
+        class TimeoutClient:
+            def chat_json(self, messages, *, max_tokens, temperature):
+                raise VMLXError("vMLX request timed out")
+
+        with self.assertRaises(VMLXError):
+            _chat_json_with_token_retry(
+                TimeoutClient(),
+                [{"role": "user", "content": "x"}],
+                max_tokens=4096,
+                temperature=0.1,
+            )
+
     def test_reduce_failure_code_is_metadata_only(self) -> None:
         from feishu_archive.vmlx import VMLXError
 
