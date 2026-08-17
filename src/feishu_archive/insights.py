@@ -839,9 +839,16 @@ def _validated_map_result(
                 valid = False
                 continue
             ids = list(dict.fromkeys(str(value) for value in raw_ids))
-            if any(value not in evidence_by_id for value in ids):
-                valid = False
-                continue
+            known_ids = [value for value in ids if value in evidence_by_id]
+            if len(known_ids) != len(ids):
+                # The model sometimes composes a hallucinated ID from a session
+                # or thread identifier visible in the chunk text. That failure
+                # is deterministic at low temperature and stalls the backfill
+                # day, so strip unknown citations and drop entries left with
+                # no evidence instead of failing the whole chunk.
+                ids = known_ids
+                if not ids:
+                    continue
             if kind in {"task_observations", "opportunity_signals"}:
                 # The mapper only sees the chunk text, so it cannot tell which
                 # cited evidence is actionable (spam/trash mail, deleted or

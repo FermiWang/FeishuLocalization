@@ -863,6 +863,35 @@ class DailyInsightsTests(unittest.TestCase):
             ],
         )
 
+    def test_map_unknown_citations_are_stripped_not_fatal(self) -> None:
+        evidence = {
+            "chat:oc/om-ok": {
+                "source_kind": "chat",
+                "metadata": {},
+            },
+        }
+        value = {
+            "facts": [
+                {
+                    "summary": "部分引用系模型拼接的幻觉 ID。",
+                    "evidence_ids": ["chat:oc/om-ok", "chat:oc/om-hallucinated"],
+                },
+                {
+                    "summary": "仅引用幻觉 ID 的条目被整体丢弃。",
+                    "evidence_ids": ["chat:oc/om-hallucinated"],
+                },
+            ],
+            "decisions": [],
+            "task_observations": [],
+            "opportunity_signals": [],
+        }
+        observations, valid = _validated_map_result(value, evidence)
+        self.assertTrue(valid)
+        self.assertEqual(
+            [(item["kind"], item["evidence_ids"]) for item in observations],
+            [("facts", ["chat:oc/om-ok"])],
+        )
+
     def test_model_report_is_evidence_validated_and_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))
@@ -1452,7 +1481,7 @@ class DailyInsightsTests(unittest.TestCase):
             self.assertEqual(resume_client.maps, 1)
             self.assertFalse(checkpoint.exists())
 
-    def test_map_cannot_cite_evidence_from_an_unseen_chunk(self) -> None:
+    def test_map_drops_entries_citing_evidence_from_an_unseen_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))
             paths.ensure()
@@ -1541,8 +1570,11 @@ class DailyInsightsTests(unittest.TestCase):
 
             self.assertEqual(client.maps, 2)
             self.assertEqual(report["validated_observations"], 0)
-            self.assertEqual(report["model_status"], "partial")
-            self.assertFalse(report["published"])
+            # Entries citing foreign or hallucinated IDs are dropped, not
+            # fatal: with no observations left the day falls back to the
+            # deterministic report and still publishes.
+            self.assertEqual(report["model_status"], "not_required")
+            self.assertTrue(report["published"])
             self.assertEqual(insights.list_tasks(limit=None), [])
 
     def test_valid_empty_map_output_publishes_and_allows_backfill_progress(self) -> None:
