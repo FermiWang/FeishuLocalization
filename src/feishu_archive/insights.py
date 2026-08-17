@@ -843,8 +843,18 @@ def _validated_map_result(
                 valid = False
                 continue
             if kind in {"task_observations", "opportunity_signals"}:
-                if any(not _actionable_evidence(evidence_by_id[value]) for value in ids):
-                    valid = False
+                # The mapper only sees the chunk text, so it cannot tell which
+                # cited evidence is actionable (spam/trash mail, deleted or
+                # recalled chat, metadata-only wiki events). Instead of failing
+                # the whole chunk — which deterministically stalls a backfill
+                # day — strip inactionable citations and drop entries left
+                # with no evidence. Unknown IDs above still fail the chunk.
+                ids = [
+                    evidence_id
+                    for evidence_id in ids
+                    if _actionable_evidence(evidence_by_id[evidence_id])
+                ]
+                if not ids:
                     continue
             if not summary or not ids:
                 valid = False

@@ -821,6 +821,48 @@ class DailyInsightsTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(_validated_map_result(value, evidence), ([], False))
 
+    def test_map_inactionable_citations_are_stripped_not_fatal(self) -> None:
+        evidence = {
+            "chat:oc/om-ok": {
+                "source_kind": "chat",
+                "metadata": {},
+            },
+            "chat:oc/om-recalled": {
+                "source_kind": "chat",
+                "metadata": {"recalled": True},
+            },
+            "wiki:meta-only": {
+                "source_kind": "wiki",
+                "metadata": {"actionable": False},
+            },
+        }
+        value = {
+            "facts": [
+                {"summary": "存在一份仅元数据的知识库文档。", "evidence_ids": ["wiki:meta-only"]}
+            ],
+            "decisions": [],
+            "task_observations": [
+                {
+                    "summary": "继续跟进项目资料。",
+                    "evidence_ids": ["chat:oc/om-ok", "chat:oc/om-recalled"],
+                },
+                {
+                    "summary": "仅由元数据文档支撑的任务。",
+                    "evidence_ids": ["wiki:meta-only"],
+                },
+            ],
+            "opportunity_signals": [],
+        }
+        observations, valid = _validated_map_result(value, evidence)
+        self.assertTrue(valid)
+        self.assertEqual(
+            [(item["kind"], item["evidence_ids"]) for item in observations],
+            [
+                ("facts", ["wiki:meta-only"]),
+                ("task_observations", ["chat:oc/om-ok"]),
+            ],
+        )
+
     def test_model_report_is_evidence_validated_and_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))
