@@ -23,6 +23,15 @@ class VMLXError(RuntimeError):
     """A safe-to-display failure from the local vMLX client or tunnel."""
 
 
+class VMLXResponseError(VMLXError):
+    """The engine answered, but its response payload was not usable.
+
+    Distinct from transport-level failures (connect/timeout/HTTP status):
+    a response-level problem does not mean the engine is unhealthy, so
+    callers such as the backfill load gate must not latch closed on it.
+    """
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(
         self,
@@ -79,19 +88,19 @@ def _validated_base_url(value: str) -> str:
 
 def _json_object_from_content(content: str) -> dict[str, Any]:
     if not isinstance(content, str):
-        raise VMLXError("vMLX response content is not text")
+        raise VMLXResponseError("vMLX response content is not text")
     candidate = content.strip()
     if candidate.startswith("```"):
         match = re.fullmatch(r"```json[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```", candidate)
         if match is None:
-            raise VMLXError("vMLX response does not contain a single JSON object")
+            raise VMLXResponseError("vMLX response does not contain a single JSON object")
         candidate = match.group("body").strip()
     try:
         value = json.loads(candidate)
     except (json.JSONDecodeError, UnicodeError):
-        raise VMLXError("vMLX response does not contain valid JSON") from None
+        raise VMLXResponseError("vMLX response does not contain valid JSON") from None
     if not isinstance(value, dict):
-        raise VMLXError("vMLX response JSON must be an object")
+        raise VMLXResponseError("vMLX response JSON must be an object")
     return value
 
 
@@ -186,7 +195,7 @@ class VMLXClient:
                     except (TypeError, ValueError):
                         declared_length = None
                     if declared_length is not None and declared_length > self.max_response_bytes:
-                        raise VMLXError("vMLX response exceeded the configured size limit")
+                        raise VMLXResponseError("vMLX response exceeded the configured size limit")
                 raw = response.read(self.max_response_bytes + 1)
         except VMLXError:
             raise
@@ -206,15 +215,15 @@ class VMLXClient:
             # not copy arbitrary upstream exception text into a displayed error.
             raise VMLXError("vMLX request failed") from None
         if not isinstance(raw, bytes):
-            raise VMLXError("vMLX response body is invalid")
+            raise VMLXResponseError("vMLX response body is invalid")
         if len(raw) > self.max_response_bytes:
-            raise VMLXError("vMLX response exceeded the configured size limit")
+            raise VMLXResponseError("vMLX response exceeded the configured size limit")
         try:
             result = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise VMLXError("vMLX response is not valid JSON") from None
+            raise VMLXResponseError("vMLX response is not valid JSON") from None
         if not isinstance(result, dict):
-            raise VMLXError("vMLX response must be a JSON object")
+            raise VMLXResponseError("vMLX response must be a JSON object")
         return result
 
     def models(self) -> list[dict[str, Any]]:
@@ -270,16 +279,16 @@ class VMLXClient:
     def _content_from_completion(payload: Mapping[str, Any]) -> str:
         choices = payload.get("choices")
         if not isinstance(choices, list) or len(choices) != 1:
-            raise VMLXError("vMLX response must contain exactly one choice")
+            raise VMLXResponseError("vMLX response must contain exactly one choice")
         choice = choices[0]
         if not isinstance(choice, dict):
-            raise VMLXError("vMLX response choice is invalid")
+            raise VMLXResponseError("vMLX response choice is invalid")
         message = choice.get("message")
         if not isinstance(message, dict):
-            raise VMLXError("vMLX response choice has no message")
+            raise VMLXResponseError("vMLX response choice has no message")
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
-            raise VMLXError("vMLX response message has no text content")
+            raise VMLXResponseError("vMLX response message has no text content")
         return content
 
     def chat(

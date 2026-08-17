@@ -38,6 +38,7 @@ from feishu_archive.config import (
     MAIL_TOKEN_NAMESPACE,
 )
 from feishu_archive.backfill import load_backfill_state
+from feishu_archive.vmlx import VMLXResponseError
 from feishu_archive.database import ArchiveDatabase
 from feishu_archive.insights import (
     PROJECTION_VERSION,
@@ -171,6 +172,40 @@ class AppConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "load_gate_closed"):
                 gate.chat_json([], max_tokens=1, temperature=0.1)
         self.assertEqual(client.chat_calls, 0)
+
+    def test_backfill_load_gate_stays_open_after_response_payload_error(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.chat_calls = 0
+
+            def health(self):
+                return {
+                    "status": "healthy",
+                    "model_loaded": True,
+                    "model_name": "model",
+                    "last_request_time": time.time(),
+                    "scheduler": {"num_running": 0, "num_waiting": 0},
+                }
+
+            def chat_json(self, messages, *, max_tokens, temperature):
+                self.chat_calls += 1
+                if self.chat_calls == 1:
+                    raise VMLXResponseError("vMLX response does not contain valid JSON")
+                return {"ok": True}
+
+        client = Client()
+        gate = _LoadAwareBackfillClient(
+            client,
+            models=[{"id": "model"}],
+            requested_model="model",
+            stability_seconds=0,
+        )
+        with self.assertRaises(VMLXResponseError):
+            gate.chat_json([], max_tokens=1, temperature=0.1)
+        self.assertFalse(gate.blocked)
+        result = gate.chat_json([], max_tokens=2, temperature=0.1)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(client.chat_calls, 2)
 
     def test_backfill_load_gate_refuses_calls_past_window_budget(self) -> None:
         client = MagicMock()

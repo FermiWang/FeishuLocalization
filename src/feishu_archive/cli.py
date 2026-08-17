@@ -109,6 +109,7 @@ from .reader_auth import (
     enable_permanent_unlock,
 )
 from .sync import ArchiveSyncer
+from .vmlx import VMLXResponseError
 from .web import is_literal_loopback_host, is_loopback_host, serve
 from .wiki import WikiSyncer
 
@@ -1674,6 +1675,12 @@ class _LoadAwareBackfillClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+        except VMLXResponseError:
+            # The engine answered but its payload was unusable (e.g. truncated
+            # JSON at the max_tokens limit). The engine itself is healthy, so
+            # the gate stays open and _chat_json_with_token_retry can retry
+            # this call with a larger token budget.
+            raise
         except Exception:
             self.blocked = True
             raise
