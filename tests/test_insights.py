@@ -892,6 +892,31 @@ class DailyInsightsTests(unittest.TestCase):
             [("facts", ["chat:oc/om-ok"])],
         )
 
+    def test_map_drops_entries_without_summary_or_citations(self) -> None:
+        evidence = {
+            "chat:oc/om-ok": {
+                "source_kind": "chat",
+                "metadata": {},
+            },
+        }
+        value = {
+            "facts": [
+                {"summary": "正常条目。", "evidence_ids": ["chat:oc/om-ok"]},
+            ],
+            "decisions": [],
+            "task_observations": [],
+            "opportunity_signals": [
+                {"summary": "", "evidence_ids": ["chat:oc/om-ok"]},
+                {"summary": "没有引用的条目。", "evidence_ids": []},
+            ],
+        }
+        observations, valid = _validated_map_result(value, evidence)
+        self.assertTrue(valid)
+        self.assertEqual(
+            [(item["kind"], item["summary"]) for item in observations],
+            [("facts", "正常条目。")],
+        )
+
     def test_model_report_is_evidence_validated_and_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))

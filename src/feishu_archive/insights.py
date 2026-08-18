@@ -855,7 +855,7 @@ def _validated_map_result(
                 # recalled chat, metadata-only wiki events). Instead of failing
                 # the whole chunk — which deterministically stalls a backfill
                 # day — strip inactionable citations and drop entries left
-                # with no evidence. Unknown IDs above still fail the chunk.
+                # with no evidence.
                 ids = [
                     evidence_id
                     for evidence_id in ids
@@ -864,7 +864,9 @@ def _validated_map_result(
                 if not ids:
                     continue
             if not summary or not ids:
-                valid = False
+                # An entry without a summary, or whose citations were all
+                # stripped above, carries no auditable information. Drop it
+                # instead of failing the whole chunk.
                 continue
             cleaned = dict(item)
             cleaned.update(
