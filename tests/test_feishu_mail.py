@@ -405,6 +405,45 @@ class FeishuMailProviderTests(unittest.TestCase):
 
         self.assertTrue(response.closed)
 
+    def test_download_allows_tun_fake_ip_addresses(self) -> None:
+        client = ScriptedClient(lambda *args, **kwargs: {})
+        provider = FeishuMailProvider(client)  # type: ignore[arg-type]
+        url = "https://download.example.com/file"
+        response = FakeResponse(url, peer_ip="198.18.1.86")
+        opener = FakeOpener(response)
+        fake_ip_dns = [(2, 1, 6, "", ("198.18.1.86", 443))]
+
+        with patch(
+            "feishu_archive.feishu_mail.socket.getaddrinfo",
+            return_value=fake_ip_dns,
+        ), patch(
+            "feishu_archive.feishu_mail.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            result = provider.open_download_url(url)
+
+        self.assertEqual(result.read(), b"payload")
+        self.assertFalse(response.closed)
+
+    def test_download_still_rejects_rfc1918_peer_alongside_fake_ip_exemption(self) -> None:
+        client = ScriptedClient(lambda *args, **kwargs: {})
+        provider = FeishuMailProvider(client)  # type: ignore[arg-type]
+        url = "https://download.example.com/file"
+        response = FakeResponse(url, peer_ip="192.168.1.10")
+        opener = FakeOpener(response)
+        fake_ip_dns = [(2, 1, 6, "", ("198.18.1.86", 443))]
+
+        with patch(
+            "feishu_archive.feishu_mail.socket.getaddrinfo",
+            return_value=fake_ip_dns,
+        ), patch(
+            "feishu_archive.feishu_mail.urllib.request.build_opener",
+            return_value=opener,
+        ), self.assertRaisesRegex(FeishuAPIError, "连接到本机或私网"):
+            provider.open_download_url(url)
+
+        self.assertTrue(response.closed)
+
     def test_download_rejects_private_initial_url_dns_and_redirect(self) -> None:
         client = ScriptedClient(lambda *args, **kwargs: {})
         provider = FeishuMailProvider(client)  # type: ignore[arg-type]

@@ -28,6 +28,20 @@ MAIL_BATCH_GET_SIZE = 20
 MAIL_ATTACHMENT_URL_BATCH_SIZE = 20
 MAIL_MESSAGE_FORMATS = {"metadata", "plain_text_full", "full"}
 
+# RFC 2544 benchmarking range. TUN-mode proxies (Clash fake-ip and similar)
+# hand out these addresses for remote domains; the address is only routable
+# while such a proxy intercepts it and can never reach loopback or LAN space,
+# so it is exempt from the attachment SSRF guard.
+_TUN_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _is_forbidden_attachment_ip(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    if address in _TUN_FAKE_IP_NETWORK:
+        return False
+    return not address.is_global
+
 class FeishuMailProvider:
     """Read-only Feishu Mail v1 adapter using the OAuth user's access token."""
 
@@ -489,7 +503,7 @@ class FeishuMailProvider:
         except ValueError:
             literal = None
         if literal is not None:
-            if not literal.is_global:
+            if _is_forbidden_attachment_ip(literal):
                 raise FeishuAPIError("拒绝访问本机或私网邮件附件 URL")
             return
         if not resolve:
@@ -511,7 +525,7 @@ class FeishuMailProvider:
                 resolved_ip = ipaddress.ip_address(raw_ip)
             except ValueError as exc:
                 raise FeishuAPIError("邮件附件下载域名解析结果无效") from exc
-            if not resolved_ip.is_global:
+            if _is_forbidden_attachment_ip(resolved_ip):
                 raise FeishuAPIError("拒绝访问解析到本机或私网的邮件附件 URL")
 
     @staticmethod
@@ -530,7 +544,7 @@ class FeishuMailProvider:
         except ValueError as exc:
             response.close()
             raise FeishuAPIError("邮件附件连接的远端地址无效") from exc
-        if not address.is_global:
+        if _is_forbidden_attachment_ip(address):
             response.close()
             raise FeishuAPIError("拒绝访问连接到本机或私网的邮件附件 URL")
 
