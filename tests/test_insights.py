@@ -1244,6 +1244,36 @@ class DailyInsightsTests(unittest.TestCase):
         )
         self.assertEqual(validated["commercial_opportunities"], [])
 
+    def test_reducer_unknown_citations_are_stripped_not_fatal(self) -> None:
+        evidence_by_id = {
+            "chat:oc/om-ok": {
+                "source_kind": "chat",
+                "metadata": {},
+                "citation": "聊天 项目群",
+            },
+        }
+        value = {
+            "yesterday_summary": [
+                {
+                    "summary": "部分引用系模型拼接的幻觉 ID。",
+                    "evidence_ids": ["chat:oc/om-ok", "chat:oc/om-hallucinated"],
+                },
+                {
+                    "summary": "仅引用幻觉 ID 的条目被整体丢弃。",
+                    "evidence_ids": ["chat:oc/om-hallucinated"],
+                },
+            ],
+            "today_plan": [],
+            "commercial_opportunities": [],
+        }
+
+        validated = _validated_reducer_report(value, evidence_by_id)
+
+        self.assertEqual(len(validated["yesterday_summary"]), 1)
+        self.assertEqual(
+            validated["yesterday_summary"][0]["evidence_ids"], ["chat:oc/om-ok"]
+        )
+
     def test_chat_json_token_retry_on_truncated_json(self) -> None:
         from feishu_archive.insights import (
             _OUTPUT_TOKEN_RETRY_BUDGET,

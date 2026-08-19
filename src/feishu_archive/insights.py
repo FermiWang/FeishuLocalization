@@ -776,8 +776,20 @@ def _validated_reducer_report(
             if not isinstance(raw_ids, list) or not raw_ids:
                 raise InsightsError(f"Reducer 字段 {field} 缺少证据数组")
             ids = [str(evidence_id) for evidence_id in raw_ids]
-            if any(evidence_id not in evidence_by_id for evidence_id in ids):
-                raise InsightsError(f"Reducer 字段 {field} 引用了未见证据")
+            known_ids = [
+                evidence_id for evidence_id in ids if evidence_id in evidence_by_id
+            ]
+            if len(known_ids) != len(ids):
+                # The reducer occasionally composes a plausible-looking ID from
+                # identifiers visible in the observation JSON. That failure is
+                # deterministic at low temperature and stalls the backfill day,
+                # so strip unknown citations and drop entries left with no
+                # evidence instead of failing the whole Reduce (same policy as
+                # the mapper since 099c552).
+                if not known_ids:
+                    continue
+                ids = known_ids
+                item = {**item, "evidence_ids": ids}
             if field in {"today_plan", "commercial_opportunities"}:
                 # The reducer only sees the observation JSON, so it cannot tell
                 # which cited evidence is actionable (spam/trash mail, deleted
