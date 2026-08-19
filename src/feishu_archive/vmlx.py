@@ -86,6 +86,25 @@ def _validated_base_url(value: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme.lower(), authority, path, "", ""))
 
 
+def _loads_with_missing_comma_repair(candidate: str) -> Any:
+    """Parse JSON, tolerating the most common model defect: a missing comma.
+
+    The strict parser reports exactly where a comma was expected, so
+    inserting one there cannot change the meaning of well-formed content;
+    it only rescues otherwise-valid replies.  The repair budget is bounded
+    so genuinely malformed content still fails.
+    """
+    repairs = 0
+    while True:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            if exc.msg != "Expecting ',' delimiter" or repairs >= 8:
+                raise
+            candidate = candidate[: exc.pos] + "," + candidate[exc.pos :]
+            repairs += 1
+
+
 def _json_object_from_content(content: str) -> dict[str, Any]:
     if not isinstance(content, str):
         raise VMLXResponseError("vMLX response content is not text")
@@ -96,7 +115,7 @@ def _json_object_from_content(content: str) -> dict[str, Any]:
             raise VMLXResponseError("vMLX response does not contain a single JSON object")
         candidate = match.group("body").strip()
     try:
-        value = json.loads(candidate)
+        value = _loads_with_missing_comma_repair(candidate)
     except (json.JSONDecodeError, UnicodeError):
         raise VMLXResponseError("vMLX response does not contain valid JSON") from None
     if not isinstance(value, dict):

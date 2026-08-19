@@ -164,6 +164,41 @@ class VMLXClientTests(unittest.TestCase):
                     [{"role": "user", "content": "test"}]
                 )
 
+    def test_chat_json_repairs_missing_commas(self) -> None:
+        content = (
+            '{\n  "facts": [\n    {"summary": "a"\n      "evidence_ids": ["e1"]}\n  ]\n'
+            '  "decisions": []\n}'
+        )
+        opener = RecordingOpener(
+            FakeResponse(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+        )
+        result = VMLXClient("http://127.0.0.1:11435", opener=opener).chat_json(
+            [{"role": "user", "content": "test"}]
+        )
+        self.assertEqual(result["facts"][0]["evidence_ids"], ["e1"])
+        self.assertEqual(result["decisions"], [])
+
+    def test_chat_json_comma_repair_is_syntax_specific_and_bounded(self) -> None:
+        # A missing colon is a different defect and must still fail.
+        opener = RecordingOpener(
+            FakeResponse(
+                json.dumps({"choices": [{"message": {"content": '{"a" 1}'}}]}).encode()
+            )
+        )
+        with self.assertRaises(VMLXError):
+            VMLXClient("http://127.0.0.1:11435", opener=opener).chat_json(
+                [{"role": "user", "content": "test"}]
+            )
+        # More missing commas than the repair budget must still fail.
+        content = "[" + " ".join(f'"{index}"' for index in range(12)) + "]"
+        opener = RecordingOpener(
+            FakeResponse(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+        )
+        with self.assertRaises(VMLXError):
+            VMLXClient("http://127.0.0.1:11435", opener=opener).chat_json(
+                [{"role": "user", "content": "test"}]
+            )
+
     def test_response_limit_and_http_errors_do_not_expose_body_or_token(self) -> None:
         oversized = RecordingOpener(FakeResponse(b"x" * 9, content_length="9"))
         with self.assertRaisesRegex(VMLXError, "size limit"):
