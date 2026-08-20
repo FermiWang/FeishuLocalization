@@ -31,6 +31,7 @@ from feishu_archive.config import (
     DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS,
     DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
     DEFAULT_SCOPES,
@@ -416,7 +417,15 @@ class AppConfigTests(unittest.TestCase):
                 None,
             ],
         )
-        self.assertEqual(sleeps, [DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS])
+        self.assertEqual(
+            sleeps,
+            [
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
+            ],
+        )
 
     def test_backfill_loop_waits_and_keeps_full_idle_after_external_activity(self) -> None:
         outcomes = [
@@ -446,6 +455,7 @@ class AppConfigTests(unittest.TestCase):
             [
                 DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
                 DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
+                DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
             ],
         )
 

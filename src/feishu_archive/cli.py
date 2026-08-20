@@ -37,6 +37,7 @@ from .config import (
     DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS,
     DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
+    DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_MAX_STEP_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_MIN_IDLE_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_START_HOUR,
@@ -1489,6 +1490,7 @@ def _run_insights_backfill_loop(
             # the full idle threshold for the next model-backed step.
             consecutive_errors = 0
             continuation = False
+            time.sleep(DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS)
             continue
         if outcome in {"covered_by_daily", "reused"} or (
             outcome == "success" and last_outcome == "empty"
@@ -1496,6 +1498,7 @@ def _run_insights_backfill_loop(
             # Completed without occupying the engine.
             consecutive_errors = 0
             continuation = False
+            time.sleep(DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS)
             continue
         if outcome == "success" or (
             outcome == "deferred" and reason == "scheduled_step_budget_exhausted"
@@ -1504,6 +1507,7 @@ def _run_insights_backfill_loop(
             # enough before submitting the next date.
             consecutive_errors = 0
             continuation = True
+            time.sleep(DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS)
             continue
         if outcome == "complete":
             consecutive_errors = 0

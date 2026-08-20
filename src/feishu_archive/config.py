@@ -35,6 +35,10 @@ DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS = 10
 DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS = 30
 DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS = 300
 DEFAULT_INSIGHTS_BACKFILL_LOOP_ERROR_SECONDS = 60
+# Between back-to-back steps the lock is free only for microseconds, so the
+# scheduled daily lane (polling every 15s) would starve. Yield the lock for
+# longer than that poll interval before immediately continuing.
+DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS = 20
 # After this many consecutive step errors the loop exits and lets launchd
 # apply ThrottleInterval before restarting it.
 DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS = 10
