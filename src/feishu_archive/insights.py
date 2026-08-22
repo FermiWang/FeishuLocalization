@@ -669,6 +669,44 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# On very dense days the reducer's reply grows with the observation count and
+# the 27B model stops mid-document no matter how large the token budget is.
+# After the full input fails twice, retry with a compacted input that keeps
+# every actionable observation and caps facts. This is an execution detail and
+# intentionally not part of the analysis identity, so adopting it does not
+# restart an in-flight backfill campaign.
+_REDUCE_COMPACT_MAX_OBSERVATIONS = 80
+
+
+def _compact_reduce_observations(
+    observations: list[dict[str, Any]], *, limit: int
+) -> list[dict[str, Any]]:
+    """Cap dense-day facts so the reducer reply fits the model's output budget.
+
+    Actionable kinds (decisions, task_observations, opportunity_signals) are
+    always kept; facts are trimmed by confidence (ties keep input order) and
+    the result preserves the original ordering.
+    """
+    if len(observations) <= limit:
+        return observations
+    fact_indexes = [
+        index
+        for index, observation in enumerate(observations)
+        if observation.get("kind") == "facts"
+    ]
+    slots = max(0, limit - (len(observations) - len(fact_indexes)))
+    ranked = sorted(
+        fact_indexes,
+        key=lambda index: (-_confidence(observations[index].get("confidence")), index),
+    )
+    kept = set(ranked[:slots])
+    return [
+        observation
+        for index, observation in enumerate(observations)
+        if observation.get("kind") != "facts" or index in kept
+    ]
+
+
 def _reduce_report(
     client: Any,
     observations: list[dict[str, Any]],
@@ -688,32 +726,45 @@ def _reduce_report(
         for evidence_id in reducer_evidence_ids
         if evidence_id in evidence_by_id
     }
-    messages = [
-        {"role": "system", "content": REDUCE_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(observations, ensure_ascii=False)},
-    ]
     failure_codes: list[str] = []
-    for attempt in range(2):
-        try:
-            value = _chat_json_with_token_retry(
-                client,
-                messages,
-                max_tokens=max_tokens,
-                temperature=0.1,
-            )
-            report = _validated_reducer_report(value, reducer_evidence_by_id)
-            if failure_codes:
-                report["reduce_retries"] = len(failure_codes)
-            return report
-        except Exception as exc:
-            failure_codes.append(_reduce_failure_code(exc))
-            if attempt == 0:
-                # One corrective retry: restate the structural contract without
-                # echoing any model output or archive content back.
-                messages = [
-                    *messages,
-                    {"role": "user", "content": REDUCE_RETRY_USER_PROMPT},
-                ]
+    inputs = [observations]
+    if len(observations) > _REDUCE_COMPACT_MAX_OBSERVATIONS:
+        compacted = _compact_reduce_observations(
+            observations, limit=_REDUCE_COMPACT_MAX_OBSERVATIONS
+        )
+        if len(compacted) < len(observations):
+            inputs.append(compacted)
+    for index, current in enumerate(inputs):
+        messages = [
+            {"role": "system", "content": REDUCE_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(current, ensure_ascii=False)},
+        ]
+        for attempt in range(2):
+            try:
+                value = _chat_json_with_token_retry(
+                    client,
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=0.1,
+                )
+                report = _validated_reducer_report(value, reducer_evidence_by_id)
+                if failure_codes:
+                    report["reduce_retries"] = len(failure_codes)
+                if index > 0:
+                    report["reduce_compaction"] = {
+                        "input_observations": len(observations),
+                        "used_observations": len(current),
+                    }
+                return report
+            except Exception as exc:
+                failure_codes.append(_reduce_failure_code(exc))
+                if attempt == 0:
+                    # One corrective retry: restate the structural contract without
+                    # echoing any model output or archive content back.
+                    messages = [
+                        *messages,
+                        {"role": "user", "content": REDUCE_RETRY_USER_PROMPT},
+                    ]
     fallback = deterministic_report(source, model_status="partial")
     fallback["degraded_reason"] = "综合归纳失败；保留确定性统计"
     fallback["reduce_failure"] = {

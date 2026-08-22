@@ -11,10 +11,12 @@ from feishu_archive.insights import (
     REDUCE_RETRY_USER_PROMPT,
     InsightsError,
     InsightsRunOptions,
+    _compact_reduce_observations,
     _due_at_ms,
     _merge_carryover_tasks,
     _persist_validated_observations,
     _reduce_failure_code,
+    _reduce_report,
     _validate_cached_observations,
     _validated_map,
     _validated_map_result,
@@ -26,6 +28,7 @@ from feishu_archive.insights import (
 from feishu_archive.insights_database import InsightsDatabase
 from feishu_archive.insights_sources import calendar_day_window
 from feishu_archive.mail_database import MailDatabase
+from feishu_archive.vmlx import VMLXResponseError
 
 
 class FakeJSONClient:
@@ -1191,6 +1194,80 @@ class DailyInsightsTests(unittest.TestCase):
                     "SELECT stats_json FROM analysis_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
             self.assertEqual(json.loads(row["stats_json"])["reduce_retries"], 1)
+
+    def test_compact_reduce_observations_keeps_actionable_and_caps_facts(self) -> None:
+        observations = [
+            {"kind": "facts", "confidence": 0.5, "summary": f"事实{index}"}
+            for index in range(100)
+        ] + [
+            {"kind": "decisions", "confidence": 0.6, "summary": "决定"},
+            {"kind": "task_observations", "confidence": 0.9, "summary": "待办"},
+        ]
+        compacted = _compact_reduce_observations(observations, limit=80)
+        self.assertEqual(len(compacted), 80)
+        self.assertEqual(
+            [item["kind"] for item in compacted[-2:]], ["decisions", "task_observations"]
+        )
+        small = [{"kind": "facts", "confidence": 0.5}] * 10
+        self.assertIs(_compact_reduce_observations(small, limit=80), small)
+
+    def test_reduce_compacts_dense_observations_after_full_input_fails(self) -> None:
+        observations = [
+            {
+                "kind": "facts",
+                "summary": f"事实{index}",
+                "evidence_ids": [f"e{index}"],
+                "confidence": 0.5,
+            }
+            for index in range(100)
+        ] + [
+            {
+                "kind": "task_observations",
+                "summary": "待办事项",
+                "action": "跟进项目资料",
+                "status": "open",
+                "evidence_ids": ["et"],
+                "confidence": 0.9,
+            }
+        ]
+        evidence_by_id = {
+            f"e{index}": {"source_kind": "chat", "metadata": {}} for index in range(100)
+        }
+        evidence_by_id["et"] = {"source_kind": "chat", "metadata": {}}
+
+        class DenseDayClient:
+            def __init__(self) -> None:
+                self.input_sizes: list[int] = []
+
+            def chat_json(self, messages, *, max_tokens, temperature):
+                payload = json.loads(messages[1]["content"])
+                self.input_sizes.append(len(payload))
+                if len(payload) > 80:
+                    raise VMLXResponseError("vMLX response does not contain valid JSON")
+                return {
+                    "yesterday_summary": [
+                        {"summary": "事实汇总", "evidence_ids": ["e0"], "confidence": 0.9}
+                    ],
+                    "today_plan": [
+                        {
+                            "summary": "跟进项目资料",
+                            "category": "committed",
+                            "evidence_ids": ["et"],
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "commercial_opportunities": [],
+                }
+
+        client = DenseDayClient()
+        report = _reduce_report(client, observations, evidence_by_id, {}, 4096)
+        self.assertEqual(report["yesterday_summary"][0]["summary"], "事实汇总")
+        self.assertEqual(report["reduce_retries"], 2)
+        self.assertEqual(
+            report["reduce_compaction"],
+            {"input_observations": 101, "used_observations": 80},
+        )
+        self.assertEqual(client.input_sizes, [101, 101, 101, 101, 80])
 
     def test_reducer_inactionable_citations_are_stripped_not_fatal(self) -> None:
         evidence_by_id = {
