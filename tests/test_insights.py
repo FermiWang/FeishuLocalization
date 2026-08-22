@@ -1262,12 +1262,14 @@ class DailyInsightsTests(unittest.TestCase):
         client = DenseDayClient()
         report = _reduce_report(client, observations, evidence_by_id, {}, 4096)
         self.assertEqual(report["yesterday_summary"][0]["summary"], "事实汇总")
-        self.assertEqual(report["reduce_retries"], 2)
+        self.assertEqual(report["reduce_retries"], 1)
         self.assertEqual(
             report["reduce_compaction"],
             {"input_observations": 101, "used_observations": 80},
         )
-        self.assertEqual(client.input_sizes, [101, 101, 101, 101, 80])
+        # One full-input attempt (plus its internal token-budget retry), then
+        # the compacted input succeeds on its first attempt.
+        self.assertEqual(client.input_sizes, [101, 101, 80])
 
     def test_reducer_inactionable_citations_are_stripped_not_fatal(self) -> None:
         evidence_by_id = {

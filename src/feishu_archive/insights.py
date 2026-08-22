@@ -739,7 +739,11 @@ def _reduce_report(
             {"role": "system", "content": REDUCE_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(current, ensure_ascii=False)},
         ]
-        for attempt in range(2):
+        # Dense days fall through to the compacted input anyway; spending the
+        # corrective retry on the full input would blow the backfill step's
+        # time budget before the compacted attempt gets admitted.
+        attempts = 1 if index == 0 and len(inputs) > 1 else 2
+        for attempt in range(attempts):
             try:
                 value = _chat_json_with_token_retry(
                     client,
@@ -758,7 +762,7 @@ def _reduce_report(
                 return report
             except Exception as exc:
                 failure_codes.append(_reduce_failure_code(exc))
-                if attempt == 0:
+                if attempt == 0 and attempts > 1:
                     # One corrective retry: restate the structural contract without
                     # echoing any model output or archive content back.
                     messages = [
