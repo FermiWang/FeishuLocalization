@@ -17,6 +17,7 @@ from .config import (
     DEFAULT_MAX_ATTACHMENT_BYTES,
     MAX_SINGLE_ATTACHMENT_BYTES,
     ArchivePaths,
+    resolve_archive_resource_path,
 )
 from .database import ArchiveDatabase
 
@@ -55,7 +56,7 @@ SUPPORTED_METADATA_ONLY_TYPES = {
     "board",
     "file",
 }
-WIKI_RENDER_VERSION = "3"
+WIKI_RENDER_VERSION = "4"
 
 
 @dataclass
@@ -313,7 +314,7 @@ class WikiSyncer:
                 "content_text": raw_content or "\n".join(block_text(item) for item in blocks),
                 "rendered_html": rendered,
                 "content_sha256": content_hash,
-                "local_export_path": str(export_path),
+                "local_export_path": str(export_path.relative_to(self.paths.root)),
                 "status": "synced",
                 "last_synced_at": int(time.time() * 1000),
                 "raw_json": metadata,
@@ -422,7 +423,7 @@ class WikiSyncer:
             if self.database.update_wiki_rendered_view(
                 obj_token,
                 rendered,
-                local_export_path=str(export_path),
+                local_export_path=str(export_path.relative_to(self.paths.root)),
             ):
                 updated += 1
         self.database.set_metadata("wiki_render_version", WIKI_RENDER_VERSION)
@@ -451,7 +452,11 @@ class WikiSyncer:
             filename=filename,
         )
         existing = self.database.get_wiki_asset(asset_id) or {}
-        local_path = Path(str(existing.get("local_path") or ""))
+        local_path = resolve_archive_resource_path(
+            self.paths.root,
+            str(existing.get("local_path") or ""),
+            legacy_anchor=("knowledge", "assets"),
+        )
         if existing.get("status") == "downloaded" and local_path.is_file():
             return asset_id, False
         if self.database.wiki_asset_bytes() >= self.max_asset_bytes:
@@ -510,7 +515,7 @@ class WikiSyncer:
                 mime_type=mime_type or mimetypes.guess_type(response_filename or "")[0],
                 byte_size=written,
                 sha256=sha256,
-                local_path=str(destination),
+                local_path=str(destination.relative_to(self.paths.root)),
                 status="downloaded",
                 error=None,
                 downloaded_at=int(time.time() * 1000),
@@ -534,10 +539,16 @@ class WikiSyncer:
         destination = self.paths.knowledge_exports / f"{_safe_token(obj_token)}.html"
         export_rendered = rendered
         for asset in self.database.list_wiki_assets(obj_token):
-            local_path = Path(str(asset.get("local_path") or ""))
+            local_path = resolve_archive_resource_path(
+                self.paths.root,
+                str(asset.get("local_path") or ""),
+                legacy_anchor=("knowledge", "assets"),
+            )
             if asset.get("status") != "downloaded" or not local_path.is_file():
                 continue
-            relative = Path(os.path.relpath(local_path, destination.parent)).as_posix()
+            relative = Path(
+                os.path.relpath(local_path, destination.parent.resolve())
+            ).as_posix()
             export_rendered = export_rendered.replace(
                 f'/api/wiki/assets/{asset["id"]}',
                 html.escape(relative, quote=True),

@@ -20,6 +20,7 @@ INSIGHTS_BACKFILL_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_BACKFILL_LABE
 PYTHON_BIN=$(command -v python3)
 INSIGHTS_BACKFILL_INTERVAL_SECONDS=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS; print(DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS)')
 USER_DOMAIN="gui/$(id -u)"
+INSTALL_INSIGHTS=""
 STAGING_DIR=""
 BACKUP_DIR=""
 TEMP_SERVICE_PLIST=""
@@ -30,6 +31,38 @@ TEMP_INSIGHTS_PLIST=""
 TEMP_INSIGHTS_BACKFILL_PLIST=""
 SERVICES_STOPPED=0
 INSTALL_COMPLETE=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/install-local.sh [--with-insights|--without-insights]
+
+  --with-insights     Install and immediately start daily Insights and backfill.
+  --without-insights  Install only reader, chat, Wiki, and Mail services.
+
+With no option, a new installation defaults to core-only. An existing
+installation preserves whether Insights is already installed.
+EOF
+}
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 2
+fi
+if [ "$#" -eq 1 ]; then
+  case "$1" in
+    --with-insights) INSTALL_INSIGHTS=1 ;;
+    --without-insights) INSTALL_INSIGHTS=0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+fi
+if [ -z "$INSTALL_INSIGHTS" ]; then
+  if [ -f "$INSIGHTS_PLIST_PATH" ] || [ -f "$INSIGHTS_BACKFILL_PLIST_PATH" ]; then
+    INSTALL_INSIGHTS=1
+  else
+    INSTALL_INSIGHTS=0
+  fi
+fi
 
 restore_plist() {
   backup_name=$1
@@ -165,16 +198,25 @@ chmod 600 "$ARCHIVE_DIR/archive.sqlite3"
 if [ -f "$ARCHIVE_DIR/mail.sqlite3" ]; then
   chmod 600 "$ARCHIVE_DIR/mail.sqlite3"
 fi
-"$RUNTIME_DIR/bin/feishu-archive" --archive-dir "$ARCHIVE_DIR" insights-status >/dev/null
-chmod 600 "$ARCHIVE_DIR/insights.sqlite3"
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  "$RUNTIME_DIR/bin/feishu-archive" --archive-dir "$ARCHIVE_DIR" insights-status >/dev/null
+  chmod 600 "$ARCHIVE_DIR/insights.sqlite3"
+elif [ -f "$ARCHIVE_DIR/insights.sqlite3" ]; then
+  chmod 600 "$ARCHIVE_DIR/insights.sqlite3"
+fi
 
 TEMP_SERVICE_PLIST=$(mktemp)
 TEMP_SYNC_PLIST=$(mktemp)
 TEMP_WIKI_SYNC_PLIST=$(mktemp)
 TEMP_MAIL_SYNC_PLIST=$(mktemp)
-TEMP_INSIGHTS_PLIST=$(mktemp)
-TEMP_INSIGHTS_BACKFILL_PLIST=$(mktemp)
-rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MAIL_SYNC_PLIST" "$TEMP_INSIGHTS_PLIST" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  TEMP_INSIGHTS_PLIST=$(mktemp)
+  TEMP_INSIGHTS_BACKFILL_PLIST=$(mktemp)
+fi
+rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MAIL_SYNC_PLIST"
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  rm -f "$TEMP_INSIGHTS_PLIST" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+fi
 
 /usr/libexec/PlistBuddy -c "Add :Label string $SERVICE_LABEL" "$TEMP_SERVICE_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$TEMP_SERVICE_PLIST"
@@ -258,6 +300,7 @@ rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MA
 /usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/mail-sync.log" "$TEMP_MAIL_SYNC_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/mail-sync.error.log" "$TEMP_MAIL_SYNC_PLIST"
 
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
 /usr/libexec/PlistBuddy -c "Add :Label string $INSIGHTS_LABEL" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $RUNTIME_DIR/bin/feishu-archive" "$TEMP_INSIGHTS_PLIST"
@@ -302,31 +345,42 @@ rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MA
 /usr/libexec/PlistBuddy -c "Add :Umask integer 63" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/insights-backfill.log" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/insights-backfill.error.log" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+fi
 
 plutil -lint "$TEMP_SERVICE_PLIST" >/dev/null
 plutil -lint "$TEMP_SYNC_PLIST" >/dev/null
 plutil -lint "$TEMP_WIKI_SYNC_PLIST" >/dev/null
 plutil -lint "$TEMP_MAIL_SYNC_PLIST" >/dev/null
-plutil -lint "$TEMP_INSIGHTS_PLIST" >/dev/null
-plutil -lint "$TEMP_INSIGHTS_BACKFILL_PLIST" >/dev/null
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  plutil -lint "$TEMP_INSIGHTS_PLIST" >/dev/null
+  plutil -lint "$TEMP_INSIGHTS_BACKFILL_PLIST" >/dev/null
+fi
 install -m 600 "$TEMP_SERVICE_PLIST" "$SERVICE_PLIST_PATH"
 install -m 600 "$TEMP_SYNC_PLIST" "$SYNC_PLIST_PATH"
 install -m 600 "$TEMP_WIKI_SYNC_PLIST" "$WIKI_SYNC_PLIST_PATH"
 install -m 600 "$TEMP_MAIL_SYNC_PLIST" "$MAIL_SYNC_PLIST_PATH"
-install -m 600 "$TEMP_INSIGHTS_PLIST" "$INSIGHTS_PLIST_PATH"
-install -m 600 "$TEMP_INSIGHTS_BACKFILL_PLIST" "$INSIGHTS_BACKFILL_PLIST_PATH"
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  install -m 600 "$TEMP_INSIGHTS_PLIST" "$INSIGHTS_PLIST_PATH"
+  install -m 600 "$TEMP_INSIGHTS_BACKFILL_PLIST" "$INSIGHTS_BACKFILL_PLIST_PATH"
+else
+  rm -f "$INSIGHTS_PLIST_PATH" "$INSIGHTS_BACKFILL_PLIST_PATH"
+fi
 
 launchctl enable "$USER_DOMAIN/$SERVICE_LABEL"
 launchctl enable "$USER_DOMAIN/$SYNC_LABEL"
 launchctl enable "$USER_DOMAIN/$WIKI_SYNC_LABEL"
 launchctl enable "$USER_DOMAIN/$MAIL_SYNC_LABEL"
-launchctl enable "$USER_DOMAIN/$INSIGHTS_LABEL"
-launchctl enable "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL"
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  launchctl enable "$USER_DOMAIN/$INSIGHTS_LABEL"
+  launchctl enable "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL"
+fi
 launchctl bootstrap "$USER_DOMAIN" "$SERVICE_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$SYNC_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$WIKI_SYNC_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$MAIL_SYNC_PLIST_PATH"
-launchctl bootstrap "$USER_DOMAIN" "$INSIGHTS_PLIST_PATH"
+if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+  launchctl bootstrap "$USER_DOMAIN" "$INSIGHTS_PLIST_PATH"
+fi
 
 ATTEMPT=0
 while [ "$ATTEMPT" -lt 20 ]; do
@@ -335,13 +389,18 @@ while [ "$ATTEMPT" -lt 20 ]; do
     && launchctl print "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 \
     && launchctl print "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 \
     && launchctl print "$USER_DOMAIN/$MAIL_SYNC_LABEL" >/dev/null 2>&1 \
-    && launchctl print "$USER_DOMAIN/$INSIGHTS_LABEL" >/dev/null 2>&1; then
+    && { [ "$INSTALL_INSIGHTS" -eq 0 ] || launchctl print "$USER_DOMAIN/$INSIGHTS_LABEL" >/dev/null 2>&1; }; then
     # Start the mutating backfill agent only after the reader and all existing
     # scheduled lanes have passed deployment health checks. Until this point a
     # failed install can roll back code/plists without new-version data writes.
-    launchctl bootstrap "$USER_DOMAIN" "$INSIGHTS_BACKFILL_PLIST_PATH"
-    launchctl print "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL" >/dev/null 2>&1
-    launchctl kickstart "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL"
+    if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+      launchctl bootstrap "$USER_DOMAIN" "$INSIGHTS_BACKFILL_PLIST_PATH"
+      launchctl print "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL" >/dev/null 2>&1
+      launchctl kickstart "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL"
+    else
+      launchctl disable "$USER_DOMAIN/$INSIGHTS_LABEL"
+      launchctl disable "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL"
+    fi
     INSTALL_COMPLETE=1
     echo "Feishu Archive 已部署：http://127.0.0.1:8765"
     echo "档案目录：$ARCHIVE_DIR"
@@ -349,8 +408,12 @@ while [ "$ATTEMPT" -lt 20 ]; do
     echo "每日同步：${SYNC_LABEL}（每天 03:30）"
     echo "知识库同步：${WIKI_SYNC_LABEL}（每天 03:45）"
     echo "邮箱同步：${MAIL_SYNC_LABEL}（每天 04:00；未授权时安全跳过，不影响其他通道）"
-    echo "每日洞察：${INSIGHTS_LABEL}（每天 04:30，失败时 05:00/05:30 断点重试）"
-    echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（全天候，启动时及每 ${INSIGHTS_BACKFILL_INTERVAL_SECONDS} 秒尝试一个受控步骤）"
+    if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
+      echo "每日洞察：${INSIGHTS_LABEL}（每天 04:30，失败时 05:00/05:30 断点重试）"
+      echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（全天候，启动时及每 ${INSIGHTS_BACKFILL_INTERVAL_SECONDS} 秒尝试一个受控步骤）"
+    else
+      echo "每日洞察与历史回填：未安装；验证模型和数据边界后使用 --with-insights 启用。"
+    fi
     exit 0
   fi
   ATTEMPT=$((ATTEMPT + 1))

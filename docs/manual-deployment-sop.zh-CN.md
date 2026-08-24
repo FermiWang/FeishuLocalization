@@ -1,17 +1,17 @@
-# FeishuLocalization（Feishu Archive）手工部署与飞书配置作业指导书（SOP V1.1）
+# FeishuLocalization（Feishu Archive）手工部署与飞书配置作业指导书（SOP V1.2）
 
 **文件性质：** 普通用户手工部署与配置标准作业指导书
 **适用项目：** FermiWang/FeishuLocalization
 **项目程序名称：** Feishu Archive
-**文档版本：** V1.1
-**适用源码基线：** Feishu Archive v0.5.3 / Git commit [`4ba312d8c6918875fbc78b2a110ed62c07a849e5`](https://github.com/FermiWang/FeishuLocalization/commit/4ba312d8c6918875fbc78b2a110ed62c07a849e5)
+**文档版本：** V1.2
+**适用源码基线：** Feishu Archive v0.5.4 / 与本文位于同一 Git commit（在 GitHub 文档页面通过“History”查看，或安装后执行 `git rev-parse HEAD` 记录）
 **核验日期：** 2026年8月24日
 **编制日期：** 2026年8月24日
 **适用对象：** 不具备 Python、Git、服务器运维经验的普通飞书用户
 **推荐运行平台：** macOS
 **目标：** 不依赖 Codex 自动部署，由普通用户通过复制命令、飞书网页配置和少量本机操作，部署上述源码基线中已经实现的功能，并明确飞书 OpenAPI、租户策略和当前适配范围造成的边界。
 
-> **版本提示：** GitHub `main` 会继续变化。本文中的默认时区、模型、端口、计划任务频率和命令均以以上 commit 为准。升级源码后，应重新核对 README、`./bin/feishu-archive --help`、`src/feishu_archive/config.py` 和 `scripts/install-local.sh`，不能把本文当作以后所有版本都不变的说明。
+> **版本提示：** GitHub `main` 会继续变化。本文中的默认时区、模型、端口、计划任务频率和命令均以本文所在 commit 为准。升级源码后，应重新核对 README、`./bin/feishu-archive --help`、`src/feishu_archive/config.py` 和 `scripts/install-local.sh`，不能把本文当作以后所有版本都不变的说明。
 
 ---
 
@@ -22,8 +22,8 @@
 1. 第一至第三阶段：准备 Mac、安装 Python、验证演示阅读器；
 2. 第四至第十六阶段：配置飞书主应用和可选的邮箱独立应用；
 3. 第十七至第二十五阶段：完成首次聊天、知识库、邮箱同步和阅读器验收；
-4. 第二十六至第二十七阶段：安装并验证后台任务；
-5. 第二十八阶段以后：按需配置 vMLX Insights、回填、备份和升级。
+4. 第二十六至第二十七阶段：只安装并验证不调用 AI 的核心后台任务；
+5. 第二十八阶段以后：按需配置并人工验证 vMLX Insights，再显式启用自动洞察和历史回填，最后完成备份与升级准备。
 
 只需要归档功能、不需要 AI 的用户，完成第二十七阶段即可。附录 A 是部署完成后的命令速查卡，不能代替前面的权限、边界和安全说明。
 
@@ -61,7 +61,7 @@ Feishu Archive 是一个**本地优先的飞书离线归档系统**。它通过�
 | Thread/话题回复 | 支持 |
 | 消息编辑/删除状态保存 | 支持 |
 | 图片归档与显示 | 支持 |
-| 普通文件归档 | 支持，但受飞书接口条件限制 |
+| 普通文件归档 | 其他人或机器人发送的文件支持；本人发送的普通文件当前只保留消息和资源元数据，不保存文件本体 |
 | 聊天全文搜索 | 支持，SQLite FTS5 |
 | 单会话 JSON 导出 | 支持 |
 | 单会话自包含 HTML 导出 | 支持消息文字和样式；不嵌入图片/附件 |
@@ -134,7 +134,7 @@ Windows 原生 Python 当前还存在 `fcntl` 等兼容性问题；WSL2 也只�
 - 不需要 ngrok；
 - 不需要把 Mac 的 8765 端口暴露给互联网。
 
-当前安装脚本会分别创建聊天、知识库、邮箱和洞察的本机计划任务。
+当前安装脚本始终创建聊天、知识库和邮箱的本机计划任务；只有明确使用 `--with-insights` 时才创建洞察和历史回填任务。
 
 ---
 
@@ -190,6 +190,7 @@ Feishu Archive 不是飞书客户端数据库的镜像，也不能绕过租户�
 - 群列表接口不返回 P2P 单聊，程序会用消息搜索补发现，但不可见或已超出租户保留期的单聊仍无法发现；
 - 普通话题群按会话查询主要取得根消息，回复还要按 thread 查询；thread 接口不接受起止时间，程序取得后再在本地过滤；
 - 消息和知识库资源单文件受 100 MB 上限约束，部分卡片、合并转发子消息、表情包和防泄密资源不支持下载；
+- 本人发送的图片可以归档；本人发送的普通文件当前只保留消息和资源元数据，不下载文件本体，其他人或机器人发送的普通文件仍受会话成员身份、100 MB 和防泄密限制；
 - 已删除、撤回、超过保留期限或受历史可见性限制的内容无法补救性恢复；
 - 知识库只同步当前用户可见空间和节点；暂时不可见的旧节点会在本地标记为 `missing`，不会因一次权限变化静默删除已有正文；
 - 当前完整正文适配覆盖新版文档和普通文件；旧版文档、电子表格、多维表格、思维笔记、幻灯片及第三方组件主要保存目录元数据；
@@ -345,7 +346,7 @@ chmod +x bin/feishu-archive scripts/install-local.sh scripts/uninstall-local.sh
 正确情况下应该看到：
 
 ```
-0.5.3
+0.5.4
 ```
 
 ---
@@ -786,6 +787,13 @@ App ID
 
 ```
 pbpaste | ./bin/feishu-archive configure --app-id-stdin
+printf '' | pbcopy
+```
+
+确认命令成功后清空剪贴板：
+
+```
+printf '' | pbcopy
 ```
 
 ---
@@ -802,6 +810,13 @@ App Secret
 
 ```
 pbpaste | ./bin/feishu-archive configure --app-secret-stdin
+printf '' | pbcopy
+```
+
+确认命令成功后立即清空剪贴板：
+
+```
+printf '' | pbcopy
 ```
 
 这样做的好处是：
@@ -862,12 +877,22 @@ Feishu Archive Mail
 
 ```
 pbpaste | ./bin/feishu-archive mail-configure --app-id-stdin
+printf '' | pbcopy
 ```
+
+确认成功后执行 `printf '' | pbcopy` 清空剪贴板，再复制 Mail App Secret：
 
 复制 Mail App Secret：
 
 ```
 pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
+printf '' | pbcopy
+```
+
+确认成功后再次执行：
+
+```
+printf '' | pbcopy
 ```
 
 然后：
@@ -927,6 +952,14 @@ GitHub
 公开NAS同步目录
 ```
 
+在发起可能持续很久的首次同步前，先执行：
+
+```
+./bin/feishu-archive doctor
+```
+
+当前版本只有在 App ID、主 OAuth 刷新令牌、全部聊天/知识库授权范围、SQLite、磁盘、FileVault 和阅读器绑定检查都通过时才返回成功。它核对的是 Keychain 中保存的授权范围，不能替代后续真实接口调用；如有 `!` 项，先按输出修复并重新授权，不要直接开始长时间同步。
+
 ---
 
 # 二十一、第十八阶段：发现聊天
@@ -973,6 +1006,8 @@ GitHub
 ```
 
 正式第一次建库建议不限制日期。
+
+首次全量同步可能持续数小时。期间保持 Mac 唤醒和网络稳定，不要同时启动第二个聊天同步。若因休眠、网络、接口限流或关机中断，可重新执行同一命令；数据库写入是幂等的，已保存消息和内容寻址资源会复用。重跑前先确认上一进程已经退出，不要删除 `.lock` 文件。
 
 ---
 
@@ -1041,6 +1076,8 @@ GitHub
 
 这是飞书接口和当前适配范围共同决定的边界。
 
+知识库同步也可以在中断后重跑同一命令；不要为了“续传”直接使用 `--force`，因为 `--force` 会要求重新处理全部可见文档。
+
 ---
 
 # 二十五、第二十二阶段：第一次完整邮箱同步
@@ -1073,6 +1110,8 @@ mail-sync.lock
 ```
 
 不会与聊天/知识库数据库混写。
+
+邮箱首次同步同样可能很久。保持 Mac 唤醒，不要并行启动第二个邮箱同步；中断后直接重跑 `mail-sync`，程序会复用已经校验的内容寻址 blob。
 
 ---
 
@@ -1133,6 +1172,8 @@ mail-sync.lock
 - FileVault 状态正常；
 - 邮箱授权正常。
 
+这里的 `doctor` 是同步完成后的再次验收；它现在会把缺 App 配置、缺主令牌或缺任一主 OAuth 权限都视为失败。`mail-doctor` 负责独立邮箱数据库、权限、blob 完整性和本机安全边界，两者不能互相替代。
+
 ---
 
 # 二十八、第二十四阶段：启动本地阅读器
@@ -1142,6 +1183,8 @@ mail-sync.lock
 ```
 ./bin/feishu-archive serve
 ```
+
+该命令会一直占用当前 Terminal，这是正常现象。保持它运行，并新开第二个 Terminal 窗口执行邮箱解锁等命令。完成前台验收后，回到运行 `serve` 的窗口按 `Control + C` 停止；否则 8765 端口仍被占用，后台阅读器无法启动。
 
 浏览器打开：
 
@@ -1185,6 +1228,15 @@ http://127.0.0.1:8765
 
 当前 HTML 把样式和消息文字包含在单一文件中，但**不会把聊天图片或文件附件嵌入 HTML**；JSON 会包含会话、消息和资源记录，便于后续程序处理，但本地资源文件仍是独立文件。两者都是脱离 Keychain 和阅读器保护的**明文副本**，不要放入公共网盘、GitHub 或无访问控制的共享目录。
 
+## 28.2 验证日常检索与手工同步
+
+继续在阅读器中完成一次实际操作验收：
+
+1. 在“消息”中分别使用会话、关键词、发送人、消息类型和起止日期筛选；点击“立即同步”后确认状态更新；
+2. 在“知识库”中选择空间、展开目录、打开文档，并用已知关键词搜索；点击知识库同步按钮后确认没有重复异常；
+3. 打开一张图片和一个由其他人或机器人发送的普通文件；本人发送的普通文件当前只保留消息和资源元数据，不把文件本体作为验收要求；
+4. 断开外网后刷新一个已经同步的聊天和知识库文档，确认正文与本地资源仍可读取。
+
 ---
 
 # 二十九、第二十五阶段：使用邮箱阅读器
@@ -1208,6 +1260,8 @@ http://127.0.0.1:8765
 程序会生成一个安全的本机解锁链接，并打开浏览器。
 
 短期会话大约15分钟，解锁密钥通过 URL fragment 传递，不作为普通 HTTP 查询参数进入服务日志。
+
+解锁后在“邮箱”中完成以下日常验收：选择收件箱、已发送和一个自定义文件夹；用已知主题、发件人或正文关键词搜索；翻页并打开一封邮件；下载一个普通附件；对 HTML、SVG、脚本、XML 或可执行格式只在确认来源和风险后进行二次确认。阅读器中的“同步邮箱”会执行一次全历史手工枚举，不等同于每天 04:00 的 2 天重叠增量任务。
 
 ---
 
@@ -1237,7 +1291,7 @@ http://127.0.0.1:8765
 
 # 三十、第二十六阶段：安装自动后台服务
 
-到目前为止，所有功能还是“手工执行”。
+到目前为止，所有功能还是“手工执行”。先回到运行 `serve` 的 Terminal，按 `Control + C` 释放 8765 端口。
 
 验证没有问题后执行：
 
@@ -1256,13 +1310,13 @@ command -v python3
 最后：
 
 ```
-./scripts/install-local.sh
+./scripts/install-local.sh --without-insights
 ```
 
 **不要使用：**
 
 ```
-sudo ./scripts/install-local.sh
+sudo ./scripts/install-local.sh --without-insights
 ```
 
 项目使用的是当前用户自己的 LaunchAgent、Keychain 和档案目录，不需要 root 权限。
@@ -1273,7 +1327,7 @@ sudo ./scripts/install-local.sh
 
 这些任务是当前 macOS 登录用户的 LaunchAgent，不是系统级守护进程。Mac 需要处于开机状态并保留该用户会话；表中的计划时间按 Mac 当前系统时区解释，而日报的自然日边界按 `DEFAULT_INSIGHTS_TIMEZONE` 解释。电脑关机、休眠或用户会话不可用时，不应把表中的固定时间理解为有服务器保证的准点执行。
 
-当前安装脚本会建立以下后台服务：
+使用 `--without-insights` 时建立以下核心后台服务：
 
 | 时间/条件 | 工作 |
 | --- | --- |
@@ -1281,10 +1335,6 @@ sudo ./scripts/install-local.sh
 | 03:30 | 聊天增量同步 |
 | 03:45 | 知识库增量同步 |
 | 04:00 | 邮箱增量同步 |
-| 04:30 | 每日 Insights |
-| 05:00 | 未完成 Insights 重试 |
-| 05:30 | 未完成 Insights 再次重试 |
-| 周期唤醒 | 历史 Insights 回填 |
 
 聊天和邮箱的日常增量默认会采用约2天重叠窗口，用来捕获延迟出现、编辑或状态发生变化的内容。
 
@@ -1295,11 +1345,13 @@ sudo ./scripts/install-local.sh
 - 在更新失败时恢复上一版 runtime；
 - 只有新版阅读器通过健康检查以后才删除回滚副本。
 
+只有在第三十三至四十阶段完成数据边界确认、专用 SSH 配置、干跑和一次真实日报验收后，才执行 `./scripts/install-local.sh --with-insights`。届时额外增加：04:30 每日洞察、05:00 和 05:30 未完成重试，以及周期性历史回填。未明确同意把本地归档正文提交给指定模型服务时，不要启用此模式。
+
+安装器不带选项时，新安装默认只安装核心服务；已有安装会根据现存 Insights plist 保留原模式。为保证作业记录清晰，本文始终要求明确写 `--without-insights` 或 `--with-insights`。
+
 ### 关于历史洞察回填的唤醒频率
 
-指定源码基线的 README 安装说明中仍有一处旧描述写成“每30分钟”。
-
-但是当前实际源代码：
+当前实际源代码：
 
 ```
 DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS = 60
@@ -1307,11 +1359,11 @@ DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS = 60
 
 而安装脚本直接读取该参数生成 `StartInterval`。
 
-所以本文适用源码基线的实际行为应按：
+所以启用 Insights 后的实际行为应按：
 
 > **每60秒唤醒一次回填调度器**
 
-理解，而不是30分钟。
+理解。
 
 这并不等于每60秒就一定调用大模型；它还会检查模型是否空闲等条件。
 
@@ -1355,7 +1407,7 @@ launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-wiki-sync"
 launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-mail-sync"
 ```
 
-检查每日 Insights 和历史回填（即使模型尚未配置，也应能确认任务是否已安装）：
+当前按 `--without-insights` 安装，下面两个命令应提示服务不存在；这证明归档正文不会在尚未确认模型边界时自动进入 AI 流程：
 
 ```
 launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-insights"
@@ -1429,6 +1481,7 @@ SSH用户：apple
 模型：vmlx/gemma-4-31b-it-8bit
 本机隧道端口：18135
 远端模型端口：11435
+SSH专用私钥：默认未指定
 ```
 
 这些参数来自当前 `config.py`。
@@ -1439,7 +1492,7 @@ SSH用户：apple
 
 ---
 
-# 三十五、普通部署用户应向模型管理员取得五项信息
+# 三十五、普通部署用户应向模型管理员取得六项信息
 
 如果单位已经有 vMLX 模型服务器，请模型管理员提供：
 
@@ -1448,7 +1501,8 @@ SSH用户：apple
 2. SSH_USER
 3. MODEL_ID
 4. MODEL_PORT
-5. SSH访问权限
+5. SSH专用私钥在本机的绝对路径
+6. SSH访问权限和主机指纹
 ```
 
 推荐使用当前代码的：
@@ -1511,6 +1565,7 @@ Mac
 - StrictHostKeyChecking；
 - 不使用密码认证；
 - 不依赖 SSH Agent；
+- 不读取用户 `~/.ssh/config`；
 - 使用公钥认证。
 
 ---
@@ -1531,13 +1586,15 @@ Mac
 6. 确认模型 API 只监听远端 loopback；
 7. 不开放公网模型端口。
 
+专用私钥可以放在例如 `$HOME/.ssh/id_ed25519_feishu_archive`，权限应为 `0600`。当前隧道使用 `-F /dev/null` 和 `IdentitiesOnly=yes`，所以自定义名称的私钥不会从 `~/.ssh/config` 或 SSH agent 自动取得，必须在手工命令中用 `--identity-file` 明确指定，并为无人值守任务配置默认路径。
+
 不建议普通用户通过“关闭 StrictHostKeyChecking”等方法绕过安全检查，因为当前源代码本身就是故意禁止这种降级。
 
 ---
 
 # 三十八、如果模型服务器和当前源码默认值不同
 
-不要把“修改 `config.py`”作为普通用户验证模型的第一步。先使用命令行参数验证，确认时区、主机、用户、模型和端口全部正确后，再决定是否配置无人值守任务。
+不要把“修改 `config.py`”作为普通用户验证模型的第一步。先使用命令行参数验证，确认时区、主机、用户、专用私钥、模型和端口全部正确后，再决定是否配置无人值守任务。
 
 ## 38.1 手工验证：不修改源码
 
@@ -1548,16 +1605,17 @@ Mac
   --timezone Asia/Shanghai \
   --host 192.168.1.50 \
   --user modeluser \
+  --identity-file "$HOME/.ssh/id_ed25519_feishu_archive" \
   --model vmlx/qwen3-32b-8bit \
   --local-port 18135 \
   --remote-port 11435
 ```
 
-这些参数只影响本次运行，不修改代码，也不会自动改变凌晨任务。正式调用模型前，先完成第三十九章的 `--no-model --dry-run` 验证。
+`--identity-file` 展开后必须是现有的绝对文件路径；相对路径和不存在的文件会被拒绝。这些参数只影响本次运行，不修改代码，也不会自动改变凌晨任务。正式调用模型前，先完成第三十九章的 `--no-model --dry-run` 验证。
 
 ## 38.2 无人值守任务：管理员确认后再改默认值
 
-本文适用源码基线的 `install-local.sh` 会把 `config.py` 中的默认参数写入凌晨 Insights 和历史回填任务，没有单独的用户配置文件。因此，如果实际模型与源码默认值不同，无人值守部署需要由熟悉 Git 和模型服务的管理员完成以下受控操作。
+本文适用源码基线的 `install-local.sh` 生成的 Insights 和历史回填任务不附加模型参数，运行时会读取所安装 runtime 内 `config.py` 的默认值；当前没有单独的用户配置文件。因此，如果实际模型与源码默认值不同，无人值守部署需要由熟悉 Git 和模型服务的管理员完成以下受控操作。
 
 先备份：
 
@@ -1578,9 +1636,12 @@ DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
 DEFAULT_VMLX_MODEL = "vmlx/gemma-4-31b-it-8bit"
+DEFAULT_VMLX_IDENTITY_FILE = None
 DEFAULT_VMLX_LOCAL_PORT = 18135
 DEFAULT_VMLX_REMOTE_PORT = 11435
 ```
+
+如果使用自定义名称的专用私钥，把 `DEFAULT_VMLX_IDENTITY_FILE` 改为该 Mac 上的绝对路径，例如 `"/Users/yourname/.ssh/id_ed25519_feishu_archive"`。这里可以保存**路径字符串**，绝不能把私钥内容粘进源码。
 
 保存后先做语法检查：
 
@@ -1594,11 +1655,7 @@ Git 用户还应检查实际差异：
 git diff -- src/feishu_archive/config.py
 ```
 
-然后依次运行第三十九章的数据 dry-run、第四十章的真实模型测试。全部通过后，才重新执行：
-
-```
-./scripts/install-local.sh
-```
+然后依次运行第三十九章的数据 dry-run、第四十章的真实模型测试。只有全部通过并确认允许模型处理本地档案正文后，才按第四十章执行 `./scripts/install-local.sh --with-insights`。
 
 修改源码会使 `git pull --ff-only` 可能因本地差异而失败，也可能在以后换版本时需要重新应用。升级前必须记录和复核这些参数；更稳妥的长期做法是由项目维护者提供正式的外部配置能力或维护经过审核的部署分支。
 
@@ -1610,6 +1667,8 @@ git diff -- src/feishu_archive/config.py
 pbpaste | ./bin/feishu-archive insights-configure --bearer-token-stdin
 ```
 
+确认成功后立即执行 `printf '' | pbcopy` 清空剪贴板。
+
 管理员通过环境变量注入 token 时，也可以使用：
 
 ```
@@ -1619,7 +1678,15 @@ printf '%s' "$VMLINUX_BEARER_TOKEN" | ./bin/feishu-archive insights-configure --
 手工测试指定日期：
 
 ```
-./bin/feishu-archive insights-run --date 2026-08-12 --remote-port 8067
+./bin/feishu-archive insights-run \
+  --date 2026-08-12 \
+  --timezone Asia/Shanghai \
+  --host 192.168.1.50 \
+  --user modeluser \
+  --identity-file "$HOME/.ssh/id_ed25519_feishu_archive" \
+  --model vmlx/qwen3-32b-8bit \
+  --local-port 18135 \
+  --remote-port 8067
 ```
 
 不要把 Bearer token 直接写在命令参数、`config.py`、README 或截图中。本文适用源码基线的 `insights-backfill-step` 只接受 `11435`，因此 8067 是手工日报的受支持替代路线，不是完整历史回填路线。
@@ -1658,10 +1725,23 @@ printf '%s' "$VMLINUX_BEARER_TOKEN" | ./bin/feishu-archive insights-configure --
 
 # 四十、测试真实 Insights
 
-模型连接配置好以后执行：
+如果已经按 38.2 节把经过审核的值写成默认值，执行：
 
 ```
 ./bin/feishu-archive insights-run
+```
+
+如果只做了 38.1 节的手工验证，必须重复使用**同一整组参数**，不要改回无参数命令，否则会悄悄恢复源码默认主机、用户、模型、端口和身份文件：
+
+```
+./bin/feishu-archive insights-run \
+  --timezone Asia/Shanghai \
+  --host 192.168.1.50 \
+  --user modeluser \
+  --identity-file "$HOME/.ssh/id_ed25519_feishu_archive" \
+  --model vmlx/qwen3-32b-8bit \
+  --local-port 18135 \
+  --remote-port 11435
 ```
 
 然后：
@@ -1670,7 +1750,13 @@ printf '%s' "$VMLINUX_BEARER_TOKEN" | ./bin/feishu-archive insights-configure --
 ./bin/feishu-archive insights-status
 ```
 
-打开：
+Insights API 与邮箱共用本机阅读会话。先执行：
+
+```
+./bin/feishu-archive mail-reader-url --open
+```
+
+再打开：
 
 ```
 http://127.0.0.1:8765/?mode=insights
@@ -1684,6 +1770,21 @@ http://127.0.0.1:8765/?mode=insights
 - 证据来源；
 - 置信度；
 - 当前模型和生成状态。
+
+在页面中切换到刚才生成的日期，再切换到一个没有报告的日期，确认日期选择和空状态都正确。只有日报内容、证据引用、置信度和模型身份都通过人工抽样，并且数据所有者明确同意指定模型服务处理聊天、知识库和邮件正文后，才启用无人值守任务。若手工参数与源码默认值不同，还必须先完成 38.2 节的默认值配置和语法检查，否则后台任务仍会使用错误的旧默认值：
+
+```
+./scripts/install-local.sh --with-insights
+```
+
+启用后验证：
+
+```
+launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-insights"
+launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-insights-backfill"
+```
+
+`--with-insights` 会立即启动历史回填并按计划运行日报；它不是单纯“保存设置”。如尚未取得数据处理授权，只保留 `--without-insights`，手工测试结束后不要启用自动任务。
 
 ---
 
@@ -1830,7 +1931,7 @@ backfill-state.json
 - [ ] 历史消息能够读取
 - [ ] Thread 回复能够读取
 - [ ] 图片能够显示
-- [ ] 文件能够归档
+- [ ] 至少一个由其他人或机器人发送的普通文件能够归档；本人发送的普通文件只核对消息和资源元数据
 - [ ] 关键词全文搜索有效
 - [ ] 单会话 JSON 能够导出
 - [ ] 单会话 HTML 能够离线打开
@@ -1860,16 +1961,18 @@ backfill-state.json
 - [ ] 聊天同步 LaunchAgent 存在
 - [ ] Wiki 同步 LaunchAgent 存在
 - [ ] Mail 同步 LaunchAgent 存在
-- [ ] Insights LaunchAgent 存在
-- [ ] Insights Backfill LaunchAgent 存在
+- [ ] 若只部署核心功能，Insights 和 Backfill LaunchAgent 不存在
+- [ ] 若明确启用全部功能，Insights 和 Backfill LaunchAgent 均存在
 
 ## H. Insights
 
 - [ ] `insights-run --no-model --dry-run` 正常
 - [ ] SSH 模型连接正常
+- [ ] 专用私钥通过 `--identity-file` 或审核后的 `DEFAULT_VMLX_IDENTITY_FILE` 明确指定
 - [ ] 实际模型 ID 与配置一致
 - [ ] `insights-run` 成功
 - [ ] `insights-status` 正常
+- [ ] 已用 `mail-reader-url --open` 建立本机阅读会话
 - [ ] `/?mode=insights` 页面能够打开
 - [ ] Yesterday Summary 有内容
 - [ ] Today Plan 有内容
@@ -1881,6 +1984,7 @@ backfill-state.json
 - [ ] 已记录租户的数据保留期限和应用可用范围
 - [ ] 已抽样比对至少一个已知群、单聊、知识库和邮箱文件夹
 - [ ] 已记录机器人未加入、撤回/删除、100 MB、DLP 和未适配文档类型造成的缺口
+- [ ] 已记录本人发送的普通文件当前不保存文件本体
 - [ ] 没有把“同步成功”表述为飞书客户端的完整备份或电子取证镜像
 
 只有 A—I 全部满足，才可以称为：
@@ -1897,21 +2001,25 @@ backfill-state.json
 | OAuth 打不开 | 浏览器没有自动启动 | 使用 `auth --no-open` |
 | OAuth 回调失败 | 8766被占用或URL不一致 | 检查 `http://127.0.0.1:8766/oauth/callback` |
 | 新增权限仍报缺权限 | 只勾选了权限，没有重新发布 | 创建新版本→发布→重新 `auth` |
+| `doctor` 返回失败 | App 配置、主令牌、任一主权限或本机安全检查未通过 | 按每个 `!` 项修复；发布权限后重新 `auth`，不要把非零退出当作警告忽略 |
 | `mail-auth` 后缺权限 | 邮箱权限未发布 | 发布邮箱应用新版本→重新 `mail-auth` |
 | 复用主应用后邮箱缺权限 | 只保留了主权限，或新增 Mail 权限后没有发布/重新授权 | 追加全部 Mail 权限→发布→重新 `mail-auth`；不要运行 `mail-configure` |
 | 自动邮箱任务跳过 | 没有有效 Mail OAuth | 运行 `mail-auth`、`mail-doctor` |
 | 群很少 | 机器人没有加入相关群 | 将应用机器人加入目标群 |
 | 单聊比客户端少 | 飞书搜索/保留期限制 | 确认 `search:message` 权限 |
 | 图片或附件缺少 | Bot不在群/超过100MB/DLP限制 | 加机器人，执行 `attachments --workers 4` |
+| 本人发送的普通文件没有本体 | 当前有意跳过本人普通文件下载 | 消息和资源元数据仍应存在；这属于已知覆盖边界，不要反复强制同步 |
 | 文档只有标题没有正文 | 内容类型当前未适配 | 新版Docx支持；Sheet/Base等可能只有目录 |
 | Wiki页面显示旧格式 | 本地正文渲染版本旧 | 执行 `wiki-rebuild` |
 | 邮件正文有、附件没有 | 磁盘或附件上限触发 | 检查可用磁盘和 `mail-doctor` |
 | 邮箱API 401 | 阅读器没有解锁 | `mail-reader-url --open` |
 | HTML/SVG/脚本附件不能直接开 | 被安全隔离 | 在阅读器确认风险后二次下载 |
-| `Address already in use` | 8765或8766已占用 | 停止旧实例 |
+| `Address already in use` | 手工 `serve` 仍在运行，或8765/8766被其他进程占用 | 回到前台 Terminal 按 `Control + C`；确认旧实例退出后再安装或授权 |
 | TLS证书错误 | Python证书环境异常 | 使用 Python.org 正式版本并安装证书 |
 | SQLite locked | 多进程或复制中写入 | 停止服务后再操作 |
 | Insights只有统计没有智能结论 | 模型不可用 | 检查 SSH、模型、11435 |
+| Insights 页面或 API 401 | 尚未建立邮箱/Insights 共用的本机阅读会话 | 执行 `mail-reader-url --open` 后从新打开的页面进入 Insights |
+| SSH 提示找不到身份或公钥拒绝 | 专用私钥名称非默认，且 SSH 配置/agent 被安全策略忽略 | 手工命令加 `--identity-file`；后台任务配置 `DEFAULT_VMLX_IDENTITY_FILE` 后用 `--with-insights` 重装 |
 | Insights模型不匹配 | 配置的 MODEL ID 与服务器不同 | 先用 `--model` 手工验证；计划任务参数由管理员按 38.2 节受控更新 |
 | Insights凌晨不工作，手工指定参数却可以 | LaunchAgent仍用源码默认参数 | 核对 38.2 节默认值、语法检查和差异，再重新执行安装脚本 |
 | 8067 提示缺 Bearer | 尚未把代理 token 保存到 Keychain | 按 38.3 节用标准输入执行 `insights-configure` |
@@ -2022,25 +2130,28 @@ exports
 
 在复制之前应先停止相关服务，避免 SQLite 正在写入。对于已经按本文安装后台任务的 Mac，推荐使用以下可恢复流程：
 
-1. 执行 `./scripts/uninstall-local.sh`，卸载当前用户的 LaunchAgent；这会暂停服务，但不会删除档案；
-2. 用 Finder 将整个 `Feishu Archive` 目录复制到受访问控制且容量足够的备份位置；
-3. 确认备份中同时存在数据库、附件/资源目录和所需的 `-wal` 文件；
-4. 回到经过验证的项目源码目录，执行 `./scripts/install-local.sh` 恢复后台任务；
-5. 再访问 `http://127.0.0.1:8765/api/status` 确认服务恢复。
+1. 先记录当前模式是核心归档（`--without-insights`）还是已获授权的完整 Insights（`--with-insights`）；
+2. 执行 `./scripts/uninstall-local.sh`，卸载当前用户的 LaunchAgent；这会暂停服务，但不会删除档案；
+3. 确认没有手工 `sync`、`wiki-sync`、`mail-sync`、`insights-run` 或 `serve` 进程，再用 Finder 将整个 `Feishu Archive` 目录复制到受访问控制且容量足够的备份位置；
+4. 确认备份中同时存在数据库、附件/资源、邮件 blob、洞察目录和可能存在的 `-wal` 文件；
+5. 回到经过验证的项目源码目录，按第1步记录显式执行 `./scripts/install-local.sh --without-insights` 或 `./scripts/install-local.sh --with-insights`；
+6. 访问 `http://127.0.0.1:8765/api/status`，并运行 `doctor`、`mail-doctor` 确认服务和数据完整性恢复。
 
 备份期间同步和阅读器会暂停。不要一边复制数据库，一边手工运行 `sync`、`wiki-sync` 或 `mail-sync`。
 
 Mac Keychain 中的 App Secret 和 OAuth Token 不会跟着这个目录一起迁移。
 
-所以换新 Mac 后仍然需要重新保存主应用凭据并授权：
+换新 Mac 或恢复到不同用户名/目录时，按以下顺序处理：
 
-```
-configure
-auth
-mail-auth
-```
+1. 在目标 Mac 把整个目录恢复为 `~/Library/Application Support/Feishu Archive`，执行 `chmod 700 "$HOME/Library/Application Support/Feishu Archive"`，并确认 FileVault 已开启；
+2. 用第十七、十八章的完整命令重新执行 `configure --app-id-stdin`、`configure --app-secret-stdin` 和 `auth`；Keychain 凭据不会随备份复制；
+3. 独立邮箱应用还要重新执行两个 `mail-configure` 命令和 `mail-auth`；复用主应用时只重新执行 `mail-auth`；
+4. 重新配置 SSH 专用私钥、`known_hosts` 和可选 Insights Bearer token；这些凭据不在档案目录内；
+5. 执行 `wiki-rebuild --force`。0.5.4 新数据使用相对路径，0.5.3 及更早的知识库绝对路径会按保留的 `knowledge/assets` 结构自动重映射并重新生成相对链接 HTML；
+6. 执行 `doctor`、`mail-doctor`，再抽查一个聊天附件、一张知识库图片、一个知识库文件、一个邮件附件和一个导出 HTML；
+7. 备份可能含 `reader.secret` 和永久解锁策略。目标 Mac 上先执行 `mail-reader-url --lock` 撤销旧会话，再按需要重新执行 `mail-reader-url --open`；不要默认沿用永久解锁。
 
-使用独立邮箱应用时还要先执行 `mail-configure`；复用主应用时不要执行它。SSH 私钥、`known_hosts` 和 Insights Bearer token 也应按本单位密钥管理流程重新配置，不能假设备份目录已经包含这些凭据。
+知识库兼容映射依赖完整保留 `knowledge/assets` 子目录结构。只复制数据库、单独改名资源目录或只复制导出 HTML，都不能视为完整恢复。
 
 ---
 
@@ -2064,10 +2175,11 @@ git pull --ff-only
 ./bin/feishu-archive --version
 ```
 
-然后重新：
+然后按升级前记录的模式显式重新安装；未获 Insights 数据处理授权时必须选择核心模式：
 
 ```
-./scripts/install-local.sh
+./scripts/install-local.sh --without-insights
+# 或：./scripts/install-local.sh --with-insights
 ```
 
 安装器会先测试候选 runtime。
@@ -2089,6 +2201,7 @@ TIMEZONE
 HOST
 USER
 MODEL
+IDENTITY_FILE
 PORT
 ```
 
@@ -2101,7 +2214,7 @@ PORT
 1. 从 GitHub 下载新 ZIP，并解压到一个**新的文件夹**；不要覆盖旧的 `FeishuLocalization-main`；
 2. 在新文件夹运行 `./bin/feishu-archive --version`，核对版本；
 3. 重新检查飞书权限、默认模型参数和本文列出的 OpenAPI 边界；
-4. 在新文件夹执行 `./scripts/install-local.sh`；安装器会验证候选 runtime；
+4. 在新文件夹按原模式执行 `./scripts/install-local.sh --without-insights` 或 `./scripts/install-local.sh --with-insights`；安装器会验证候选 runtime；
 5. 检查阅读器、聊天、Wiki、Mail 和 Insights 状态后，再决定是否保留旧源码文件夹。
 
 升级不会自动替代数据备份。旧源码文件夹至少应保留到新 runtime 健康检查和一次代表性同步通过为止。
@@ -2220,6 +2333,12 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 
 ## 7. 发现聊天
 
+先执行同步前预检：
+
+```
+./bin/feishu-archive doctor
+```
+
 ```
 ./bin/feishu-archive discover
 ```
@@ -2264,6 +2383,8 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 ./bin/feishu-archive serve
 ```
 
+该命令占用当前窗口；在第二个 Terminal 做验收，安装后台服务前回到此窗口按 `Control + C`。
+
 ## 14. 聊天导出
 
 在阅读器“消息”页面选择一个会话，点击“导出 HTML”或“导出 JSON”。
@@ -2286,6 +2407,8 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 ./bin/feishu-archive insights-run
 ```
 
+仅当审核后的模型参数已经写成源码默认值时使用无参数命令；否则完整重复第 38.1 节的 `--timezone`、`--host`、`--user`、`--identity-file`、`--model`、`--local-port` 和 `--remote-port`。
+
 ## 18. AI状态
 
 ```
@@ -2298,16 +2421,31 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 
 ```
 pbpaste | ./bin/feishu-archive insights-configure --bearer-token-stdin
+printf '' | pbcopy
 ```
 
 ```
-./bin/feishu-archive insights-run --date 2026-08-12 --remote-port 8067
+./bin/feishu-archive insights-run \
+  --date 2026-08-12 \
+  --timezone Asia/Shanghai \
+  --host 192.168.1.50 \
+  --user modeluser \
+  --identity-file "$HOME/.ssh/id_ed25519_feishu_archive" \
+  --model vmlx/qwen3-32b-8bit \
+  --local-port 18135 \
+  --remote-port 8067
 ```
 
-## 20. 自动运行
+## 20. 自动运行（核心归档）
 
 ```
-./scripts/install-local.sh
+./scripts/install-local.sh --without-insights
+```
+
+日报已经人工验收、模型默认参数已配置且数据处理授权已确认后，才执行：
+
+```
+./scripts/install-local.sh --with-insights
 ```
 
 ---

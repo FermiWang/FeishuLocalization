@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 
@@ -319,6 +320,7 @@ def build_ssh_tunnel_argv(
     user: str,
     local_port: int,
     remote_port: int = 8067,
+    identity_file: str | None = None,
 ) -> list[str]:
     if (
         not isinstance(host, str)
@@ -337,7 +339,17 @@ def build_ssh_tunnel_argv(
         raise ValueError("SSH user is invalid")
     local = _validated_port(local_port, "local_port")
     remote = _validated_port(remote_port, "remote_port")
-    return [
+    identity_path: str | None = None
+    if identity_file is not None:
+        if not isinstance(identity_file, str) or not identity_file.strip():
+            raise ValueError("SSH identity file is invalid")
+        if any(ord(character) < 32 or ord(character) == 127 for character in identity_file):
+            raise ValueError("SSH identity file is invalid")
+        candidate = Path(identity_file).expanduser()
+        if not candidate.is_absolute() or not candidate.is_file():
+            raise ValueError("SSH identity file must be an existing absolute path")
+        identity_path = str(candidate.resolve())
+    argv = [
         "ssh",
         "-F",
         "/dev/null",
@@ -365,11 +377,16 @@ def build_ssh_tunnel_argv(
         "PasswordAuthentication=no",
         "-o",
         "PreferredAuthentications=publickey",
+    ]
+    if identity_path is not None:
+        argv.extend(("-i", identity_path))
+    argv.extend((
         "-L",
         f"127.0.0.1:{local}:127.0.0.1:{remote}",
         "--",
         f"{user}@{host}",
-    ]
+    ))
+    return argv
 
 
 class Tunnel:
@@ -379,6 +396,7 @@ class Tunnel:
         user: str,
         local_port: int,
         remote_port: int = 8067,
+        identity_file: str | None = None,
         *,
         startup_timeout: float = 10.0,
         poll_interval: float = 0.05,
@@ -388,7 +406,13 @@ class Tunnel:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self.argv = build_ssh_tunnel_argv(host, user, local_port, remote_port)
+        self.argv = build_ssh_tunnel_argv(
+            host,
+            user,
+            local_port,
+            remote_port,
+            identity_file=identity_file,
+        )
         startup_timeout = _positive_seconds(startup_timeout, "startup_timeout")
         poll_interval = _positive_seconds(poll_interval, "poll_interval")
         shutdown_timeout = _positive_seconds(shutdown_timeout, "shutdown_timeout")

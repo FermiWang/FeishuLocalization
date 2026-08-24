@@ -6,7 +6,7 @@ Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞�
 
 ## 先看平台支持范围
 
-当前版本为 `0.5.3`，完整的“授权、同步、自动增量更新”链路仍以 macOS 为目标平台。Linux 和 Windows 可以复用部分源码，但不能在不改代码的情况下获得与 macOS 相同的完整同步能力。
+当前版本为 `0.5.4`，完整的“授权、同步、自动增量更新”链路仍以 macOS 为目标平台。Linux 和 Windows 可以复用部分源码，但不能在不改代码的情况下获得与 macOS 相同的完整同步能力。
 
 | 能力 | macOS 原生 | Linux 原生 | Windows 原生 | Windows + WSL2 |
 | --- | --- | --- | --- | --- |
@@ -43,7 +43,7 @@ Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞�
 - 将飞书邮箱作为聊天、知识库之外的第三条独立同步通道，通过 Mail OpenAPI 同步收件箱和已发送邮件、正文及附件。
 - 邮箱使用独立的 `mail.sqlite3`、`mail/blobs` 内容寻址存储和 `mail-sync.lock`，不会把邮件写入聊天/知识库数据库，也不会共用同步锁。
 - 邮箱阅读器默认使用短期本机会话，并支持显式、可回锁的永久本机解锁；邮件 HTML 不直接渲染，附件只以强制下载方式提供；HTML、SVG、脚本和可执行格式还需要二次风险确认。
-- 保存本人和其他人发送的图片并直接显示；普通文件只归档其他人或机器人发送的文件。
+- 保存本人和其他人发送的图片并直接显示；普通文件只归档其他人或机器人发送的文件。本人发送的普通文件会保留消息和资源元数据，但当前不会保存文件本体。
 - 单个资源限制为 100 MB；消息资源和知识库资源分别设置本地总容量上限。
 - macOS 每天 03:30 增量同步消息、03:45 增量同步知识库、04:00 增量同步邮箱，阅读器也提供手工同步按钮。
 - 离线阅读器不加载 CDN、外部字体、统计脚本或其他网络资源。
@@ -192,6 +192,9 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 首次回溯可能需要较长时间，并受租户保留期、机器人群成员身份、历史消息可见性和接口限流影响。
 
 ```bash
+# 在发起长时间同步前检查应用配置、主 OAuth 权限、数据库、磁盘和 FileVault
+./bin/feishu-archive doctor
+
 # 发现群聊和有可见消息的单聊
 ./bin/feishu-archive discover
 
@@ -201,9 +204,6 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 # 同步全部可见知识空间
 ./bin/feishu-archive wiki-sync
 
-# 检查数据库、磁盘、FileVault 和授权状态
-./bin/feishu-archive doctor
-
 # 同步全部系统与自定义邮件文件夹的全部可获取历史
 ./bin/feishu-archive mail-sync
 
@@ -211,6 +211,8 @@ pbpaste | ./bin/feishu-archive mail-configure --app-secret-stdin
 ./bin/feishu-archive mail-status
 ./bin/feishu-archive mail-doctor
 ```
+
+`doctor` 现在只在全部主应用配置、主 OAuth 权限和本机安全检查通过时返回成功；它检查本机保存的授权范围，不能替代 `discover`、`wiki-sync` 等真实接口调用。首次全量同步应让 Mac 保持唤醒并避免并行启动同一通道；命令被网络、限流或关机中断后，可安全重跑同一命令，已有记录与内容寻址资源会复用。
 
 常用的范围和容量参数：
 
@@ -262,12 +264,12 @@ macOS 的 `scripts/install-local.sh` 会在启动新版阅读器前自动执行�
 
 ### 6. 安装 macOS 后台服务
 
-确认前台命令正常后再安装：
+确认前台命令正常后，先只安装不调用 AI 的核心服务：
 
 ```bash
 deactivate 2>/dev/null || true
 command -v python3
-./scripts/install-local.sh
+./scripts/install-local.sh --without-insights
 ```
 
 安装脚本会：
@@ -278,12 +280,16 @@ command -v python3
 - 注册每天 03:30 的消息同步任务；
 - 注册每天 03:45 的知识库同步任务；
 - 注册每天 04:00 的独立邮箱同步任务 `com.fermiwang.feishu-archive-mail-sync`；
-- 注册每天 04:30 的独立每日洞察任务 `com.fermiwang.feishu-archive-insights`，并在
-  05:00、05:30 对未完成分片做幂等重试；
-- 注册每 30 分钟唤醒一次的历史洞察回填任务
-  `com.fermiwang.feishu-archive-insights-backfill`；
 - 把日志写入 `~/Library/Application Support/Feishu Archive/logs`；
 - 只让阅读器监听 <http://127.0.0.1:8765>。
+
+只有在完成下一节的数据边界确认、模型连通测试与一次人工日报验收后，才显式启用 Insights：
+
+```bash
+./scripts/install-local.sh --with-insights
+```
+
+此模式会额外注册每天 04:30 的洞察任务（05:00、05:30 幂等重试），以及启动时和每 60 秒尝试一个受控步骤的历史回填任务。安装器不带选项时，新安装默认等同 `--without-insights`；已有安装则保留当前是否已经安装 Insights。正式操作建议始终写明选项，避免误解。
 
 候选运行时通过预检后，脚本会临时保留上一版运行时和 LaunchAgent；如果后续正文重建、plist 安装、服务启动或健康检查失败，会自动恢复上一版并重新注册原服务。只有新版阅读器通过 `/api/status` 健康检查后，回滚副本才会删除。
 
@@ -307,11 +313,19 @@ printf '%s' "$VMLINUX_BEARER_TOKEN" | ./bin/feishu-archive insights-configure --
 ./bin/feishu-archive insights-status
 ```
 
-默认受控路线为：
+默认受控路线为（参数值应由模型管理员确认）：
 
 ```bash
-./bin/feishu-archive insights-run --remote-port 11435
+./bin/feishu-archive insights-run \
+  --host 192.168.100.179 \
+  --user apple \
+  --identity-file "$HOME/.ssh/id_ed25519_feishu_archive" \
+  --model vmlx/gemma-4-31b-it-8bit \
+  --local-port 18135 \
+  --remote-port 11435
 ```
+
+隧道禁用用户 SSH 配置和 agent 身份注入；自定义名称的专用私钥必须用 `--identity-file` 指向现有绝对路径。默认身份文件可在 `src/feishu_archive/config.py` 的 `DEFAULT_VMLX_IDENTITY_FILE` 中配置，后台任务会采用该值。不要把私钥复制进仓库。
 
 只验证本地抽取、日期口径和覆盖数量，不调用模型也不写洞察库：
 
@@ -541,8 +555,8 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 - 运行中直接复制 SQLite 可能遗漏 `archive.sqlite3-wal` 中的数据。
 - 邮件保存在独立的 `mail.sqlite3` 和 `mail/blobs`；只复制其中一项会得到不完整的邮件档案，运行中复制也可能遗漏 `mail.sqlite3-wal`。
 - 聊天附件主要使用档案根目录下的相对路径，整目录迁移后通常仍可读取。
-- 知识库资源数据库目前保存绝对本机路径。跨用户名、跨目录或跨系统复制后，阅读器中的知识库图片和附件可能无法打开。
-- `knowledge/exports` 中的 HTML 使用相对资源路径，更适合在保持目录结构时独立迁移和查看。
+- 新写入的知识库资源和导出路径相对档案根目录保存；版本 0.5.3 及更早的绝对路径会在读取时按 `knowledge/assets` 目录结构自动重映射。迁移后运行 `wiki-rebuild --force`，再抽查图片、附件和 `knowledge/exports` 中的 HTML。
+- 自动重映射依赖完整保留档案根目录内的 `knowledge/assets` 结构；不要只移动数据库或单独改名资源子目录。
 - 不要把 macOS Keychain、明文 App Secret 或 OAuth 令牌打包进公开备份。
 
 ## Windows 和 Linux 完整同步所需改造
@@ -552,7 +566,7 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 1. 把 `KeychainStore` 抽象为多后端凭据存储：macOS Keychain、Windows Credential Manager/DPAPI、Linux Secret Service；无安全存储时应拒绝保存，而不是退化为明文文件。
 2. 用跨平台实现替换或封装 `fcntl.flock`，并验证多进程重复同步保护。
 3. 按平台选择默认数据目录：macOS Application Support、Windows Local AppData、Linux XDG Data Home。
-4. 把知识库资源路径改为相对档案根目录，并提供旧数据库迁移。
+4. 为知识库旧绝对路径增加可选的一次性数据库规范化工具；当前读取兼容和本地重建已经支持跨根目录恢复。
 5. 将 `doctor` 分为 FileVault、BitLocker 和 LUKS/发行版磁盘加密检查。
 6. 增加 systemd timer 和 Windows Task Scheduler 安装/卸载脚本。
 7. 在 GitHub Actions 中增加 macOS、Ubuntu 和 Windows 测试矩阵，再把 README 支持状态改为“支持”。
@@ -590,6 +604,8 @@ feishu-archive serve --host 127.0.0.1 --port 8765
 | 图片或附件缺失 | 检查机器人是否在会话内、资源是否超过 100 MB、是否受防泄密策略限制，并运行 `attachments --workers 4`。 |
 | 知识空间有节点数量但正文显示方式仍旧 | 运行 `wiki-rebuild`，使用已保存的原始内容块重建正文；无需执行 `wiki-sync --force`。 |
 | `Address already in use` | `8765` 或 `8766` 已被占用；停止旧进程，或为前台测试指定其他端口并同步修改飞书回调地址。 |
+| Insights 页面或 API 返回 `401` | Insights 沿用邮箱阅读会话；运行 `mail-reader-url --open`，或在接受同机访问风险后使用永久解锁。 |
+| Insights SSH 报公钥或身份错误 | 自定义私钥不会从 SSH 配置或 agent 自动注入；在手工命令中传入 `--identity-file`，后台任务则配置 `DEFAULT_VMLX_IDENTITY_FILE` 后重新执行 `install-local.sh --with-insights`。 |
 | Linux 提示找不到 `/usr/bin/security` | 当前真实 OAuth 不支持 Linux；只能运行演示或阅读器，不能用明文脚本伪造钥匙串。 |
 | Windows 提示没有 `fcntl` | 原生 Windows 尚未支持；改用 WSL2 运行演示，或先完成跨平台锁改造。 |
 | macOS TLS 证书错误 | 使用受支持的 Python 安装，并完成其证书安装步骤；必要时通过 `SSL_CERT_FILE` 指向可信 CA 文件。 |
@@ -621,6 +637,7 @@ sh -n scripts/uninstall-local.sh
 - 普通对话群中，按 `chat` 查询只能取得话题根消息；回复需要再按 `thread` 查询。
 - `thread` 查询不支持 `start_time` 和 `end_time`，程序拉取后在本地按时间范围过滤。
 - 资源接口限制单文件不超过 100 MB，不支持部分卡片、合并转发子消息、表情包和防泄密资源。
+- 本人发送的图片可归档；本人发送的普通文件当前只保留消息和资源元数据，不下载文件本体。其他人或机器人发送的普通文件仍受 100 MB、会话成员身份和防泄密限制。
 - 被删除、撤回、超过租户保留期限或受历史消息可见性限制的内容无法补救性恢复。
 - 知识库只保存 OAuth 用户当前可见的空间和节点；暂时不可见的旧节点会标记为 `missing`，不会因一次权限变化静默删除本地正文。
 - 当前完整正文适配覆盖新版文档和普通文件；旧版文档、电子表格、多维表格、思维笔记、幻灯片及第三方组件只保存目录元数据。

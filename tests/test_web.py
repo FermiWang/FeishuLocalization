@@ -308,7 +308,10 @@ class WebTests(unittest.TestCase):
                 status="downloaded",
                 mime_type="image/png",
                 byte_size=len(image_payload),
-                local_path=str(wiki_asset_path),
+                local_path=str(
+                    Path("/Users/previous/Library/Application Support/Feishu Archive")
+                    / "knowledge/assets/wiki.png"
+                ),
             )
             wiki_file_asset_id = database.ensure_wiki_asset(
                 "doc_1", "asset_pdf", "file", filename="证据清单.pdf"
@@ -321,7 +324,10 @@ class WebTests(unittest.TestCase):
                 status="downloaded",
                 mime_type="application/pdf",
                 byte_size=len(wiki_file_payload),
-                local_path=str(wiki_file_path),
+                local_path=str(
+                    Path("/Users/previous/Library/Application Support/Feishu Archive")
+                    / "knowledge/assets/evidence.pdf"
+                ),
             )
             starts = []
             wiki_starts = []
@@ -376,6 +382,7 @@ class WebTests(unittest.TestCase):
                     self.assertIn("message-image", script)
                     self.assertIn("/api/images/", script)
                     self.assertIn("showWikiNodeList", script)
+                    self.assertIn("置信度：", script)
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/sync/status", timeout=2
                 ) as response:
