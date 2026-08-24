@@ -4,6 +4,11 @@ Feishu Archive 是一个本地优先的飞书离线归档 PoC。它只通过飞�
 
 项目不会读取、复制或尝试解密 `LarkShell`、`messages.db`、`im.db`、`Core.db` 等飞书客户端私有数据。邮箱同步使用飞书 Mail OpenAPI，不通过 IMAP，也不读取飞书客户端的本地邮件数据库。
 
+## 部署文档
+
+- [普通用户手工部署与飞书配置 SOP](docs/manual-deployment-sop.zh-CN.md)
+- [使用 ChatGPT Codex 或 Kimi Code 的 AI 辅助部署 SOP](docs/codex-kimi-code-deployment-sop.zh-CN.md)
+
 ## 先看平台支持范围
 
 当前版本为 `0.5.4`，完整的“授权、同步、自动增量更新”链路仍以 macOS 为目标平台。Linux 和 Windows 可以复用部分源码，但不能在不改代码的情况下获得与 macOS 相同的完整同步能力。
