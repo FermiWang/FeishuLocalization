@@ -1,9 +1,11 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from feishu_archive.automation import (
     BackgroundMailSyncController,
+    BackgroundInsightsRefreshController,
     SyncBusyError,
     acquire_mail_sync_lock,
     acquire_sync_lock,
@@ -65,6 +67,24 @@ class FakeMailSyncer:
 
 
 class AutomationTests(unittest.TestCase):
+    def test_insights_refresh_uses_installed_runtime_entrypoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            entrypoint = paths.root / "runtime" / "bin" / "feishu-archive"
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            entrypoint.chmod(0o700)
+            completed = mock.Mock(returncode=0)
+            controller = BackgroundInsightsRefreshController(paths)
+            with mock.patch("subprocess.run", return_value=completed) as run:
+                controller._run("2026-08-16")
+            command = run.call_args.args[0]
+            self.assertEqual(command, [
+                str(entrypoint), "--archive-dir", str(paths.root),
+                "insights-run", "--date", "2026-08-16",
+            ])
+            self.assertEqual(controller.status()["status"], "success")
+
     def test_cycle_full_syncs_new_chats_and_incrementally_syncs_existing_chats(self):
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))

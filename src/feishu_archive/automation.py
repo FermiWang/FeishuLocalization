@@ -62,8 +62,20 @@ class BackgroundInsightsRefreshController:
 
     def __init__(self, paths: ArchivePaths, executable: str | None = None) -> None:
         self.paths = paths
-        candidate = Path(executable or sys.argv[0]).expanduser().resolve()
-        self.executable = str(candidate) if candidate.is_file() else "feishu-archive"
+        if executable is not None:
+            candidate = Path(executable).expanduser().resolve()
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                raise ValueError("insights refresh executable is not executable")
+            self.command_prefix = [str(candidate)]
+        else:
+            runtime_entry = paths.root / "runtime" / "bin" / "feishu-archive"
+            argv_entry = Path(sys.argv[0]).expanduser().resolve()
+            if runtime_entry.is_file() and os.access(runtime_entry, os.X_OK):
+                self.command_prefix = [str(runtime_entry)]
+            elif argv_entry.is_file() and os.access(argv_entry, os.X_OK):
+                self.command_prefix = [str(argv_entry)]
+            else:
+                self.command_prefix = [sys.executable, "-m", "feishu_archive"]
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._status: dict[str, Any] = {"status": "idle"}
@@ -90,7 +102,7 @@ class BackgroundInsightsRefreshController:
         log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         log_path = log_dir / "insights-refresh.log"
         command = [
-            self.executable, "--archive-dir", str(self.paths.root),
+            *self.command_prefix, "--archive-dir", str(self.paths.root),
             "insights-run", "--date", report_date,
         ]
         try:
