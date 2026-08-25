@@ -327,7 +327,9 @@ async def upload_source(meeting_id: int, file: UploadFile | None = File(default=
             stored_path=str(destination), sha256=hashlib.sha256(raw).hexdigest(),
             text_content=content, pair_key=pair_key,
         )
-    return _public_source(source, include_text=True)
+    result = _public_source(source)
+    result["text_chars"] = len(extracted if file is not None else content)
+    return result
 
 
 @app.delete("/api/meetings/{meeting_id}/sources/{source_id}", status_code=204)
@@ -401,7 +403,7 @@ async def upload_transcript(meeting_id: int, file: UploadFile | None = File(defa
     source = await upload_source(
         meeting_id, file=file, text=text, pair_key="legacy-1", source_name="粘贴识别稿.txt",
     )
-    return {"ok": True, "chars": len(source.get("text") or ""), "source_id": source["id"]}
+    return {"ok": True, "chars": int(source.get("text_chars") or 0), "source_id": source["id"]}
 
 
 @app.get("/api/meetings/{meeting_id}/audio")

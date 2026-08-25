@@ -352,6 +352,25 @@ class ExactModelTests(unittest.TestCase):
 
 
 class MeetingApiTests(unittest.TestCase):
+    def test_upload_response_does_not_echo_transcript_body(self):
+        headers = {"X-Meeting-Minutes-Action": "confirm"}
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/meetings",
+                headers=headers,
+                json={"title": "上传回显测试", "meeting_date": "2026-08-25"},
+            )
+            meeting_id = created.json()["id"]
+            response = client.post(
+                f"/api/meetings/{meeting_id}/sources",
+                headers=headers,
+                data={"text": "不应在响应中回显的识别稿正文"},
+            )
+            self.assertEqual(response.status_code, 201)
+            payload = response.json()
+            self.assertNotIn("text", payload)
+            self.assertEqual(payload["text_chars"], 14)
+
     def test_date_is_required_before_organize_and_all_mutations_need_confirmation(self):
         headers = {"X-Meeting-Minutes-Action": "confirm"}
         with TestClient(app) as client:
