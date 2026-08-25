@@ -13,7 +13,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ArchivePaths
+from .config import ArchivePaths, resolve_archive_resource_path
 from .database import ArchiveDatabase
 from .mail_database import MailDatabase
 from .insights_database import InsightsDatabase
@@ -760,7 +760,11 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
             return None
         root = self.server.paths.root.resolve()
-        target = Path(str(asset["local_path"])).resolve()
+        target = resolve_archive_resource_path(
+            root,
+            str(asset["local_path"]),
+            legacy_anchor=("knowledge", "assets"),
+        )
         if root not in target.parents or not target.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
             return None

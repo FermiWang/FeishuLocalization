@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from feishu_archive.vmlx import (
@@ -254,6 +256,29 @@ class TunnelTests(unittest.TestCase):
         for unsafe in ("-oProxyCommand=bad", "host;command", "user@host"):
             with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
                 build_ssh_tunnel_argv(unsafe, "apple", 11435)
+
+    def test_ssh_argv_accepts_only_an_existing_explicit_identity_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            identity = Path(directory) / "feishu-archive-ed25519"
+            identity.write_text("test-key", encoding="utf-8")
+            identity.chmod(0o600)
+            argv = build_ssh_tunnel_argv(
+                "192.168.100.179",
+                "apple",
+                11435,
+                remote_port=11435,
+                identity_file=str(identity),
+            )
+            identity_index = argv.index("-i")
+            self.assertEqual(argv[identity_index + 1], str(identity.resolve()))
+        for invalid in ("relative-key", "/private/tmp/missing-feishu-archive-key"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                build_ssh_tunnel_argv(
+                    "192.168.100.179",
+                    "apple",
+                    11435,
+                    identity_file=invalid,
+                )
 
     def test_tunnel_polls_then_cleans_up(self) -> None:
         process = MagicMock()

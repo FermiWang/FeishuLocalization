@@ -162,13 +162,23 @@ class WikiSyncTests(unittest.TestCase):
         self.assertIn("/api/wiki/assets/", document["rendered_html"])
         self.assertIn('href="https://example.com/reference"', document["rendered_html"])
         self.assertIn('target="_blank"', document["rendered_html"])
-        export_path = Path(document["local_export_path"])
+        self.assertFalse(Path(document["local_export_path"]).is_absolute())
+        export_path = self.paths.root / document["local_export_path"]
         self.assertTrue(export_path.is_file())
         export_text = export_path.read_text(encoding="utf-8")
         self.assertIn("../assets/", export_text)
         self.assertNotIn("/api/wiki/assets/", export_text)
         for asset in self.database.list_wiki_assets("doc_1"):
-            self.assertTrue(Path(asset["local_path"]).is_file())
+            self.assertFalse(Path(asset["local_path"]).is_absolute())
+            self.assertTrue((self.paths.root / asset["local_path"]).is_file())
+            legacy_path = (
+                Path("/Users/previous/Library/Application Support/Feishu Archive")
+                / asset["local_path"]
+            )
+            self.database.update_wiki_asset(
+                int(asset["id"]),
+                local_path=str(legacy_path),
+            )
         file_document = self.database.wiki_document_for_node("wik_file")
         self.assertIn("/api/wiki/preview/", file_document["rendered_html"])
         self.assertIn('target="_blank"', file_document["rendered_html"])
@@ -182,6 +192,15 @@ class WikiSyncTests(unittest.TestCase):
     def test_local_rebuild_uses_saved_blocks_without_api_calls(self) -> None:
         syncer = WikiSyncer(self.database, self.client, self.paths)
         syncer.sync()
+        for asset in self.database.list_wiki_assets("doc_1"):
+            legacy_path = (
+                Path("/Users/previous/Library/Application Support/Feishu Archive")
+                / asset["local_path"]
+            )
+            self.database.update_wiki_asset(
+                int(asset["id"]),
+                local_path=str(legacy_path),
+            )
         self.database.update_wiki_rendered_view("doc_1", "<p>旧正文</p>")
         media_opens = self.client.media_opens
         file_opens = self.client.file_opens
@@ -194,6 +213,12 @@ class WikiSyncTests(unittest.TestCase):
         self.assertGreaterEqual(result["documents_updated"], 1)
         rebuilt = self.database.get_wiki_document("doc_1")
         self.assertIn('href="https://example.com/reference"', rebuilt["rendered_html"])
+        self.assertFalse(Path(rebuilt["local_export_path"]).is_absolute())
+        export_text = (self.paths.root / rebuilt["local_export_path"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("../assets/", export_text)
+        self.assertNotIn("/Users/previous/", export_text)
         self.assertEqual(self.database.get_metadata("wiki_render_version"), WIKI_RENDER_VERSION)
         self.assertEqual(self.client.media_opens, media_opens)
         self.assertEqual(self.client.file_opens, file_opens)

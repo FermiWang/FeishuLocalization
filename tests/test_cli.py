@@ -17,6 +17,7 @@ from feishu_archive.cli import (
     _run_insights_backfill_step,
     _app_config,
     _client,
+    _doctor,
     _mail_client,
     _mail_app_config,
     _mail_oauth_readiness,
@@ -54,6 +55,35 @@ from feishu_archive.mail_database import MailDatabase
 
 
 class AppConfigTests(unittest.TestCase):
+    def test_doctor_requires_every_main_oauth_scope_and_fails_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = ArchivePaths(Path(temp))
+            paths.ensure()
+            database = ArchiveDatabase(paths.database)
+            database.initialize()
+            values = {
+                "app_id": "cli_app",
+                "cli_app:app_secret": "secret",
+                "cli_app:refresh_token": "refresh",
+                "cli_app:scope": " ".join(
+                    scope
+                    for scope in DEFAULT_SCOPES
+                    if scope not in {"offline_access", "search:message"}
+                ),
+            }
+            with (
+                patch("feishu_archive.cli.KeychainStore") as store_class,
+                patch("feishu_archive.cli.subprocess.run") as run,
+                patch("feishu_archive.cli.shutil.disk_usage") as disk_usage,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                store_class.return_value.get.side_effect = values.get
+                run.return_value = SimpleNamespace(stdout="FileVault is On.", stderr="")
+                disk_usage.return_value = SimpleNamespace(free=20 * 1024**3)
+                self.assertTrue(_doctor(database, paths.root))
+            self.assertIn("飞书主 OAuth 权限", output.getvalue())
+            self.assertIn("search:message", output.getvalue())
+
     def test_cold_start_warmup_initializes_idle_clock_then_defers(self) -> None:
         class Client:
             def __init__(self) -> None:
@@ -573,6 +603,7 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(args.timezone, "Europe/Amsterdam")
         self.assertEqual(args.host, "192.168.100.179")
         self.assertEqual(args.model, "vmlx/qwen3.8-27b-8bit")
+        self.assertIsNone(args.identity_file)
         self.assertEqual(args.remote_port, 11435)
         self.assertFalse(args.no_model)
         self.assertFalse(args.dry_run)
@@ -586,6 +617,10 @@ class AppConfigTests(unittest.TestCase):
             ["insights-configure", "--bearer-token-stdin"]
         )
         self.assertTrue(configure.bearer_token_stdin)
+        custom_identity = build_parser().parse_args(
+            ["insights-run", "--identity-file", "/tmp/feishu-archive-key"]
+        )
+        self.assertEqual(custom_identity.identity_file, "/tmp/feishu-archive-key")
 
     def test_wiki_rebuild_can_force_local_rendering(self) -> None:
         args = build_parser().parse_args(["wiki-rebuild", "--force"])

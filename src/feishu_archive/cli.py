@@ -60,6 +60,7 @@ from .config import (
     DEFAULT_WIKI_SYNC_HOUR,
     DEFAULT_WIKI_SYNC_MINUTE,
     DEFAULT_VMLX_HOST,
+    DEFAULT_VMLX_IDENTITY_FILE,
     DEFAULT_VMLX_LOCAL_PORT,
     DEFAULT_VMLX_MODEL,
     DEFAULT_VMLX_REMOTE_PORT,
@@ -316,6 +317,11 @@ def build_parser() -> argparse.ArgumentParser:
     insights_run.add_argument("--timezone", default=DEFAULT_INSIGHTS_TIMEZONE)
     insights_run.add_argument("--host", default=DEFAULT_VMLX_HOST)
     insights_run.add_argument("--user", default=DEFAULT_VMLX_USER)
+    insights_run.add_argument(
+        "--identity-file",
+        default=DEFAULT_VMLX_IDENTITY_FILE,
+        help="SSH 私钥路径；未指定时只尝试 OpenSSH 默认身份文件",
+    )
     insights_run.add_argument("--model", default=DEFAULT_VMLX_MODEL)
     insights_run.add_argument("--local-port", type=int, default=DEFAULT_VMLX_LOCAL_PORT)
     insights_run.add_argument("--remote-port", type=int, choices=(8067, 11435), default=DEFAULT_VMLX_REMOTE_PORT)
@@ -338,6 +344,11 @@ def build_parser() -> argparse.ArgumentParser:
     insights_backfill.add_argument("--timezone", default=DEFAULT_INSIGHTS_TIMEZONE)
     insights_backfill.add_argument("--host", default=DEFAULT_VMLX_HOST)
     insights_backfill.add_argument("--user", default=DEFAULT_VMLX_USER)
+    insights_backfill.add_argument(
+        "--identity-file",
+        default=DEFAULT_VMLX_IDENTITY_FILE,
+        help="SSH 私钥路径；未指定时只尝试 OpenSSH 默认身份文件",
+    )
     insights_backfill.add_argument("--model", default=DEFAULT_VMLX_MODEL)
     insights_backfill.add_argument(
         "--local-port", type=int, default=DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT
@@ -772,6 +783,7 @@ def main(argv: list[str] | None = None) -> None:
                             user=args.user,
                             local_port=args.local_port,
                             remote_port=args.remote_port,
+                            identity_file=args.identity_file,
                         )
                         base_url = tunnel.__enter__()
                         client = VMLXClient(
@@ -1302,6 +1314,7 @@ def _run_insights_backfill_step(
                     user=args.user,
                     local_port=args.local_port,
                     remote_port=args.remote_port,
+                    identity_file=args.identity_file,
                 ) as base_url:
                     raw_client = VMLXClient(base_url, model=args.model, timeout=900.0)
                     models = raw_client.models()
@@ -1933,15 +1946,11 @@ def _doctor(database: ArchiveDatabase, root: Path) -> bool:
             token_present = bool(store.get(f"{app_id}:refresh_token"))
             checks.append(("OAuth 刷新令牌", token_present, "已保存" if token_present else "未保存"))
             granted = set((store.get(f"{app_id}:scope") or "").split())
-            required_knowledge = {
-                scope
-                for scope in DEFAULT_SCOPES
-                if scope.startswith(("wiki:", "docx:", "drive:", "sheets:", "bitable:"))
-            }
-            missing = sorted(required_knowledge - granted)
+            required_main = set(DEFAULT_SCOPES) - {"offline_access"}
+            missing = sorted(required_main - granted)
             checks.append(
                 (
-                    "知识库 OAuth 权限",
+                    "飞书主 OAuth 权限",
                     not missing,
                     "已授权" if not missing else "需重新执行 auth：" + " ".join(missing),
                 )
@@ -1952,9 +1961,9 @@ def _doctor(database: ArchiveDatabase, root: Path) -> bool:
         checks.append(("飞书应用配置", False, "未配置 App ID（demo/阅读不受影响）"))
     for name, ok, detail in checks:
         print(f"{'✓' if ok else '!'} {name}: {detail}")
-    hard_failures = [name for name, ok, _ in checks if not ok and name in {"FileVault", "SQLite 完整性", "阅读器绑定"}]
-    if hard_failures:
-        print("安全检查未通过：" + "、".join(hard_failures))
+    failures = [name for name, ok, _ in checks if not ok]
+    if failures:
+        print("检查未通过：" + "、".join(failures))
         return True
     return False
 

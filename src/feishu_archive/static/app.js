@@ -125,6 +125,13 @@ function renderInsightItems(rootId, items) {
     if (categoryLabels[item.category]) labels.push(categoryLabels[item.category]);
     if (strengthLabels[item.strength]) labels.push(strengthLabels[item.strength]);
     if (item.status) labels.push(`状态：${item.status}`);
+    if (item.confidence !== null && item.confidence !== undefined && item.confidence !== "") {
+      const confidence = Number(item.confidence);
+      if (Number.isFinite(confidence)) {
+        const percentage = Math.round(Math.max(0, Math.min(1, confidence)) * 100);
+        labels.push(`置信度：${percentage}%`);
+      }
+    }
     if (labels.length) {
       const semantics = document.createElement("span");
       semantics.className = "insights-semantics";

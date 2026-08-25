@@ -46,6 +46,7 @@ DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
 DEFAULT_VMLX_MODEL = "vmlx/qwen3.8-27b-8bit"
+DEFAULT_VMLX_IDENTITY_FILE: str | None = None
 DEFAULT_VMLX_LOCAL_PORT = 18135
 # The resident backfill loop uses a separate tunnel port so its frequent SSH
 # forwards never collide with a manual or scheduled `insights-run` on 18135.
@@ -231,3 +232,27 @@ def archive_paths(value: str | Path | None = None) -> ArchivePaths:
         env_value = os.environ.get("FEISHU_ARCHIVE_DIR")
         value = env_value if env_value else DEFAULT_ARCHIVE_DIR
     return ArchivePaths(Path(value).expanduser().resolve())
+
+
+def resolve_archive_resource_path(
+    root: Path,
+    stored_value: str | Path,
+    *,
+    legacy_anchor: tuple[str, ...] | None = None,
+) -> Path:
+    """Resolve relative paths and remap legacy absolute resource paths after migration."""
+    archive_root = root.expanduser().resolve()
+    stored = Path(stored_value)
+    candidate = (stored if stored.is_absolute() else archive_root / stored).resolve()
+    if candidate == archive_root or archive_root in candidate.parents:
+        return candidate
+    if legacy_anchor:
+        parts = stored.parts
+        anchor_size = len(legacy_anchor)
+        for index in range(0, len(parts) - anchor_size + 1):
+            if tuple(parts[index : index + anchor_size]) != legacy_anchor:
+                continue
+            remapped = archive_root.joinpath(*parts[index:]).resolve()
+            if archive_root in remapped.parents:
+                return remapped
+    return candidate
