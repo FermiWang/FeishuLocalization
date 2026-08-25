@@ -134,7 +134,7 @@ Windows 原生 Python 当前还存在 `fcntl` 等兼容性问题；WSL2 也只�
 - 不需要 ngrok；
 - 不需要把 Mac 的 8765 端口暴露给互联网。
 
-当前安装脚本始终创建聊天、知识库和邮箱的本机计划任务；只有明确使用 `--with-insights` 时才创建洞察和历史回填任务。
+当前安装脚本始终创建聊天、知识库、邮箱和详细会议记录的本机计划任务；会议记录每 300 秒通过固定 SSH 命令从 179 增量拉取已完成的结构化修订，不复制录音或识别稿。只有明确使用 `--with-insights` 时才创建洞察和历史回填任务。
 
 ---
 
@@ -1335,6 +1335,7 @@ sudo ./scripts/install-local.sh --without-insights
 | 03:30 | 聊天增量同步 |
 | 03:45 | 知识库增量同步 |
 | 04:00 | 邮箱增量同步 |
+| 每 300 秒 | 详细会议记录增量同步 |
 
 聊天和邮箱的日常增量默认会采用约2天重叠窗口，用来捕获延迟出现、编辑或状态发生变化的内容。
 
@@ -1357,15 +1358,15 @@ sudo ./scripts/install-local.sh --without-insights
 DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS = 60
 ```
 
-而安装脚本直接读取该参数生成 `StartInterval`。
+该值作为 KeepAlive 进程异常退出后的 `ThrottleInterval`，不是正常工作的唤醒周期。
 
 所以启用 Insights 后的实际行为应按：
 
-> **每60秒唤醒一次回填调度器**
+> **回填进程常驻；异常退出后至少等待 60 秒再由 launchd 重启**
 
 理解。
 
-这并不等于每60秒就一定调用大模型；它还会检查模型是否空闲等条件。
+常驻进程仍会检查模型是否空闲；繁忙时按程序内置间隔轮询，不会每 60 秒固定提交正文。
 
 ---
 
@@ -1961,6 +1962,7 @@ backfill-state.json
 - [ ] 聊天同步 LaunchAgent 存在
 - [ ] Wiki 同步 LaunchAgent 存在
 - [ ] Mail 同步 LaunchAgent 存在
+- [ ] Meeting Records 同步 LaunchAgent 存在，周期为 300 秒
 - [ ] 若只部署核心功能，Insights 和 Backfill LaunchAgent 不存在
 - [ ] 若明确启用全部功能，Insights 和 Backfill LaunchAgent 均存在
 
@@ -1972,6 +1974,7 @@ backfill-state.json
 - [ ] 实际模型 ID 与配置一致
 - [ ] `insights-run` 成功
 - [ ] `insights-status` 正常
+- [ ] `meeting-records-status` 正常，会议修订后已有日报只显示“待人工刷新”
 - [ ] 已用 `mail-reader-url --open` 建立本机阅读会话
 - [ ] `/?mode=insights` 页面能够打开
 - [ ] Yesterday Summary 有内容

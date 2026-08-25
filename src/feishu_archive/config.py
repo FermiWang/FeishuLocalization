@@ -52,6 +52,10 @@ DEFAULT_VMLX_LOCAL_PORT = 18135
 # forwards never collide with a manual or scheduled `insights-run` on 18135.
 DEFAULT_INSIGHTS_BACKFILL_LOCAL_PORT = 18136
 DEFAULT_VMLX_REMOTE_PORT = 11435
+DEFAULT_MEETING_RECORDS_HOST = "192.168.100.179"
+DEFAULT_MEETING_RECORDS_USER = "apple"
+DEFAULT_MEETING_RECORDS_SYNC_INTERVAL_SECONDS = 300
+DEFAULT_MEETING_RECORDS_SYNC_TIMEOUT_SECONDS = 45
 DEFAULT_MAIL_INITIAL_DAYS: int | None = None
 DEFAULT_MAIL_OVERLAP_DAYS = 2
 DEFAULT_MAIL_MAX_PAGES = 5000
@@ -122,6 +126,10 @@ class ArchivePaths:
         return self.root / "insights.sqlite3"
 
     @property
+    def meeting_records_database(self) -> Path:
+        return self.root / "meeting-records.sqlite3"
+
+    @property
     def insights(self) -> Path:
         return self.root / "insights"
 
@@ -172,6 +180,10 @@ class ArchivePaths:
     @property
     def insights_lock(self) -> Path:
         return self.root / "insights.lock"
+
+    @property
+    def meeting_records_sync_lock(self) -> Path:
+        return self.root / "meeting-records-sync.lock"
 
     @property
     def reader_secret(self) -> Path:

@@ -1,4 +1,4 @@
-"""说话人分离编排：音频转码 + 调用独立 funasr worker 子进程。
+"""Audio transcription and speaker diarization orchestration.
 
 主应用自身不依赖 torch/funasr；worker 由独立 venv（SPK_PYTHON）执行。
 任何一步失败都返回 None，由调用方回退为无发言人标注的整理。
@@ -23,16 +23,15 @@ def available() -> bool:
     return Path(SPK_PYTHON).is_file() and WORKER.is_file()
 
 
-def diarize(meeting_id: int, audio_path: str, transcript_path: str,
-            upload_dir: Path) -> str | None:
-    """对会议音频做声纹分离并把讯飞转写按发言人区分。
-
-    成功返回带「发言人N：」前缀的转写文本；单人会议或失败返回 None。
-    """
+def analyze(meeting_id: int, source_id: int, audio_path: str,
+            authoritative_text: str | None, upload_dir: Path) -> dict | None:
+    """Return FunASR text/timeline/speaker labels; caller decides fallback policy."""
     if not available():
         return None
-    wav = upload_dir / f"{meeting_id}_spk.wav"
-    out_json = upload_dir / f"{meeting_id}_spk.json"
+    stem = f"{meeting_id}_{source_id}_spk"
+    wav = upload_dir / f"{stem}.wav"
+    transcript_path = upload_dir / f"{stem}_authoritative.txt"
+    out_json = upload_dir / f"{stem}.json"
     try:
         # macOS 自带 afconvert：mp3/m4a 等 → 16kHz 单声道 wav
         subprocess.run(
@@ -40,15 +39,28 @@ def diarize(meeting_id: int, audio_path: str, transcript_path: str,
              audio_path, str(wav)],
             check=True, capture_output=True, timeout=300,
         )
+        transcript_arg = "-"
+        if authoritative_text and authoritative_text.strip():
+            transcript_path.write_text(authoritative_text, encoding="utf-8")
+            transcript_arg = str(transcript_path)
         subprocess.run(
-            [SPK_PYTHON, str(WORKER), str(wav), transcript_path, str(out_json)],
+            [SPK_PYTHON, str(WORKER), str(wav), transcript_arg, str(out_json)],
             check=True, capture_output=True, timeout=WORKER_TIMEOUT,
         )
         data = json.loads(out_json.read_text(encoding="utf-8"))
-        labeled = (data.get("labeled") or "").strip()
-        return labeled or None
+        if not str(data.get("text") or "").strip():
+            return None
+        return data
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
             OSError, json.JSONDecodeError, KeyError):
         return None
     finally:
         wav.unlink(missing_ok=True)
+
+
+def diarize(meeting_id: int, audio_path: str, transcript_path: str,
+            upload_dir: Path) -> str | None:
+    """Legacy compatibility wrapper for the original single-source API."""
+    text = Path(transcript_path).read_text(encoding="utf-8", errors="replace")
+    result = analyze(meeting_id, 0, audio_path, text, upload_dir)
+    return str(result.get("labeled") or "").strip() if result else None

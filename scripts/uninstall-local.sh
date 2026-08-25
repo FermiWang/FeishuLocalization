@@ -5,14 +5,15 @@ SERVICE_LABEL="com.fermiwang.feishu-archive"
 SYNC_LABEL="com.fermiwang.feishu-archive-sync"
 WIKI_SYNC_LABEL="com.fermiwang.feishu-archive-wiki-sync"
 MAIL_SYNC_LABEL="com.fermiwang.feishu-archive-mail-sync"
+MEETING_SYNC_LABEL="com.fermiwang.feishu-archive-meeting-records-sync"
 INSIGHTS_LABEL="com.fermiwang.feishu-archive-insights"
 INSIGHTS_BACKFILL_LABEL="com.fermiwang.feishu-archive-insights-backfill"
 USER_DOMAIN="gui/$(id -u)"
 
-for LABEL in "$SERVICE_LABEL" "$SYNC_LABEL" "$WIKI_SYNC_LABEL" "$MAIL_SYNC_LABEL" "$INSIGHTS_LABEL" "$INSIGHTS_BACKFILL_LABEL"; do
+for LABEL in "$SERVICE_LABEL" "$SYNC_LABEL" "$WIKI_SYNC_LABEL" "$MAIL_SYNC_LABEL" "$MEETING_SYNC_LABEL" "$INSIGHTS_LABEL" "$INSIGHTS_BACKFILL_LABEL"; do
   launchctl bootout "$USER_DOMAIN/$LABEL" >/dev/null 2>&1 || true
   rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
 done
 
-echo "Feishu Archive 阅读器、三条源同步、每日洞察和历史洞察回填服务已移除。"
+echo "Feishu Archive 阅读器、聊天/知识库/邮箱/会议同步、每日洞察和历史洞察回填服务已移除。"
 echo "档案数据仍保留在：$HOME/Library/Application Support/Feishu Archive"

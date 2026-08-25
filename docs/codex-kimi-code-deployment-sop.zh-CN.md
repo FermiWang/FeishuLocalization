@@ -627,7 +627,7 @@ launchctl print "gui/$(id -u)/com.fermiwang.feishu-archive-insights-backfill"
 依据当前 README、docs/manual-deployment-sop.zh-CN.md 和 docs/codex-kimi-code-deployment-sop.zh-CN.md，检查：
 - 当前源码版本、工作树；
 - /api/status 和 /api/wiki/status；
-- reader、chat sync、wiki sync、mail sync 的 LaunchAgent；
+- reader、chat sync、wiki sync、mail sync、meeting records sync 的 LaunchAgent；
 - doctor、mail-status、mail-doctor；
 - 当前是否应安装 Insights；
 - 最近同步状态与日志中是否有当前时间段的新错误。
@@ -747,7 +747,7 @@ Insights 人工抽样：PASS / FAIL / NOT APPLICABLE
 验收人：
 ```
 
-核心部署只有在健康接口、四个核心 LaunchAgent、`doctor`/`mail-doctor` 和用户内容抽样都达到预期后才算完成。Insights 必须单独授权、单独验收，不能因核心归档成功而默认启用。
+核心部署只有在健康接口、五个核心 LaunchAgent、`doctor`/`mail-doctor`、`meeting-records-status` 和用户内容抽样都达到预期后才算完成。Insights 必须单独授权、单独验收，不能因核心归档成功而默认启用。
 
 ---
 

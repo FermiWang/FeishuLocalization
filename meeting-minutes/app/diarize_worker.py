@@ -1,10 +1,10 @@
-"""说话人分离 + 讯飞文本对齐 —— 独立进程脚本（需 funasr 环境运行，勿被主应用 import）。
+"""FunASR 转写、标点、VAD 与说话人分离 worker（由独立环境执行）。
 
 用法：
-    python diarize_worker.py <audio.wav(16k单声道)> <transcript.txt> <out.json>
+    python diarize_worker.py <audio.wav(16k单声道)> <transcript.txt|-> <out.json>
 
 输出 out.json：
-    {"speakers": N, "labeled": "发言人1：……\n发言人2：……"}
+    {"speakers": N, "text": "……", "labeled": "发言人1：……", "segments": [...]}
 失败时抛出非零退出码，stderr 带原因；调用方负责回退。
 """
 import json
@@ -81,6 +81,21 @@ def render_labeled(items: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
+def _segments(sentence_info: list[dict]) -> list[dict]:
+    result = []
+    for item in sentence_info:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        result.append({
+            "speaker": int(item.get("spk") or 0),
+            "text": text,
+            "start_ms": int(item.get("start") or 0),
+            "end_ms": int(item.get("end") or 0),
+        })
+    return result
+
+
 def main() -> None:
     wav_path, transcript_path, out_path = sys.argv[1:4]
 
@@ -94,17 +109,35 @@ def main() -> None:
         disable_update=True,
     )
     res = model.generate(input=wav_path, batch_size_s=300)
-    segs = (res[0].get("sentence_info") if res else None) or []
+    first = res[0] if res else {}
+    segs = (first.get("sentence_info") if first else None) or []
     if not segs:
         raise RuntimeError("声纹分离无结果（音频可能为空或无声）")
 
-    with open(transcript_path, encoding="utf-8") as f:
-        transcript = f.read()
-    speakers = len({s["spk"] for s in segs})
-    labeled = render_labeled(align_speakers(transcript, segs)) if speakers > 1 else ""
+    recognized = str(first.get("text") or "").strip()
+    speakers = len({int(s.get("spk") or 0) for s in segs})
+    if transcript_path != "-":
+        with open(transcript_path, encoding="utf-8") as f:
+            transcript = f.read()
+        aligned = align_speakers(transcript, segs)
+        text = transcript
+        labeled = render_labeled(aligned)
+    else:
+        rendered = _segments(segs)
+        text = recognized or "".join(item["text"] for item in rendered)
+        labeled = render_labeled(rendered)
 
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"speakers": speakers, "labeled": labeled}, f, ensure_ascii=False)
+        json.dump({
+            "speakers": speakers,
+            "text": text,
+            "labeled": labeled,
+            "segments": _segments(segs),
+            "models": {
+                "asr": "paraformer-zh", "vad": "fsmn-vad",
+                "punc": "ct-punc", "speaker": "cam++",
+            },
+        }, f, ensure_ascii=False)
 
 
 if __name__ == "__main__":

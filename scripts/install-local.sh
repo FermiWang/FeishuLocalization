@@ -5,6 +5,7 @@ SERVICE_LABEL="com.fermiwang.feishu-archive"
 SYNC_LABEL="com.fermiwang.feishu-archive-sync"
 WIKI_SYNC_LABEL="com.fermiwang.feishu-archive-wiki-sync"
 MAIL_SYNC_LABEL="com.fermiwang.feishu-archive-mail-sync"
+MEETING_SYNC_LABEL="com.fermiwang.feishu-archive-meeting-records-sync"
 INSIGHTS_LABEL="com.fermiwang.feishu-archive-insights"
 INSIGHTS_BACKFILL_LABEL="com.fermiwang.feishu-archive-insights-backfill"
 PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -15,10 +16,12 @@ SERVICE_PLIST_PATH="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
 SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$SYNC_LABEL.plist"
 WIKI_SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$WIKI_SYNC_LABEL.plist"
 MAIL_SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$MAIL_SYNC_LABEL.plist"
+MEETING_SYNC_PLIST_PATH="$HOME/Library/LaunchAgents/$MEETING_SYNC_LABEL.plist"
 INSIGHTS_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_LABEL.plist"
 INSIGHTS_BACKFILL_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_BACKFILL_LABEL.plist"
 PYTHON_BIN=$(command -v python3)
 INSIGHTS_BACKFILL_INTERVAL_SECONDS=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS; print(DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS)')
+MEETING_SYNC_INTERVAL_SECONDS=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_MEETING_RECORDS_SYNC_INTERVAL_SECONDS; print(DEFAULT_MEETING_RECORDS_SYNC_INTERVAL_SECONDS)')
 USER_DOMAIN="gui/$(id -u)"
 INSTALL_INSIGHTS=""
 STAGING_DIR=""
@@ -27,6 +30,7 @@ TEMP_SERVICE_PLIST=""
 TEMP_SYNC_PLIST=""
 TEMP_WIKI_SYNC_PLIST=""
 TEMP_MAIL_SYNC_PLIST=""
+TEMP_MEETING_SYNC_PLIST=""
 TEMP_INSIGHTS_PLIST=""
 TEMP_INSIGHTS_BACKFILL_PLIST=""
 SERVICES_STOPPED=0
@@ -37,7 +41,7 @@ usage() {
 Usage: ./scripts/install-local.sh [--with-insights|--without-insights]
 
   --with-insights     Install and immediately start daily Insights and backfill.
-  --without-insights  Install only reader, chat, Wiki, and Mail services.
+  --without-insights  Install reader plus chat, Wiki, Mail, and meeting-record sync.
 
 With no option, a new installation defaults to core-only. An existing
 installation preserves whether Insights is already installed.
@@ -83,6 +87,7 @@ rollback_install() {
   launchctl bootout "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 || true
   launchctl bootout "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 || true
   launchctl bootout "$USER_DOMAIN/$MAIL_SYNC_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "$USER_DOMAIN/$MEETING_SYNC_LABEL" >/dev/null 2>&1 || true
   launchctl bootout "$USER_DOMAIN/$INSIGHTS_LABEL" >/dev/null 2>&1 || true
   launchctl bootout "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL" >/dev/null 2>&1 || true
   if [ -d "$BACKUP_DIR/runtime" ]; then
@@ -93,6 +98,7 @@ rollback_install() {
   restore_plist "$SYNC_LABEL.plist" "$SYNC_PLIST_PATH"
   restore_plist "$WIKI_SYNC_LABEL.plist" "$WIKI_SYNC_PLIST_PATH"
   restore_plist "$MAIL_SYNC_LABEL.plist" "$MAIL_SYNC_PLIST_PATH"
+  restore_plist "$MEETING_SYNC_LABEL.plist" "$MEETING_SYNC_PLIST_PATH"
   restore_plist "$INSIGHTS_LABEL.plist" "$INSIGHTS_PLIST_PATH"
   restore_plist "$INSIGHTS_BACKFILL_LABEL.plist" "$INSIGHTS_BACKFILL_PLIST_PATH"
   for restored_plist in \
@@ -100,6 +106,7 @@ rollback_install() {
     "$SYNC_PLIST_PATH" \
     "$WIKI_SYNC_PLIST_PATH" \
     "$MAIL_SYNC_PLIST_PATH" \
+    "$MEETING_SYNC_PLIST_PATH" \
     "$INSIGHTS_PLIST_PATH" \
     "$INSIGHTS_BACKFILL_PLIST_PATH"
   do
@@ -124,6 +131,7 @@ cleanup() {
     "$TEMP_SYNC_PLIST" \
     "$TEMP_WIKI_SYNC_PLIST" \
     "$TEMP_MAIL_SYNC_PLIST" \
+    "$TEMP_MEETING_SYNC_PLIST" \
     "$TEMP_INSIGHTS_PLIST" \
     "$TEMP_INSIGHTS_BACKFILL_PLIST"
   do
@@ -169,6 +177,7 @@ for current_plist in \
   "$SYNC_PLIST_PATH" \
   "$WIKI_SYNC_PLIST_PATH" \
   "$MAIL_SYNC_PLIST_PATH" \
+  "$MEETING_SYNC_PLIST_PATH" \
   "$INSIGHTS_PLIST_PATH" \
   "$INSIGHTS_BACKFILL_PLIST_PATH"
 do
@@ -184,6 +193,7 @@ launchctl bootout "$USER_DOMAIN/$SERVICE_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "$USER_DOMAIN/$MAIL_SYNC_LABEL" >/dev/null 2>&1 || true
+launchctl bootout "$USER_DOMAIN/$MEETING_SYNC_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "$USER_DOMAIN/$INSIGHTS_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL" >/dev/null 2>&1 || true
 
@@ -198,6 +208,8 @@ chmod 600 "$ARCHIVE_DIR/archive.sqlite3"
 if [ -f "$ARCHIVE_DIR/mail.sqlite3" ]; then
   chmod 600 "$ARCHIVE_DIR/mail.sqlite3"
 fi
+"$RUNTIME_DIR/bin/feishu-archive" --archive-dir "$ARCHIVE_DIR" meeting-records-status >/dev/null
+chmod 600 "$ARCHIVE_DIR/meeting-records.sqlite3"
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   "$RUNTIME_DIR/bin/feishu-archive" --archive-dir "$ARCHIVE_DIR" insights-status >/dev/null
   chmod 600 "$ARCHIVE_DIR/insights.sqlite3"
@@ -209,11 +221,12 @@ TEMP_SERVICE_PLIST=$(mktemp)
 TEMP_SYNC_PLIST=$(mktemp)
 TEMP_WIKI_SYNC_PLIST=$(mktemp)
 TEMP_MAIL_SYNC_PLIST=$(mktemp)
+TEMP_MEETING_SYNC_PLIST=$(mktemp)
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   TEMP_INSIGHTS_PLIST=$(mktemp)
   TEMP_INSIGHTS_BACKFILL_PLIST=$(mktemp)
 fi
-rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MAIL_SYNC_PLIST"
+rm -f "$TEMP_SERVICE_PLIST" "$TEMP_SYNC_PLIST" "$TEMP_WIKI_SYNC_PLIST" "$TEMP_MAIL_SYNC_PLIST" "$TEMP_MEETING_SYNC_PLIST"
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   rm -f "$TEMP_INSIGHTS_PLIST" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 fi
@@ -300,6 +313,25 @@ fi
 /usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/mail-sync.log" "$TEMP_MAIL_SYNC_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/mail-sync.error.log" "$TEMP_MAIL_SYNC_PLIST"
 
+/usr/libexec/PlistBuddy -c "Add :Label string $MEETING_SYNC_LABEL" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $RUNTIME_DIR/bin/feishu-archive" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:1 string --archive-dir" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $ARCHIVE_DIR" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:3 string meeting-records-sync" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:4 string --scheduled" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $RUNTIME_DIR" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FEISHU_ARCHIVE_PYTHON string $PYTHON_BIN" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :RunAtLoad bool true" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StartInterval integer $MEETING_SYNC_INTERVAL_SECONDS" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProcessType string Background" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer 60" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :Umask integer 63" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StandardOutPath string $LOG_DIR/meeting-records-sync.log" "$TEMP_MEETING_SYNC_PLIST"
+/usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $LOG_DIR/meeting-records-sync.error.log" "$TEMP_MEETING_SYNC_PLIST"
+
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
 /usr/libexec/PlistBuddy -c "Add :Label string $INSIGHTS_LABEL" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$TEMP_INSIGHTS_PLIST"
@@ -351,6 +383,7 @@ plutil -lint "$TEMP_SERVICE_PLIST" >/dev/null
 plutil -lint "$TEMP_SYNC_PLIST" >/dev/null
 plutil -lint "$TEMP_WIKI_SYNC_PLIST" >/dev/null
 plutil -lint "$TEMP_MAIL_SYNC_PLIST" >/dev/null
+plutil -lint "$TEMP_MEETING_SYNC_PLIST" >/dev/null
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   plutil -lint "$TEMP_INSIGHTS_PLIST" >/dev/null
   plutil -lint "$TEMP_INSIGHTS_BACKFILL_PLIST" >/dev/null
@@ -359,6 +392,7 @@ install -m 600 "$TEMP_SERVICE_PLIST" "$SERVICE_PLIST_PATH"
 install -m 600 "$TEMP_SYNC_PLIST" "$SYNC_PLIST_PATH"
 install -m 600 "$TEMP_WIKI_SYNC_PLIST" "$WIKI_SYNC_PLIST_PATH"
 install -m 600 "$TEMP_MAIL_SYNC_PLIST" "$MAIL_SYNC_PLIST_PATH"
+install -m 600 "$TEMP_MEETING_SYNC_PLIST" "$MEETING_SYNC_PLIST_PATH"
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   install -m 600 "$TEMP_INSIGHTS_PLIST" "$INSIGHTS_PLIST_PATH"
   install -m 600 "$TEMP_INSIGHTS_BACKFILL_PLIST" "$INSIGHTS_BACKFILL_PLIST_PATH"
@@ -370,6 +404,7 @@ launchctl enable "$USER_DOMAIN/$SERVICE_LABEL"
 launchctl enable "$USER_DOMAIN/$SYNC_LABEL"
 launchctl enable "$USER_DOMAIN/$WIKI_SYNC_LABEL"
 launchctl enable "$USER_DOMAIN/$MAIL_SYNC_LABEL"
+launchctl enable "$USER_DOMAIN/$MEETING_SYNC_LABEL"
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   launchctl enable "$USER_DOMAIN/$INSIGHTS_LABEL"
   launchctl enable "$USER_DOMAIN/$INSIGHTS_BACKFILL_LABEL"
@@ -378,6 +413,7 @@ launchctl bootstrap "$USER_DOMAIN" "$SERVICE_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$SYNC_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$WIKI_SYNC_PLIST_PATH"
 launchctl bootstrap "$USER_DOMAIN" "$MAIL_SYNC_PLIST_PATH"
+launchctl bootstrap "$USER_DOMAIN" "$MEETING_SYNC_PLIST_PATH"
 if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
   launchctl bootstrap "$USER_DOMAIN" "$INSIGHTS_PLIST_PATH"
 fi
@@ -389,6 +425,7 @@ while [ "$ATTEMPT" -lt 20 ]; do
     && launchctl print "$USER_DOMAIN/$SYNC_LABEL" >/dev/null 2>&1 \
     && launchctl print "$USER_DOMAIN/$WIKI_SYNC_LABEL" >/dev/null 2>&1 \
     && launchctl print "$USER_DOMAIN/$MAIL_SYNC_LABEL" >/dev/null 2>&1 \
+    && launchctl print "$USER_DOMAIN/$MEETING_SYNC_LABEL" >/dev/null 2>&1 \
     && { [ "$INSTALL_INSIGHTS" -eq 0 ] || launchctl print "$USER_DOMAIN/$INSIGHTS_LABEL" >/dev/null 2>&1; }; then
     # Start the mutating backfill agent only after the reader and all existing
     # scheduled lanes have passed deployment health checks. Until this point a
@@ -408,6 +445,7 @@ while [ "$ATTEMPT" -lt 20 ]; do
     echo "每日同步：${SYNC_LABEL}（每天 03:30）"
     echo "知识库同步：${WIKI_SYNC_LABEL}（每天 03:45）"
     echo "邮箱同步：${MAIL_SYNC_LABEL}（每天 04:00；未授权时安全跳过，不影响其他通道）"
+    echo "会议记录同步：${MEETING_SYNC_LABEL}（每 ${MEETING_SYNC_INTERVAL_SECONDS} 秒增量拉取一次）"
     if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
       echo "每日洞察：${INSIGHTS_LABEL}（每天 04:30，失败时 05:00/05:30 断点重试）"
       echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（常驻；vMLX 引擎空闲时从最早日期向最近日期连续回填，繁忙时轮询等待）"

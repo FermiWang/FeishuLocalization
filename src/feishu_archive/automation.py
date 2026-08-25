@@ -4,10 +4,12 @@ import errno
 import fcntl
 import os
 import sys
+import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+from datetime import date
 
 from .config import (
     DEFAULT_INCREMENTAL_DAYS,
@@ -22,6 +24,7 @@ from .config import (
 from .database import ArchiveDatabase
 from .mail_database import MailDatabase
 from .mail_sync import MailSyncer
+from .meeting_records_database import MeetingRecordsDatabase
 from .sync import ArchiveSyncer, SyncCounts
 from .wiki import WikiSyncCounts, WikiSyncer
 
@@ -54,6 +57,62 @@ class SyncFileLock:
         self._file.close()
 
 
+class BackgroundInsightsRefreshController:
+    """Run a human-confirmed historical refresh in a separate CLI process."""
+
+    def __init__(self, paths: ArchivePaths, executable: str | None = None) -> None:
+        self.paths = paths
+        candidate = Path(executable or sys.argv[0]).expanduser().resolve()
+        self.executable = str(candidate) if candidate.is_file() else "feishu-archive"
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._status: dict[str, Any] = {"status": "idle"}
+
+    def start(self, report_date: str) -> bool:
+        date.fromisoformat(report_date)
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return False
+            self._status = {"status": "running", "report_date": report_date}
+            self._thread = threading.Thread(
+                target=self._run, args=(report_date,), daemon=True,
+                name="insights-meeting-refresh",
+            )
+            self._thread.start()
+            return True
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._status)
+
+    def _run(self, report_date: str) -> None:
+        log_dir = self.paths.root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        log_path = log_dir / "insights-refresh.log"
+        command = [
+            self.executable, "--archive-dir", str(self.paths.root),
+            "insights-run", "--date", report_date,
+        ]
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                completed = subprocess.run(
+                    command, stdout=log, stderr=log, timeout=7200, check=False,
+                )
+            status = "success" if completed.returncode == 0 else "failed"
+            detail = None if completed.returncode == 0 else f"exit_code={completed.returncode}"
+            if status == "success":
+                meeting_database = MeetingRecordsDatabase(self.paths.meeting_records_database)
+                meeting_database.initialize()
+                if meeting_database.stale_status(report_date).get("status") == "pending":
+                    status = "failed"
+                    detail = "report_not_published_or_model_busy"
+        except Exception as exc:  # noqa: BLE001 - exposed as bounded status only
+            status = "failed"
+            detail = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            self._status = {"status": status, "report_date": report_date, "detail": detail}
+
+
 def acquire_sync_lock(paths: ArchivePaths) -> SyncFileLock:
     paths.ensure()
     return SyncFileLock(paths.sync_lock)
@@ -72,6 +131,12 @@ def acquire_mail_sync_lock(paths: ArchivePaths) -> SyncFileLock:
 def acquire_insights_lock(paths: ArchivePaths) -> SyncFileLock:
     paths.ensure()
     return SyncFileLock(paths.insights_lock)
+
+
+def acquire_meeting_records_sync_lock(paths: ArchivePaths) -> SyncFileLock:
+    paths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(paths.root, 0o700)
+    return SyncFileLock(paths.meeting_records_sync_lock)
 
 
 def run_sync_cycle(

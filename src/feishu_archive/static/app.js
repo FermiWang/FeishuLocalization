@@ -24,6 +24,7 @@ const state = {
   mailSyncWasRunning: false,
   mailPollTimer: null,
   insightsLoaded: false,
+  insightsRefreshDate: null,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -178,6 +179,9 @@ async function loadInsights(updateHistory = true) {
     const counts = report.coverage?.counts || {};
     const ledger = report.task_ledger || {};
     const backfill = insightStatus.backfill || {};
+    const meetingStatus = insightStatus.meeting_records || {};
+    const staleItems = meetingStatus.stale?.items || [];
+    const stale = staleItems.find((item) => item.meeting_date === reportDate);
     $("insights-title").textContent = `每日洞察 · ${report.report_date || reportDate}`;
     $("insights-meta").textContent = `${report.timezone || ""} · 模型 ${report.model || "未记录"} · 状态 ${report.model_status || run.status || "unknown"}`;
     const ledgerText = backfill.historical_analysis_complete && backfill.cumulative_ledger_complete
@@ -189,7 +193,21 @@ async function loadInsights(updateHistory = true) {
           : ledger.cumulative_ledger_complete
             ? `累计待办已核对：${ledger.coverage_start || ""} 至 ${ledger.coverage_end || ""}。`
             : `累计待办仅覆盖已成功日报；全历史回填尚未启动。`;
-    $("insights-coverage").textContent = `覆盖：聊天 ${counts.chat || 0} 条；收到邮件 ${counts.mail_received || 0} 封；发出邮件 ${counts.mail_sent || 0} 封；知识库新增 ${counts.wiki_created || 0} 篇、编辑 ${counts.wiki_edited || 0} 篇。${ledgerText}`;
+    $("insights-coverage").textContent = `覆盖：聊天 ${counts.chat || 0} 条；收到邮件 ${counts.mail_received || 0} 封；发出邮件 ${counts.mail_sent || 0} 封；知识库新增 ${counts.wiki_created || 0} 篇、编辑 ${counts.wiki_edited || 0} 篇；详细会议记录 ${counts.meetings || 0} 场、${counts.meeting_sections || 0} 个章节。${ledgerText}`;
+    const meetingWarning = $("insights-meeting-warning");
+    const refreshButton = $("insights-refresh");
+    state.insightsRefreshDate = stale ? reportDate : null;
+    refreshButton.hidden = !stale;
+    if (stale) {
+      meetingWarning.hidden = false;
+      meetingWarning.textContent = "会议证据已更新，当前历史日报尚未引用最新修订。请由本人点击刷新；旧日报仍会保留。";
+    } else if (meetingStatus.status === "error" || meetingStatus.error) {
+      meetingWarning.hidden = false;
+      meetingWarning.textContent = "会议记录同步不完整；聊天、知识库和邮箱阅读不受影响。可稍后重试会议同步。";
+    } else {
+      meetingWarning.hidden = true;
+      meetingWarning.textContent = "";
+    }
     renderInsightItems("insights-yesterday", report.yesterday_summary);
     renderInsightItems("insights-today", report.today_plan);
     renderInsightItems("insights-opportunities", report.commercial_opportunities);
@@ -207,7 +225,9 @@ async function loadInsights(updateHistory = true) {
     const message = mailAccessMessage(error);
     $("insights-status").textContent = message;
     $("insights-meta").textContent = message;
-    $("insights-coverage").textContent = "日报不可用；三条源档案不会因此受影响。";
+    $("insights-coverage").textContent = "日报不可用；四条证据通道不会因此受影响。";
+    $("insights-meeting-warning").hidden = true;
+    $("insights-refresh").hidden = true;
     renderInsightItems("insights-yesterday", []);
     renderInsightItems("insights-today", []);
     renderInsightItems("insights-opportunities", []);
@@ -1149,6 +1169,30 @@ $("mode-insights").addEventListener("click", async () => {
   await loadInsights(true);
 });
 $("insights-load").addEventListener("click", () => loadInsights(true));
+$("insights-refresh").addEventListener("click", async () => {
+  const reportDate = state.insightsRefreshDate;
+  if (!reportDate) return;
+  if (!window.confirm(`确认使用最新会议证据刷新 ${reportDate} 的每日洞察？旧报告会保留。`)) return;
+  const button = $("insights-refresh");
+  button.disabled = true;
+  try {
+    await request("/api/insights/refresh", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Feishu-Archive-Action": "insights-refresh",
+      },
+      body: JSON.stringify({ report_date: reportDate }),
+    });
+    $("insights-meeting-warning").hidden = false;
+    $("insights-meeting-warning").textContent = "刷新任务已启动；模型繁忙时会等待，完成后请重新查看该日期。";
+  } catch (error) {
+    $("insights-meeting-warning").hidden = false;
+    $("insights-meeting-warning").textContent = error.message || "刷新启动失败";
+  } finally {
+    button.disabled = false;
+  }
+});
 $("wiki-sync-now").addEventListener("click", startWikiSync);
 $("wiki-search").addEventListener("click", searchWiki);
 $("wiki-query").addEventListener("input", () => { if (state.wikiView === "nodes") renderWikiNodes(); });

@@ -21,10 +21,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import __version__
 from .automation import (
     BackgroundMailSyncController,
+    BackgroundInsightsRefreshController,
     BackgroundSyncController,
     BackgroundWikiSyncController,
     SyncBusyError,
     acquire_insights_lock,
+    acquire_meeting_records_sync_lock,
     run_mail_sync_cycle,
     run_sync_cycle,
     run_wiki_sync_cycle,
@@ -50,6 +52,9 @@ from .config import (
     DEFAULT_MAIL_OVERLAP_DAYS,
     DEFAULT_MAIL_SYNC_HOUR,
     DEFAULT_MAIL_SYNC_MINUTE,
+    DEFAULT_MEETING_RECORDS_HOST,
+    DEFAULT_MEETING_RECORDS_SYNC_TIMEOUT_SECONDS,
+    DEFAULT_MEETING_RECORDS_USER,
     DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
@@ -78,6 +83,8 @@ from .feishu import FeishuAPIError, FeishuClient
 from .feishu_mail import FeishuMailProvider
 from .keychain import KeychainError, KeychainStore
 from .mail_database import MailDatabase
+from .meeting_records_database import MeetingRecordsDatabase
+from .meeting_records_sync import SSHMeetingRecordsExporter, sync_meeting_records
 from .mail_sync import MailAuthorizationError, MailCapacityError, MailSyncPartialError
 from .insights import (
     InsightsRunOptions,
@@ -388,6 +395,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("insights-status", help="显示每日洞察状态")
 
+    meeting_sync = subparsers.add_parser(
+        "meeting-records-sync", help="从 179 增量同步已完成的详细会议记录"
+    )
+    meeting_sync.add_argument("--host", default=DEFAULT_MEETING_RECORDS_HOST)
+    meeting_sync.add_argument("--user", default=DEFAULT_MEETING_RECORDS_USER)
+    meeting_sync.add_argument("--identity-file", default=DEFAULT_VMLX_IDENTITY_FILE)
+    meeting_sync.add_argument(
+        "--timeout", type=int, default=DEFAULT_MEETING_RECORDS_SYNC_TIMEOUT_SECONDS
+    )
+    meeting_sync.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    subparsers.add_parser("meeting-records-status", help="显示详细会议记录同步和待刷新状态")
+
     reader = subparsers.add_parser("serve", help="启动仅本机可访问的离线阅读器")
     reader.add_argument("--host", default="127.0.0.1")
     reader.add_argument("--port", type=int, default=DEFAULT_READER_PORT)
@@ -428,6 +447,7 @@ def main(argv: list[str] | None = None) -> None:
     paths = archive_paths(args.archive_dir)
     database: ArchiveDatabase | None = None
     mail_database: MailDatabase | None = None
+    meeting_database: MeetingRecordsDatabase | None = None
 
     archive_commands = {
         "init",
@@ -453,6 +473,10 @@ def main(argv: list[str] | None = None) -> None:
         "mail-preflight",
         "insights-backfill-step",
     }
+    meeting_database_commands = {
+        "init", "serve", "insights-run", "insights-status", "insights-backfill-step",
+        "meeting-records-sync", "meeting-records-status",
+    }
 
     if args.command in archive_commands:
         _ensure_archive_paths(paths)
@@ -462,12 +486,18 @@ def main(argv: list[str] | None = None) -> None:
         _ensure_mail_paths(paths)
         mail_database = MailDatabase(paths.mail_database)
         mail_database.initialize()
+    if args.command in meeting_database_commands:
+        paths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(paths.root, 0o700)
+        meeting_database = MeetingRecordsDatabase(paths.meeting_records_database)
+        meeting_database.initialize()
     try:
         if args.command == "init":
             assert database is not None
             assert mail_database is not None
             print(f"档案库已初始化：{paths.database}")
             print(f"独立邮件库已初始化：{paths.mail_database}")
+            print(f"独立会议记录库已初始化：{paths.meeting_records_database}")
         elif args.command == "demo":
             assert database is not None
             result = seed_demo(database, paths)
@@ -702,6 +732,37 @@ def main(argv: list[str] | None = None) -> None:
             assert mail_database is not None
             failed = _mail_doctor(mail_database, paths)
             raise SystemExit(1 if failed else 0)
+        elif args.command == "meeting-records-status":
+            assert meeting_database is not None
+            print(
+                json.dumps(
+                    {**meeting_database.status(), "stale": meeting_database.stale_status()},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        elif args.command == "meeting-records-sync":
+            assert meeting_database is not None
+            insights_database = None
+            if paths.insights_database.is_file():
+                insights_database = InsightsDatabase(paths.insights_database)
+                insights_database.initialize()
+            lock = acquire_meeting_records_sync_lock(paths)
+            try:
+                result = sync_meeting_records(
+                    meeting_database,
+                    insights_database,
+                    trigger="scheduled" if args.scheduled else "manual",
+                    exporter=SSHMeetingRecordsExporter(
+                        host=args.host,
+                        user=args.user,
+                        identity_file=args.identity_file,
+                        timeout=args.timeout,
+                    ),
+                )
+            finally:
+                lock.release()
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "insights-configure":
             value = sys.stdin.read().strip()
             if not value:
@@ -711,11 +772,16 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "insights-status":
             insights_database = InsightsDatabase(paths.insights_database)
             insights_database.initialize()
+            assert meeting_database is not None
             print(
                 json.dumps(
                     {
                         **insights_database.status(),
                         "backfill": public_backfill_status(paths.insights_backfill_state),
+                        "meeting_records": {
+                            **meeting_database.status(),
+                            "stale": meeting_database.stale_status(),
+                        },
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -725,13 +791,20 @@ def main(argv: list[str] | None = None) -> None:
             assert database is not None
             assert mail_database is not None
             if args.loop:
-                _run_insights_backfill_loop(args, paths, database, mail_database)
+                _run_insights_backfill_loop(
+                    args,
+                    paths,
+                    database,
+                    mail_database,
+                    meeting_database=meeting_database,
+                )
             else:
                 _run_insights_backfill_step(
                     args,
                     paths,
                     database,
                     mail_database,
+                    meeting_database=meeting_database,
                 )
         elif args.command == "insights-run":
             if not paths.database.is_file():
@@ -742,6 +815,45 @@ def main(argv: list[str] | None = None) -> None:
             insights_database = None if args.dry_run else InsightsDatabase(paths.insights_database)
             if insights_database is not None:
                 insights_database.initialize()
+            assert meeting_database is not None
+            if not args.dry_run:
+                meeting_lock = None
+                try:
+                    meeting_lock = acquire_meeting_records_sync_lock(paths)
+                    sync_meeting_records(
+                        meeting_database,
+                        insights_database,
+                        trigger="pre-insights",
+                        exporter=SSHMeetingRecordsExporter(
+                            host=args.host,
+                            user=args.user,
+                            identity_file=args.identity_file,
+                            timeout=DEFAULT_MEETING_RECORDS_SYNC_TIMEOUT_SECONDS,
+                        ),
+                    )
+                except SyncBusyError:
+                    print("会议记录同步正在运行；本次洞察使用当前已完成的本地快照。", file=sys.stderr)
+                except Exception as exc:
+                    print(f"会议记录同步失败，日报将标记该来源不完整：{type(exc).__name__}: {exc}", file=sys.stderr)
+                finally:
+                    if meeting_lock is not None:
+                        meeting_lock.release()
+            if (
+                args.scheduled
+                and meeting_database.stale_status(report_date).get("status") == "pending"
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "outcome": "deferred",
+                            "reason": "meeting_evidence_refresh_requires_human",
+                            "report_date": report_date,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                return
             lock = None
             if not args.dry_run:
                 lock_deadline = time.monotonic() + (5400 if args.scheduled else 0)
@@ -834,6 +946,7 @@ def main(argv: list[str] | None = None) -> None:
                             ),
                         ),
                         client=client,
+                        meeting_database=meeting_database,
                     )
                 finally:
                     if tunnel is not None:
@@ -864,12 +977,14 @@ def main(argv: list[str] | None = None) -> None:
                     lock.release()
         elif args.command == "serve":
             assert database is not None
+            assert meeting_database is not None
             controller = BackgroundSyncController(database, paths, _client)
             wiki_controller = BackgroundWikiSyncController(database, paths, _client)
             mail_controller: BackgroundMailSyncController | None = None
             mail_session_manager: ReaderSessionManager | None = None
             mail_unavailable_reason: str | None = None
             insights_database: InsightsDatabase | None = None
+            insights_refresh_controller = BackgroundInsightsRefreshController(paths)
             insights_unavailable_reason: str | None = None
             try:
                 mail_session_manager = ReaderSessionManager(
@@ -922,6 +1037,8 @@ def main(argv: list[str] | None = None) -> None:
                 mail_unavailable_reason=mail_unavailable_reason,
                 insights_database=insights_database,
                 insights_unavailable_reason=insights_unavailable_reason,
+                meeting_records_database=meeting_database,
+                insights_refresh_controller=insights_refresh_controller,
                 sync_schedule={
                     "enabled": True,
                     "hour": DEFAULT_SYNC_HOUR,
@@ -1020,6 +1137,7 @@ def _run_insights_backfill_step(
     mail_database: MailDatabase,
     *,
     min_idle_seconds: int | None = None,
+    meeting_database: MeetingRecordsDatabase | None = None,
 ) -> dict[str, Any]:
     """Run at most one historical date and emit metadata-only progress.
 
@@ -1075,7 +1193,9 @@ def _run_insights_backfill_step(
             time.monotonic() + scheduled_step_seconds if args.scheduled else None
         )
 
-        bounds = archive_history_bounds(database, mail_database, args.timezone)
+        bounds = archive_history_bounds(
+            database, mail_database, args.timezone, meeting_database
+        )
         oldest = bounds.get("earliest_date")
         if not oldest:
             previous_state = load_backfill_state(paths.insights_backfill_state)
@@ -1123,7 +1243,7 @@ def _run_insights_backfill_step(
                 include_carryover=False,
             )
             audit_source = extract_daily_sources(
-                database, mail_database, str(audit_date), args.timezone
+                database, mail_database, str(audit_date), args.timezone, meeting_database
             )
             if not (audit_source.get("coverage") or {}).get("complete"):
                 state = record_backfill_deferred(
@@ -1160,7 +1280,7 @@ def _run_insights_backfill_step(
             map_checkpoint_path=checkpoint_path,
         )
         source = reusable_source or extract_daily_sources(
-            database, mail_database, report_date, args.timezone
+            database, mail_database, report_date, args.timezone, meeting_database
         )
         coverage = source.get("coverage") or {}
         if not coverage.get("complete"):
@@ -1168,6 +1288,16 @@ def _run_insights_backfill_step(
                 paths.insights_backfill_state,
                 state,
                 reason="source_coverage_incomplete",
+            )
+            return _backfill_step_result(state, outcome="deferred")
+        if (
+            meeting_database is not None
+            and meeting_database.stale_status(report_date).get("status") == "pending"
+        ):
+            state = record_backfill_deferred(
+                paths.insights_backfill_state,
+                state,
+                reason="meeting_evidence_refresh_requires_human",
             )
             return _backfill_step_result(state, outcome="deferred")
 
@@ -1297,6 +1427,7 @@ def _run_insights_backfill_step(
                     run_options,
                     client=object(),
                     source=source,
+                    meeting_database=meeting_database,
                 )
             except Exception as exc:
                 state = record_backfill_error(
@@ -1371,6 +1502,7 @@ def _run_insights_backfill_step(
                             run_options,
                             client=client,
                             source=source,
+                            meeting_database=meeting_database,
                         )
                         if client.step_budget_exhausted:
                             state = record_backfill_deferred(
@@ -1466,6 +1598,8 @@ def _run_insights_backfill_loop(
     paths: ArchivePaths,
     database: ArchiveDatabase,
     mail_database: MailDatabase,
+    *,
+    meeting_database: MeetingRecordsDatabase | None = None,
 ) -> None:
     """Drive chronological backfill from engine idleness instead of a timer.
 
@@ -1484,16 +1618,21 @@ def _run_insights_backfill_loop(
     consecutive_errors = 0
     continuation = False
     while True:
+        step_kwargs: dict[str, Any] = {
+            "min_idle_seconds": (
+                DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS
+                if continuation
+                else None
+            )
+        }
+        if meeting_database is not None:
+            step_kwargs["meeting_database"] = meeting_database
         result = _run_insights_backfill_step(
             args,
             paths,
             database,
             mail_database,
-            min_idle_seconds=(
-                DEFAULT_INSIGHTS_BACKFILL_CONTINUE_MIN_IDLE_SECONDS
-                if continuation
-                else None
-            ),
+            **step_kwargs,
         )
         outcome = str(result.get("outcome") or "")
         reason = str(result.get("reason") or "")

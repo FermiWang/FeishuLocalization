@@ -62,6 +62,7 @@
         <label class="search-label" for="insights-date">报告日期</label>
         <input id="insights-date" class="input" type="date">
         <button id="insights-load" class="button insights-load">查看报告</button>
+        <button id="insights-refresh" class="button" hidden>用最新会议证据人工刷新</button>
         <p class="insights-security-note">报告包含邮件派生内容，沿用本机邮箱解锁策略。</p>
       </section>
     </aside>
@@ -151,6 +152,7 @@
         </div>
       </header>
       <section id="insights-coverage" class="insights-coverage" aria-live="polite"></section>
+      <section id="insights-meeting-warning" class="insights-coverage" hidden aria-live="polite"></section>
       <section class="insights-grid">
         <article class="insights-section"><h3>昨日小结</h3><div id="insights-yesterday"></div></article>
         <article class="insights-section"><h3>今日规划</h3><div id="insights-today"></div></article>

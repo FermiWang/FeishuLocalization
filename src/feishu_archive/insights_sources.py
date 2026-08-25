@@ -48,8 +48,9 @@ def extract_daily_sources(
     mail_db: Any,
     day: date | str,
     timezone: str | ZoneInfo,
+    meeting_database: Any | None = None,
 ) -> dict[str, Any]:
-    """Read chat, mail and Wiki evidence occurring on one local calendar day.
+    """Read chat, mail, Wiki and optional detailed-meeting evidence for one day.
 
     Only explicitly selected, analysis-safe columns are returned.  In
     particular raw provider JSON, BCC recipients, HTML/raw MIME blobs and file
@@ -65,6 +66,8 @@ def extract_daily_sources(
         "mail_sent": 0,
         "wiki_created": 0,
         "wiki_edited": 0,
+        "meetings": 0,
+        "meeting_sections": 0,
     }
     latest_sync: dict[str, dict[str, Any] | None] = {
         "chat": None,
@@ -104,6 +107,36 @@ def extract_daily_sources(
         except (OSError, sqlite3.Error) as exc:
             warnings.append(f"邮件档案不可读：{type(exc).__name__}: {exc}")
 
+    if meeting_database is not None:
+        latest_sync["meeting"] = None
+        readable["meeting"] = False
+        try:
+            meeting_items = meeting_database.evidence_for_day(window["date"], window["timezone"])
+            evidence.extend(meeting_items)
+            counts["meeting_sections"] = len({
+                (
+                    int((item.get("metadata") or {}).get("meeting_id")),
+                    str((item.get("metadata") or {}).get("section_id") or ""),
+                )
+                for item in meeting_items
+            })
+            counts["meetings"] = len({
+                int((item.get("metadata") or {}).get("meeting_id")) for item in meeting_items
+            })
+            state = meeting_database.status()
+            latest_sync["meeting"] = {
+                "status": state.get("status"),
+                "started_at": state.get("started_at"),
+                "finished_at": state.get("finished_at"),
+                "cursor": state.get("cursor"),
+                "error": state.get("error"),
+            }
+            readable["meeting"] = True
+            if state.get("error"):
+                warnings.append(f"会议记录同步失败：{state['error']}")
+        except (OSError, sqlite3.Error) as exc:
+            warnings.append(f"会议记录档案不可读：{type(exc).__name__}: {exc}")
+
     blocking_issues: list[str] = []
     for lane, state in latest_sync.items():
         if not readable[lane]:
@@ -141,6 +174,7 @@ def archive_history_bounds(
     archive_db: Any,
     mail_db: Any | None,
     timezone: str | ZoneInfo,
+    meeting_database: Any | None = None,
 ) -> dict[str, Any]:
     """Return observed local-date bounds for each archive lane and overall.
 
@@ -212,6 +246,9 @@ def archive_history_bounds(
             )
     else:
         lanes["mail"] = _date_bounds_from_values(None, None, 0, zone)
+
+    if meeting_database is not None:
+        lanes["meeting"] = meeting_database.history_bounds()
 
     earliest_values = [value["earliest_date"] for value in lanes.values() if value["earliest_date"]]
     latest_values = [value["latest_date"] for value in lanes.values() if value["latest_date"]]

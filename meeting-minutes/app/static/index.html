@@ -2,353 +2,61 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>会议纪要整理</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>详细会议记录整理</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         background: #f5f6f8; color: #1f2329; }
-  header { background: #2b4acb; color: #fff; padding: 12px 24px; font-size: 18px; font-weight: 600; }
-  .layout { display: flex; min-height: calc(100vh - 48px); }
-  .sidebar { width: 300px; background: #fff; border-right: 1px solid #e5e6eb;
-             padding: 16px; flex-shrink: 0; }
-  .main { flex: 1; padding: 24px; overflow-x: hidden; }
-  h2 { font-size: 16px; margin-bottom: 12px; }
-  .meeting-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 6px;
-                  border: 1px solid #e5e6eb; }
-  .meeting-item:hover { background: #f2f3f5; }
-  .meeting-item.active { border-color: #2b4acb; background: #eef1fd; }
-  .meeting-item .title { font-weight: 600; font-size: 14px; }
-  .meeting-item .meta { font-size: 12px; color: #646a73; margin-top: 4px; }
-  .badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px;
-           background: #e5e6eb; margin-right: 4px; }
-  .badge.done { background: #d9f5e3; color: #187a3c; }
-  .badge.processing { background: #fdf3d7; color: #9a6a00; }
-  .badge.failed { background: #fde2e2; color: #c0392b; }
-  button { background: #2b4acb; color: #fff; border: none; border-radius: 6px;
-           padding: 8px 16px; font-size: 14px; cursor: pointer; }
-  button:disabled { background: #a9b6e8; cursor: not-allowed; }
-  button.secondary { background: #fff; color: #2b4acb; border: 1px solid #2b4acb; }
-  button.danger { background: #fff; color: #c0392b; border: 1px solid #c0392b;
-                  padding: 5px 12px; font-size: 13px; }
-  button.danger:hover { background: #fde2e2; }
-  .card { background: #fff; border: 1px solid #e5e6eb; border-radius: 10px;
-          padding: 20px; margin-bottom: 16px; }
-  .card h3 { font-size: 15px; margin-bottom: 12px; color: #1f2329; }
-  label { display: block; font-size: 13px; color: #646a73; margin: 10px 0 4px; }
-  input[type=text], input[type=date], textarea {
-    width: 100%; border: 1px solid #dee0e3; border-radius: 6px; padding: 8px 10px;
-    font-size: 14px; font-family: inherit; }
-  textarea { resize: vertical; }
-  .attendee-row { display: flex; gap: 8px; margin-bottom: 6px; }
-  .attendee-row input { flex: 1; }
-  .attendee-row .del { background: none; color: #c0392b; border: none; padding: 0 8px;
-                       font-size: 16px; cursor: pointer; }
-  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
-  .hint { font-size: 12px; color: #8f959e; }
-  audio { width: 100%; margin-top: 10px; }
-  .result h2 { font-size: 17px; margin: 20px 0 8px; padding-bottom: 6px;
-               border-bottom: 2px solid #2b4acb; display: inline-block; }
-  .result p { margin: 8px 0; line-height: 1.7; font-size: 14px; }
-  .result ul, .result ol { margin: 8px 0 8px 22px; }
-  .result li { line-height: 1.7; font-size: 14px; margin: 4px 0; }
-  .status { font-size: 13px; margin-top: 10px; }
-  .status.processing { color: #9a6a00; }
-  .status.failed { color: #c0392b; }
-  .empty { color: #8f959e; text-align: center; padding: 80px 0; font-size: 14px; }
-  .toggle { font-size: 13px; color: #2b4acb; cursor: pointer; margin-top: 8px;
-            display: inline-block; }
-  #transcript-view { white-space: pre-wrap; background: #f7f8fa; border-radius: 6px;
-                     padding: 12px; font-size: 13px; max-height: 240px; overflow-y: auto;
-                     margin-top: 8px; }
+:root{--blue:#174565;--mid:#2b6f91;--pale:#eaf3f7;--ink:#23313b;--muted:#667784;--line:#dbe3e8;--bg:#f4f7f9;--ok:#24734a;--warn:#9a6a00;--bad:#b33b3b}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink)}
+header{height:58px;background:linear-gradient(100deg,var(--blue),var(--mid));color:white;display:flex;align-items:center;justify-content:space-between;padding:0 26px;box-shadow:0 2px 8px #17354a33}
+header h1{font-size:18px;margin:0}.model{font-size:12px;background:#ffffff1f;padding:6px 10px;border-radius:20px}.layout{display:grid;grid-template-columns:300px 1fr;min-height:calc(100vh - 58px)}
+aside{background:#fff;border-right:1px solid var(--line);padding:18px;overflow:auto}.main{padding:24px;max-width:1180px;width:100%;margin:0 auto}.primary,.secondary,.danger,.tiny{border:0;border-radius:7px;padding:9px 15px;font-size:14px;cursor:pointer}.primary{background:var(--blue);color:#fff}.secondary{background:white;color:var(--blue);border:1px solid var(--mid)}.danger{background:white;color:var(--bad);border:1px solid #e4b6b6}.tiny{padding:4px 8px;font-size:12px;background:white;color:var(--mid);border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}.wide{width:100%}
+.meeting{border:1px solid var(--line);padding:11px;margin:8px 0;border-radius:9px;cursor:pointer}.meeting.active{border-color:var(--mid);background:var(--pale)}.meeting-title{font-size:14px;font-weight:650}.meta,.hint{font-size:12px;color:var(--muted);line-height:1.6}.badge{display:inline-block;padding:2px 7px;border-radius:12px;background:#edf1f4;font-size:11px;margin:4px 3px 0 0}.badge.done{background:#e0f2e8;color:var(--ok)}.badge.processing,.badge.waiting{background:#fff2d3;color:var(--warn)}.badge.failed{background:#fde7e7;color:var(--bad)}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 7px #20303a0a}.card h2{margin:0 0 14px;color:var(--blue);font-size:17px}.card h3{margin:0 0 10px;font-size:15px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.between{justify-content:space-between}.spaced{margin-top:12px}label{display:block;color:var(--muted);font-size:13px;margin:9px 0 4px}input,textarea{width:100%;border:1px solid var(--line);border-radius:7px;padding:9px 10px;font:inherit;font-size:14px}textarea{resize:vertical}.required{color:var(--bad)}
+.source{display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:start;padding:11px 0;border-top:1px solid #edf0f2}.source:first-of-type{border-top:0}.source-icon{width:30px;height:30px;border-radius:7px;background:var(--pale);display:flex;align-items:center;justify-content:center}.source-name{font-size:14px;font-weight:600}.pair{display:flex;gap:6px;margin-top:6px}.pair input{max-width:180px;padding:5px 7px;font-size:12px}.source-actions{display:flex;gap:5px}
+.job{border-left:4px solid var(--mid);background:var(--pale);padding:12px;border-radius:6px}.progress{height:7px;background:#d9e5eb;border-radius:8px;overflow:hidden;margin-top:8px}.progress span{display:block;height:100%;background:var(--mid)}
+.section{border:1px solid var(--line);border-radius:9px;margin:11px 0;overflow:hidden}.section-head{display:flex;justify-content:space-between;align-items:center;background:#f7fafb;padding:10px 13px}.section-head strong{color:var(--blue)}.section-body{padding:13px;line-height:1.72;font-size:14px}.section-body p{margin:6px 0}.section-body ul,.section-body ol{margin:6px 0 6px 23px}.section-body table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}.section-body th{background:var(--blue);color:white}.section-body th,.section-body td{border:1px solid #aebbc3;padding:7px;text-align:left;vertical-align:top}.section-body tr:nth-child(even) td{background:#f2f5f7}.refs{font-size:12px;color:var(--muted);margin-top:8px}.empty{text-align:center;color:var(--muted);padding:80px 10px}.revision{padding:7px 0;border-top:1px solid #edf0f2;font-size:13px}.error{color:var(--bad)}.hidden{display:none!important}
+@media(max-width:800px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}.main{padding:14px}.grid2{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-<header>会议纪要整理 · 本地模型 vmlx/qwen3.8-27b-8bit</header>
-<div class="layout">
-  <aside class="sidebar">
-    <button style="width:100%" onclick="showCreate()">＋ 新建会议</button>
-    <h2 style="margin-top:16px">会议列表</h2>
-    <div id="meeting-list"></div>
-  </aside>
-  <main class="main" id="main">
-    <div class="empty">请选择左侧会议，或新建一场会议</div>
-  </main>
-</div>
-
+<header><h1>详细会议记录整理</h1><div class="model" id="model-state">模型：vmlx/qwen3.8-27b-8bit</div></header>
+<div class="layout"><aside><button class="primary wide" onclick="showCreate()">＋ 新建会议</button><h3>会议列表</h3><div id="meeting-list"></div></aside><main class="main" id="main"><div class="empty">请选择会议，或新建一场会议</div></main></div>
 <script>
-let currentId = null;
-let pollTimer = null;
-
-const $ = (sel) => document.querySelector(sel);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
-  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-
-async function api(path, opts) {
-  const resp = await fetch(path, opts);
-  if (!resp.ok) {
-    let msg = resp.statusText;
-    try { msg = (await resp.json()).detail || msg; } catch (e) {}
-    throw new Error(msg);
-  }
-  return resp.status === 204 ? null : resp.json();
-}
-
-// ---------- 轻量 Markdown 渲染 ----------
-function md(mdText) {
-  const lines = mdText.split("\n");
-  let html = "", inList = null;
-  const inline = (t) => esc(t)
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/^- \[ \]\s*/, "☐ ");
-  const closeList = () => { if (inList) { html += `</${inList}>`; inList = null; } };
-  for (const line of lines) {
-    const t = line.trimEnd();
-    if (/^##\s+/.test(t)) { closeList(); html += `<h2>${inline(t.replace(/^##\s+/, ""))}</h2>`; }
-    else if (/^#{1,4}\s+/.test(t)) { closeList(); html += `<p><strong>${inline(t.replace(/^#+\s+/, ""))}</strong></p>`; }
-    else if (/^\s*[-*]\s+/.test(t)) {
-      if (inList !== "ul") { closeList(); html += "<ul>"; inList = "ul"; }
-      html += `<li>${inline(t.replace(/^\s*[-*]\s+/, ""))}</li>`;
-    } else if (/^\s*\d+[.、]\s*/.test(t)) {
-      if (inList !== "ol") { closeList(); html += "<ol>"; inList = "ol"; }
-      html += `<li>${inline(t.replace(/^\s*\d+[.、]\s*/, ""))}</li>`;
-    } else if (t === "") { closeList(); }
-    else { closeList(); html += `<p>${inline(t)}</p>`; }
-  }
-  closeList();
-  return html;
-}
-
-// ---------- 会议列表 ----------
-async function loadList() {
-  const list = await api("/api/meetings");
-  const el = $("#meeting-list");
-  el.innerHTML = list.map(m => `
-    <div class="meeting-item ${m.id === currentId ? "active" : ""}" onclick="selectMeeting(${m.id})">
-      <div class="title">${esc(m.title)}</div>
-      <div class="meta">${esc(m.meeting_date || m.created_at)}</div>
-      <div class="meta">
-        ${m.has_audio ? '<span class="badge">录音</span>' : ""}
-        ${m.has_transcript ? '<span class="badge">转写</span>' : ""}
-        ${m.minutes_status !== "pending" ? `<span class="badge ${m.minutes_status}">${statusText(m.minutes_status)}</span>` : ""}
-      </div>
-    </div>`).join("") || '<div class="hint">暂无会议</div>';
-}
-
-function statusText(s) {
-  return { processing: "整理中", done: "已整理", failed: "失败", pending: "" }[s] || s;
-}
-
-// ---------- 新建会议 ----------
-function showCreate() {
-  stopPoll();
-  currentId = null;
-  loadList();
-  $("#main").innerHTML = `
-    <div class="card">
-      <h3>新建会议</h3>
-      <label>会议标题 *</label>
-      <input type="text" id="f-title" placeholder="例如：Q3 产品排期评审">
-      <label>会议日期</label>
-      <input type="date" id="f-date">
-      <label>会议背景（可选）</label>
-      <textarea id="f-background" rows="3" placeholder="会议召开的背景、要解决的问题……"></textarea>
-      <label>主要参会人及角色（可选）</label>
-      <div id="attendee-rows"></div>
-      <button class="secondary" style="margin-top:4px" onclick="addAttendeeRow()">＋ 添加参会人</button>
-      <div class="row">
-        <button onclick="createMeeting()">创建会议</button>
-      </div>
-    </div>`;
-  addAttendeeRow();
-}
-
-function addAttendeeRow() {
-  const row = document.createElement("div");
-  row.className = "attendee-row";
-  row.innerHTML = `
-    <input type="text" class="a-name" placeholder="姓名">
-    <input type="text" class="a-role" placeholder="角色（如：产品负责人）">
-    <button class="del" onclick="this.parentElement.remove()">×</button>`;
-  $("#attendee-rows").appendChild(row);
-}
-
-async function createMeeting() {
-  const title = $("#f-title").value.trim();
-  if (!title) { alert("请填写会议标题"); return; }
-  const attendees = [...document.querySelectorAll(".attendee-row")]
-    .map(r => ({ name: r.querySelector(".a-name").value.trim(),
-                 role: r.querySelector(".a-role").value.trim() }))
-    .filter(a => a.name);
-  const { id } = await api("/api/meetings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title,
-      meeting_date: $("#f-date").value,
-      background: $("#f-background").value,
-      attendees,
-    }),
-  });
-  await selectMeeting(id);
-}
-
-// ---------- 删除会议 ----------
-async function deleteMeeting() {
-  if (currentId == null) return;
-  if (!confirm("确定删除该会议吗？\n服务器上的录音、转写文字、整理结果等所有记录将被永久删除，不可恢复。")) return;
-  if (!confirm("再次确认：永久删除此会议的全部记录？")) return;
-  await api(`/api/meetings/${currentId}`, { method: "DELETE" });
-  stopPoll();
-  currentId = null;
-  $("#main").innerHTML = '<div class="empty">会议已删除</div>';
-  await loadList();
-}
-
-// ---------- 会议详情 ----------
-async function selectMeeting(id) {
-  stopPoll();
-  currentId = id;
-  const m = await api(`/api/meetings/${id}`);
-  await loadList();
-  const people = m.attendees.length
-    ? m.attendees.map(a => a.role ? `${esc(a.name)}（${esc(a.role)}）` : esc(a.name)).join("、")
-    : '<span class="hint">未填写</span>';
-  $("#main").innerHTML = `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start">
-        <h3>${esc(m.title)}</h3>
-        <button class="danger" onclick="deleteMeeting()">删除会议</button>
-      </div>
-      <div class="hint">日期：${esc(m.meeting_date || "未填写")} ｜ 创建于 ${esc(m.created_at)}</div>
-      ${m.background ? `<p style="margin-top:10px;font-size:14px;line-height:1.7">📌 ${esc(m.background)}</p>` : ""}
-      <p style="margin-top:8px;font-size:14px">👥 ${people}</p>
-    </div>
-
-    <div class="card">
-      <h3>会议录音（mp3）</h3>
-      <div class="row">
-        <input type="file" id="audio-file" accept="audio/*">
-        <button class="secondary" onclick="uploadAudio()">上传录音</button>
-      </div>
-      ${m.has_audio ? `<audio controls src="/api/meetings/${m.id}/audio"></audio>` : '<div class="hint" style="margin-top:8px">尚未上传录音</div>'}
-    </div>
-
-    <div class="card">
-      <h3>讯飞识别文字</h3>
-      <div class="row">
-        <input type="file" id="transcript-file" accept=".txt,.text,text/plain">
-        <button class="secondary" onclick="uploadTranscriptFile()">上传转写文件</button>
-      </div>
-      <label>或直接粘贴文字：</label>
-      <textarea id="transcript-text" rows="6" placeholder="把讯飞识别的文字粘贴到这里……"></textarea>
-      <div class="row">
-        <button class="secondary" onclick="uploadTranscriptText()">保存粘贴文字</button>
-        ${m.has_transcript ? `<span class="hint">已保存转写（${m.transcript.length} 字）
-          <span class="toggle" onclick="toggleTranscript()">查看/收起</span></span>` : ""}
-        ${m.transcript_spk ? `<span class="hint">｜已完成发言人区分
-          <span class="toggle" onclick="toggleSpkTranscript()">查看标注版</span></span>` : ""}
-      </div>
-      <div id="transcript-view" style="display:none">${esc(m.transcript)}</div>
-      <div id="transcript-spk-view" style="display:none;white-space:pre-wrap;background:#f0f4ff;border-radius:6px;padding:12px;font-size:13px;max-height:240px;overflow-y:auto;margin-top:8px">${esc(m.transcript_spk)}</div>
-    </div>
-
-    <div class="card">
-      <h3>整理结果</h3>
-      <div class="row">
-        <button id="btn-organize" onclick="organize()" ${m.has_transcript ? "" : "disabled"}>开始整理</button>
-        ${m.has_transcript ? "" : '<span class="hint">需先上传讯飞识别文字</span>'}
-      </div>
-      <div class="status" id="org-status"></div>
-      <div class="result" id="org-result"></div>
-    </div>`;
-  await refreshMinutes();
-  startPollIfProcessing();
-}
-
-function toggleTranscript() {
-  const el = $("#transcript-view");
-  el.style.display = el.style.display === "none" ? "block" : "none";
-}
-
-function toggleSpkTranscript() {
-  const el = $("#transcript-spk-view");
-  el.style.display = el.style.display === "none" ? "block" : "none";
-}
-
-async function uploadAudio() {
-  const f = $("#audio-file").files[0];
-  if (!f) { alert("请选择音频文件"); return; }
-  const fd = new FormData();
-  fd.append("file", f);
-  await api(`/api/meetings/${currentId}/audio`, { method: "POST", body: fd });
-  await selectMeeting(currentId);
-}
-
-async function uploadTranscriptFile() {
-  const f = $("#transcript-file").files[0];
-  if (!f) { alert("请选择转写文件"); return; }
-  const fd = new FormData();
-  fd.append("file", f);
-  await api(`/api/meetings/${currentId}/transcript`, { method: "POST", body: fd });
-  await selectMeeting(currentId);
-}
-
-async function uploadTranscriptText() {
-  const text = $("#transcript-text").value;
-  if (!text.trim()) { alert("请粘贴转写文字"); return; }
-  const fd = new FormData();
-  fd.append("text", text);
-  await api(`/api/meetings/${currentId}/transcript`, { method: "POST", body: fd });
-  await selectMeeting(currentId);
-}
-
-// ---------- 整理 ----------
-async function organize() {
-  try {
-    await api(`/api/meetings/${currentId}/organize`, { method: "POST" });
-    await refreshMinutes();
-    startPollIfProcessing();
-    loadList();
-  } catch (e) { alert(e.message); }
-}
-
-async function refreshMinutes() {
-  if (currentId == null) return;
-  const r = await api(`/api/meetings/${currentId}/minutes`);
-  const statusEl = $("#org-status");
-  const resultEl = $("#org-result");
-  if (!statusEl) return;
-  if (r.status === "processing") {
-    statusEl.className = "status processing";
-    statusEl.textContent = "⏳ " + (r.stage || "正在调用本地模型整理，请稍候（长会议可能需要几分钟）……");
-    $("#btn-organize").disabled = true;
-  } else if (r.status === "failed") {
-    statusEl.className = "status failed";
-    statusEl.textContent = "整理失败：" + r.error + "（可点击「开始整理」重试）";
-    $("#btn-organize").disabled = false;
-  } else {
-    statusEl.className = "status";
-    statusEl.textContent = r.status === "done" ? `✅ 整理完成（${r.updated_at}）` : "";
-    $("#btn-organize").disabled = false;
-  }
-  resultEl.innerHTML = r.status === "done" ? md(r.content) : "";
-}
-
-function startPollIfProcessing() {
-  stopPoll();
-  pollTimer = setInterval(async () => {
-    const r = await api(`/api/meetings/${currentId}/minutes`);
-    await refreshMinutes();
-    if (r.status !== "processing") { stopPoll(); loadList(); }
-  }, 3000);
-}
-
-function stopPoll() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-}
-
-loadList();
+let currentId=null,pollTimer=null,currentRecord=null;
+const $=s=>document.querySelector(s);const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path,opts={}){opts.headers={...(opts.headers||{})};if(opts.method&&opts.method!=="GET")opts.headers["X-Meeting-Minutes-Action"]="confirm";const r=await fetch(path,opts);if(!r.ok){let m=r.statusText;try{m=(await r.json()).detail||m}catch{}throw new Error(m)}return r.status===204?null:r.json()}
+function badge(s){return `<span class="badge ${esc(s)}">${esc({pending:"待整理",queued:"排队中",waiting:"等待模型",processing:"处理中",running:"处理中",done:"已完成",failed:"失败"}[s]||s)}</span>`}
+async function loadList(){const list=await api("/api/meetings");$("#meeting-list").innerHTML=list.map(m=>`<div class="meeting ${m.id===currentId?"active":""}" onclick="selectMeeting(${m.id})"><div class="meeting-title">${esc(m.title)}</div><div class="meta">${esc(m.meeting_date||"日期未填")}</div><div>${m.audio_count?`<span class="badge">录音 ${m.audio_count}</span>`:""}${m.transcript_count?`<span class="badge">识别稿 ${m.transcript_count}</span>`:""}${m.minutes_status!=="pending"?badge(m.minutes_status):""}</div></div>`).join("")||'<div class="hint">暂无会议</div>'}
+async function modelStatus(){try{const s=await api("/api/system/model");$("#model-state").textContent=`模型：${s.model_id} · ${{ready:"就绪",busy:"繁忙",unavailable:"不可用"}[s.status]||s.status}`}catch{}}
+function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+function showCreate(){stopPoll();currentId=null;loadList();$("#main").innerHTML=`<div class="card"><h2>新建会议</h2><label>会议标题 <span class="required">*</span></label><input id="c-title" placeholder="例如：项目需求澄清会"><div class="grid2"><div><label>会议日期 <span class="required">*</span></label><input type="date" id="c-date"></div><div><label>会议背景</label><input id="c-bg" placeholder="可选"></div></div><label>主要参会人员（每行：姓名｜角色）</label><textarea id="c-people" rows="4" placeholder="张三｜项目负责人"></textarea><div class="spaced"><button class="primary" onclick="createMeeting()">创建并添加资料</button></div></div>`}
+async function createMeeting(){const title=$("#c-title").value.trim(),date=$("#c-date").value;if(!title||!date)return alert("请填写会议标题和会议日期");const attendees=$("#c-people").value.split("\n").map(x=>x.split(/[｜|]/)).filter(x=>x[0]?.trim()).map(x=>({name:x[0].trim(),role:(x[1]||"").trim()}));const r=await api("/api/meetings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,meeting_date:date,background:$("#c-bg").value,attendees})});await selectMeeting(r.id)}
+async function selectMeeting(id){stopPoll();currentId=id;currentRecord=null;const [m,revisions]=await Promise.all([api(`/api/meetings/${id}`),api(`/api/meetings/${id}/records/revisions`)]);await loadList();renderMeeting(m,revisions);if(m.job&&["queued","waiting","running"].includes(m.job.status))startPoll()}
+function renderMeeting(m,revisions){const sources=m.sources||[];$("#main").innerHTML=`
+<div class="card"><div class="row between"><div><h2>${esc(m.title)}</h2><div class="meta">会议日期：${esc(m.meeting_date||"未填写")}　修订版：${m.current_revision||0}</div></div><button class="danger" onclick="deleteMeeting()">删除会议</button></div><div class="grid2"><div><label>会议标题</label><input id="m-title" value="${esc(m.title)}"></div><div><label>会议日期 <span class="required">*</span></label><input type="date" id="m-date" value="${esc(m.meeting_date)}"></div></div><label>会议背景</label><textarea id="m-bg" rows="2">${esc(m.background||"")}</textarea><button class="secondary spaced" onclick="saveMeeting()">保存会议信息</button></div>
+<div class="card"><h2>会议资料</h2><div class="hint">可一次选择多份录音、TXT 或 DOCX。识别稿为文字权威；“配对标识”相同的录音仅辅助时间轴和说话人。</div><input class="spaced" id="source-files" type="file" multiple accept="audio/*,.txt,.text,.docx"><div class="row spaced"><input id="new-pair" style="max-width:180px" placeholder="配对标识（可选）"><button class="primary" onclick="uploadFiles()">上传所选文件</button></div><label>或粘贴识别稿</label><textarea id="paste-text" rows="4" placeholder="粘贴会议录音识别文字"></textarea><div class="row spaced"><input id="paste-pair" style="max-width:180px" placeholder="配对标识（可选）"><button class="secondary" onclick="savePaste()">保存粘贴文字</button></div><div id="source-list" class="spaced">${renderSources(sources)}</div></div>
+<div class="card"><h2>整理任务</h2><div id="job-panel">${renderJob(m.job)}</div><div class="row spaced"><button class="primary" id="organize-btn" onclick="organize()" ${(!m.meeting_date||!sources.length)?"disabled":""}>整理详细会议记录</button>${!m.meeting_date?'<span class="hint">需先填写会议日期</span>':!sources.length?'<span class="hint">需先添加会议资料</span>':''}</div></div>
+<div class="card"><div class="row between"><h2>详细会议记录</h2><div id="record-actions"></div></div><div id="record-view"><div class="hint">${m.current_revision?"正在加载记录…":"完成整理后在此查看并分节编辑"}</div></div></div>
+<div class="card"><h2>修订历史</h2><div id="revision-list">${renderRevisions(revisions,m.id)}</div></div>`;
+if(m.current_revision)loadRecord();}
+function renderSources(sources){return sources.map((s,i)=>`<div class="source"><div class="source-icon">${s.source_type==="audio"?"🎙":"📄"}</div><div><div class="source-name">${esc(s.original_name)} ${s.generated?'<span class="badge">FunASR生成</span>':''}</div><div class="meta">顺序 ${i+1} · ${s.source_type==="audio"?"录音":"识别稿"} · ${esc(s.processing_status||"ready")}</div><div class="pair"><input id="pair-${s.id}" value="${esc(s.pair_key||"")}" placeholder="配对标识"><button class="tiny" onclick="savePair(${s.id})">保存配对</button></div></div><div class="source-actions"><button class="tiny" ${i===0?"disabled":""} onclick="moveSource(${s.id},-1)">↑</button><button class="tiny" ${i===sources.length-1?"disabled":""} onclick="moveSource(${s.id},1)">↓</button><button class="tiny" onclick="deleteSource(${s.id})">删除</button></div></div>`).join("")||'<div class="hint">尚未添加资料</div>'}
+function renderJob(j){if(!j)return '<div class="hint">尚未开始整理</div>';const active=["queued","waiting","running"].includes(j.status);return `<div class="${active?"job":""}">${badge(j.status)} <span>${esc(j.stage||"")}</span>${j.error?`<div class="error">${esc(j.error)}</div>`:""}${active?`<div class="progress"><span style="width:${Number(j.progress)||1}%"></span></div>`:""}</div>`}
+function renderRevisions(list,id){return list.map(r=>`<div class="revision"><b>r${r.revision}</b> · ${esc(r.editor_kind==="user"?"人工修订":"模型生成")} · ${esc(r.created_at)}　<a href="/api/meetings/${id}/records/${r.revision}/docx">下载 Word</a>　<button class="tiny" onclick="loadRecord(${r.revision})">查看</button></div>`).join("")||'<div class="hint">暂无修订</div>'}
+async function saveMeeting(){const title=$("#m-title").value.trim(),date=$("#m-date").value;if(!title||!date)return alert("会议标题和会议日期不能为空");await api(`/api/meetings/${currentId}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,meeting_date:date,background:$("#m-bg").value})});await selectMeeting(currentId)}
+async function uploadFiles(){const files=[...$("#source-files").files];if(!files.length)return alert("请选择文件");for(const file of files){const fd=new FormData();fd.append("file",file);fd.append("pair_key",$("#new-pair").value.trim());await api(`/api/meetings/${currentId}/sources`,{method:"POST",body:fd})}await selectMeeting(currentId)}
+async function savePaste(){const text=$("#paste-text").value.trim();if(!text)return alert("请粘贴识别稿");const fd=new FormData();fd.append("text",text);fd.append("pair_key",$("#paste-pair").value.trim());fd.append("source_name","粘贴识别稿.txt");await api(`/api/meetings/${currentId}/sources`,{method:"POST",body:fd});await selectMeeting(currentId)}
+async function savePair(id){await api(`/api/meetings/${currentId}/sources/${id}/pair`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({pair_key:$(`#pair-${id}`).value})});await selectMeeting(currentId)}
+async function moveSource(id,delta){const list=await api(`/api/meetings/${currentId}/sources`),i=list.findIndex(x=>x.id===id),j=i+delta;if(j<0||j>=list.length)return;[list[i],list[j]]=[list[j],list[i]];await api(`/api/meetings/${currentId}/sources/order`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({source_ids:list.map(x=>x.id)})});await selectMeeting(currentId)}
+async function deleteSource(id){if(!confirm("删除该来源文件？"))return;await api(`/api/meetings/${currentId}/sources/${id}`,{method:"DELETE"});await selectMeeting(currentId)}
+async function deleteMeeting(){if(!confirm("删除这场会议及其全部来源和修订记录？此操作不可撤销。"))return;await api(`/api/meetings/${currentId}`,{method:"DELETE"});currentId=null;$("#main").innerHTML='<div class="empty">会议已删除</div>';loadList()}
+async function organize(){try{const r=await api(`/api/meetings/${currentId}/organize`,{method:"POST"});$("#job-panel").innerHTML=renderJob({status:r.status,stage:r.stage,progress:1});startPoll()}catch(e){alert(e.message)}}
+function startPoll(){stopPoll();pollTimer=setInterval(async()=>{if(!currentId)return;const j=await api(`/api/meetings/${currentId}/jobs/latest`);$("#job-panel").innerHTML=renderJob(j);if(["done","failed"].includes(j.status)){stopPoll();await selectMeeting(currentId)}},3000)}
+function markdown(text){const lines=String(text||"").split("\n"),out=[];let list=null,table=false,tableHeader=false;const inline=t=>esc(t).replace(/\*\*(.+?)\*\*/g,"<strong>$1</strong>").replace(/\[S(\d{3})\]/g,'<b style="color:#2b6f91">[S$1]</b>');const close=()=>{if(list){out.push(`</${list}>`);list=null}if(table){out.push("</tbody></table>");table=false;tableHeader=false}};for(let i=0;i<lines.length;i++){const t=lines[i].trim();if(t.startsWith("|")&&t.endsWith("|")){if(/^\|?\s*:?-+/.test(t)&&i>0)continue;if(!table){close();out.push("<table><tbody>");table=true;tableHeader=true}const cells=t.slice(1,-1).split("|");out.push(`<tr>${cells.map(c=>`${tableHeader?"<th>":"<td>"}${inline(c.trim())}${tableHeader?"</th>":"</td>"}`).join("")}</tr>`);tableHeader=false;continue}else if(table){out.push("</tbody></table>");table=false;tableHeader=false}if(/^###\s+/.test(t)){close();out.push(`<h3>${inline(t.replace(/^###\s+/,""))}</h3>`)}else if(/^[-*]\s+/.test(t)){if(list!=="ul"){close();out.push("<ul>");list="ul"}out.push(`<li>${inline(t.replace(/^[-*]\s+/,""))}</li>`)}else if(/^\d+[.、]\s*/.test(t)){if(list!=="ol"){close();out.push("<ol>");list="ol"}out.push(`<li>${inline(t.replace(/^\d+[.、]\s*/,""))}</li>`)}else if(t){if(list){out.push(`</${list}>`);list=null}out.push(`<p>${inline(t)}</p>`)}else close()}close();return out.join("")}
+async function loadRecord(revision){try{const r=await api(revision?`/api/meetings/${currentId}/records/${revision}`:`/api/meetings/${currentId}/records`);currentRecord=r;const latest=!revision||revision===(await api(`/api/meetings/${currentId}/records/revisions`))[0]?.revision;$("#record-actions").innerHTML=`<a class="secondary" style="text-decoration:none" href="/api/meetings/${currentId}/records/${r.revision}/docx">下载 r${r.revision} Word</a>${r.source_fragment_count?` <button class="secondary" onclick="loadFragments(${r.revision})">核对 ${r.source_fragment_count} 个证据片段</button>`:""}`;$("#record-view").innerHTML=(r.structured.sections||[]).map(s=>`<div class="section"><div class="section-head"><strong>${esc(s.title)}</strong>${latest?`<button class="tiny" onclick="editSection('${esc(s.id)}')">编辑本节</button>`:""}</div><div class="section-body" id="body-${esc(s.id)}">${markdown(s.content)}${s.source_refs?.length?`<div class="refs">证据片段：${esc(s.source_refs.join("、"))}</div>`:""}</div></div>`).join("")+`<div id="fragment-view"></div>`}catch(e){$("#record-view").innerHTML=`<div class="error">${esc(e.message)}</div>`}}
+async function loadFragments(revision){const data=await api(`/api/meetings/${currentId}/records/${revision}/fragments`),root=$("#fragment-view");root.innerHTML=`<div class="card"><h3>证据片段索引</h3><div class="hint">用于核对正文中的 S 编号；不会同步到 Feishu Archive。</div>${(data.items||[]).map(f=>`<div class="revision"><b>${esc(f.id)}</b> · 来源 #${Number(f.source_id)||0}<div>${esc(f.text)}</div></div>`).join("")}</div>`}
+function editSection(id){const s=currentRecord.structured.sections.find(x=>x.id===id),body=$(`#body-${id}`);body.innerHTML=`<textarea rows="12" id="edit-${id}">${esc(s.content)}</textarea><div class="row spaced"><button class="primary" onclick="saveSection('${id}')">保存为新修订版</button><button class="secondary" onclick="loadRecord()">取消</button></div>`}
+async function saveSection(id){const sections={};for(const s of currentRecord.structured.sections)sections[s.id]=s.id===id?$(`#edit-${id}`).value:s.content;try{await api(`/api/meetings/${currentId}/records`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_revision:currentRecord.revision,sections})});await selectMeeting(currentId)}catch(e){alert(e.message)}}
+loadList();modelStatus();setInterval(modelStatus,30000);
 </script>
 </body>
 </html>

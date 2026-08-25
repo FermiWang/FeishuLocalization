@@ -17,6 +17,7 @@ from .config import ArchivePaths, resolve_archive_resource_path
 from .database import ArchiveDatabase
 from .mail_database import MailDatabase
 from .insights_database import InsightsDatabase
+from .meeting_records_database import MeetingRecordsDatabase
 from .backfill import public_backfill_status
 from .reader_auth import ReaderSessionManager
 
@@ -90,6 +91,8 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         insights_database: InsightsDatabase | None = None,
         insights_schedule: dict[str, Any] | None = None,
         insights_unavailable_reason: str | None = None,
+        meeting_records_database: MeetingRecordsDatabase | None = None,
+        insights_refresh_controller: Any | None = None,
     ) -> None:
         self.database = database
         self.paths = paths
@@ -105,6 +108,8 @@ class ArchiveHTTPServer(ThreadingHTTPServer):
         self.insights_database = insights_database
         self.insights_schedule = insights_schedule or {"enabled": False}
         self.insights_unavailable_reason = insights_unavailable_reason
+        self.meeting_records_database = meeting_records_database
+        self.insights_refresh_controller = insights_refresh_controller
         super().__init__(server_address, ArchiveRequestHandler)
 
 
@@ -136,6 +141,19 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                             "schedule": self.server.insights_schedule,
                             "backfill": public_backfill_status(
                                 self.server.paths.insights_backfill_state
+                            ),
+                            "meeting_records": (
+                                {
+                                    **self.server.meeting_records_database.status(),
+                                    "stale": self.server.meeting_records_database.stale_status(),
+                                    "refresh": (
+                                        self.server.insights_refresh_controller.status()
+                                        if self.server.insights_refresh_controller is not None
+                                        else {"status": "unavailable"}
+                                    ),
+                                }
+                                if self.server.meeting_records_database is not None
+                                else {"status": "unavailable"}
                             ),
                         }
                     )
@@ -268,6 +286,9 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
                 if parsed.path.startswith("/api/insights/tasks/") and parsed.path.endswith("/status"):
                     self._insights_task_status(parsed.path)
                     return
+                if parsed.path == "/api/insights/refresh":
+                    self._insights_refresh()
+                    return
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
             if parsed.path.startswith("/api/mail/") and self._mail_api_unavailable():
@@ -374,6 +395,45 @@ class ArchiveRequestHandler(BaseHTTPRequestHandler):
             },
         )
         self._json({"item": item})
+
+    def _insights_refresh(self) -> None:
+        if self.headers.get("X-Feishu-Archive-Action") != "insights-refresh":
+            self._json({"error": "缺少本机洞察刷新确认标头"}, status=HTTPStatus.FORBIDDEN)
+            return
+        if not self._loopback_origin_allowed():
+            self._json({"error": "拒绝非本机来源"}, status=HTTPStatus.FORBIDDEN)
+            return
+        raw_length = self.headers.get("Content-Length") or "0"
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("Content-Length 无效") from exc
+        if content_length < 1 or content_length > 4096:
+            raise ValueError("刷新请求体无效")
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("刷新请求必须是 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("刷新请求必须是 JSON 对象")
+        report_date = str(payload.get("report_date") or "")
+        datetime.strptime(report_date, "%Y-%m-%d")
+        meeting_database = self.server.meeting_records_database
+        if meeting_database is None:
+            self._json({"error": "会议记录数据域不可用"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        stale = meeting_database.stale_status(report_date)
+        if stale.get("status") != "pending":
+            self._json({"error": "该日期没有待刷新的会议证据"}, status=HTTPStatus.CONFLICT)
+            return
+        controller = self.server.insights_refresh_controller
+        if controller is None:
+            self._json({"error": "当前阅读器未启用洞察刷新控制"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if not controller.start(report_date):
+            self._json({"error": "已有洞察刷新任务正在运行"}, status=HTTPStatus.CONFLICT)
+            return
+        self._json({"status": "accepted", "report_date": report_date}, status=HTTPStatus.ACCEPTED)
 
     def _mail_api_unavailable(self) -> bool:
         if (
@@ -913,6 +973,8 @@ def serve(
     insights_database: InsightsDatabase | None = None,
     insights_schedule: dict[str, Any] | None = None,
     insights_unavailable_reason: str | None = None,
+    meeting_records_database: MeetingRecordsDatabase | None = None,
+    insights_refresh_controller: Any | None = None,
 ) -> None:
     if not is_literal_loopback_host(host) or not is_loopback_host(host):
         raise ValueError("安全限制：离线阅读器只能监听回环地址 127.0.0.1 或 localhost")
@@ -932,6 +994,8 @@ def serve(
         insights_database=insights_database,
         insights_schedule=insights_schedule,
         insights_unavailable_reason=insights_unavailable_reason,
+        meeting_records_database=meeting_records_database,
+        insights_refresh_controller=insights_refresh_controller,
     )
     try:
         if not ipaddress.ip_address(str(server.server_address[0])).is_loopback:
