@@ -32,5 +32,5 @@ curl -s -o /dev/null -w '%{http_code}\n' http://192.168.100.179:8765/
 - 主应用 venv（远端）：`~/meeting-minutes/.venv`，py3.14，fastapi/uvicorn/httpx/python-multipart
 - 声纹分离 venv（远端）：`~/meeting-minutes/.venv-spk`，py3.11，funasr/torch/torchaudio，
   由 `app/spk.py` 子进程调用 `app/diarize_worker.py`；缺失时自动跳过声纹步骤
-- 模型端点：`http://127.0.0.1:11435/v1`（vmlx/qwen3.8-27b-8bit，服务器本机）
+- 详细会议记录模型端点：`http://192.168.100.214:8007/v1`（精确 ID `Qwen3.8-27B-FP8`）
 - 详细架构与配置见 README.md；声纹选型验证记录见 research/README.md

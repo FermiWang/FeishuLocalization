@@ -1,15 +1,18 @@
-"""Hierarchical detailed-record generation through the exact local vMLX model."""
+"""Hierarchical detailed-record generation through the exact configured model."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Callable
 
 import httpx
 
-EXACT_MODEL_ID = "vmlx/qwen3.8-27b-8bit"
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:11435/v1").rstrip("/")
+EXACT_MODEL_ID = "Qwen3.8-27B-FP8"
+LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL", "http://192.168.100.214:8007/v1"
+).rstrip("/")
 CONFIGURED_MODEL = os.environ.get("LLM_MODEL", EXACT_MODEL_ID)
 PROMPT_VERSION = "detailed-meeting-record-v2"
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT", "900"))
@@ -73,6 +76,36 @@ def _root_url() -> str:
     return LLM_BASE_URL[:-3] if LLM_BASE_URL.endswith("/v1") else LLM_BASE_URL
 
 
+def _vllm_scheduler_metrics(text: str) -> tuple[float, float]:
+    values: dict[str, float] = {}
+    for metric in ("num_requests_running", "num_requests_waiting"):
+        prefix = f"vllm:{metric}"
+        total = 0.0
+        matched = False
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith(prefix):
+                continue
+            labels = re.search(r"\{([^}]*)\}", line)
+            if labels and not re.search(
+                rf'(?:^|,)\s*model_name="{re.escape(EXACT_MODEL_ID)}"\s*(?:,|$)',
+                labels.group(1),
+            ):
+                continue
+            try:
+                value = float(line.rsplit(None, 1)[-1])
+            except ValueError as exc:
+                raise RuntimeError(f"vLLM 指标 {metric} 无效") from exc
+            if not math.isfinite(value) or value < 0:
+                raise RuntimeError(f"vLLM 指标 {metric} 无效")
+            total += value
+            matched = True
+        if not matched:
+            raise RuntimeError(f"vLLM /metrics 缺少 {prefix}，已按繁忙处理")
+        values[metric] = total
+    return values["num_requests_running"], values["num_requests_waiting"]
+
+
 def model_preflight() -> dict[str, Any]:
     if CONFIGURED_MODEL != EXACT_MODEL_ID:
         raise ModelIdentityError(
@@ -80,12 +113,23 @@ def model_preflight() -> dict[str, Any]:
         )
     health_response = httpx.get(f"{_root_url()}/health", timeout=10.0)
     health_response.raise_for_status()
-    health = health_response.json()
-    if not isinstance(health, dict):
-        raise RuntimeError("模型健康检查返回格式无效")
+    health: dict[str, Any] = {}
+    if health_response.content.strip():
+        try:
+            decoded_health = health_response.json()
+        except ValueError as exc:
+            raise RuntimeError("模型健康检查返回格式无效") from exc
+        if not isinstance(decoded_health, dict):
+            raise RuntimeError("模型健康检查返回格式无效")
+        health = decoded_health
     models_response = httpx.get(f"{LLM_BASE_URL}/models", timeout=10.0)
     models_response.raise_for_status()
-    models = models_response.json().get("data") or []
+    decoded_models = models_response.json()
+    if not isinstance(decoded_models, dict):
+        raise RuntimeError("模型列表返回格式无效")
+    models = decoded_models.get("data") or []
+    if not isinstance(models, list):
+        raise RuntimeError("模型列表返回格式无效")
     model_ids = {str(item.get("id") or "") for item in models}
     if EXACT_MODEL_ID not in model_ids:
         raise ModelIdentityError(
@@ -95,20 +139,32 @@ def model_preflight() -> dict[str, Any]:
     if status and status not in {"ok", "healthy", "ready", "idle"}:
         raise RuntimeError(f"模型健康检查未就绪：{status}")
     scheduler = health.get("scheduler")
-    if not isinstance(scheduler, dict):
-        raise RuntimeError("模型健康检查缺少 scheduler 负载状态，已按繁忙处理")
-    try:
-        active = int(scheduler["num_running"])
-        queued = int(scheduler["num_waiting"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("scheduler 负载状态无效，已按繁忙处理") from exc
-    if isinstance(scheduler.get("num_running"), bool) or isinstance(
-        scheduler.get("num_waiting"), bool
-    ) or not 0 <= active <= 100_000 or not 0 <= queued <= 100_000:
-        raise RuntimeError("scheduler 负载状态无效，已按繁忙处理")
+    if isinstance(scheduler, dict):
+        try:
+            active = float(scheduler["num_running"])
+            queued = float(scheduler["num_waiting"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("scheduler 负载状态无效，已按繁忙处理") from exc
+        if (
+            isinstance(scheduler.get("num_running"), bool)
+            or isinstance(scheduler.get("num_waiting"), bool)
+            or not math.isfinite(active)
+            or not math.isfinite(queued)
+            or not 0 <= active <= 100_000
+            or not 0 <= queued <= 100_000
+        ):
+            raise RuntimeError("scheduler 负载状态无效，已按繁忙处理")
+    else:
+        metrics_response = httpx.get(f"{_root_url()}/metrics", timeout=10.0)
+        metrics_response.raise_for_status()
+        active, queued = _vllm_scheduler_metrics(metrics_response.text)
     if active > 0 or queued > 0 or bool(health.get("busy")):
         raise ModelBusyError("共享模型正在处理每日洞察或其他任务，会议记录已进入等待队列")
-    return {"health": health, "model_id": EXACT_MODEL_ID}
+    return {
+        "health": health,
+        "scheduler": {"num_running": active, "num_waiting": queued},
+        "model_id": EXACT_MODEL_ID,
+    }
 
 
 def _extract_json(text: str) -> dict[str, Any]:

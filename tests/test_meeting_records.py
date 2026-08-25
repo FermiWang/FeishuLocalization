@@ -58,7 +58,7 @@ def _event(seq: int, *, revision: int = 1, content: str = "形成试点共识 [S
             "background": "头脑风暴",
         },
         "structured": structured,
-        "model_id": "vmlx/qwen3.8-27b-8bit",
+        "model_id": "Qwen3.8-27B-FP8",
         "prompt_version": "detailed-meeting-record-v2",
         "editor_kind": "model" if revision == 1 else "user",
     }

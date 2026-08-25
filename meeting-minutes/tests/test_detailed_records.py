@@ -311,20 +311,39 @@ class ExactModelTests(unittest.TestCase):
     def _response(value):
         return httpx.Response(200, json=value, request=httpx.Request("GET", "http://local"))
 
-    def test_preflight_requires_exact_model_and_idle_scheduler(self):
-        health = self._response({
-            "status": "healthy",
-            "scheduler": {"num_running": 0, "num_waiting": 0},
+    @staticmethod
+    def _text_response(value):
+        return httpx.Response(
+            200, text=value, request=httpx.Request("GET", "http://local")
+        )
+
+    def test_preflight_requires_exact_model_and_idle_vllm_metrics(self):
+        health = self._text_response("")
+        models = self._response({
+            "data": [{"id": llm.EXACT_MODEL_ID}, {"id": "Qwen3.6-27B-FP8"}]
         })
-        models = self._response({"data": [{"id": llm.EXACT_MODEL_ID}]})
-        with mock.patch("app.llm.httpx.get", side_effect=[health, models]):
+        idle_metrics = self._text_response(
+            '# TYPE vllm:num_requests_running gauge\n'
+            f'vllm:num_requests_running{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 0.0\n'
+            '# TYPE vllm:num_requests_waiting gauge\n'
+            f'vllm:num_requests_waiting{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 0.0\n'
+        )
+        with mock.patch(
+            "app.llm.httpx.get", side_effect=[health, models, idle_metrics]
+        ):
             self.assertEqual(llm.model_preflight()["model_id"], llm.EXACT_MODEL_ID)
-        busy = self._response({
-            "status": "healthy",
-            "scheduler": {"num_running": 1, "num_waiting": 0},
-        })
-        with mock.patch("app.llm.httpx.get", side_effect=[busy, models]):
+        busy_metrics = self._text_response(
+            f'vllm:num_requests_running{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 1.0\n'
+            f'vllm:num_requests_waiting{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 0.0\n'
+        )
+        with mock.patch(
+            "app.llm.httpx.get", side_effect=[health, models, busy_metrics]
+        ):
             with self.assertRaises(llm.ModelBusyError):
+                llm.model_preflight()
+        aliases_only = self._response({"data": [{"id": "Qwen3.6-27B-FP8"}]})
+        with mock.patch("app.llm.httpx.get", side_effect=[health, aliases_only]):
+            with self.assertRaises(llm.ModelIdentityError):
                 llm.model_preflight()
         with mock.patch.object(llm, "CONFIGURED_MODEL", "alias-model"):
             with self.assertRaises(llm.ModelIdentityError):

@@ -305,7 +305,7 @@ command -v python3
 
 ### 7. 详细会议记录同步与日报刷新
 
-179 上的 `meeting-minutes/` 保持独立服务和局域网入口，但源码及原提交历史由本仓库统一管理。详细用法、输入权威规则、FunASR 模型和修订机制见 [meeting-minutes/README.md](meeting-minutes/README.md)。其中“整理详细会议记录”只使用精确模型 `vmlx/qwen3.8-27b-8bit`；这项约束不表示 Feishu Archive 的其他洞察任务必须使用同一模型。
+179 上的 `meeting-minutes/` 保持独立服务和局域网入口，但源码及原提交历史由本仓库统一管理。详细用法、输入权威规则、FunASR 模型和修订机制见 [meeting-minutes/README.md](meeting-minutes/README.md)。其中“整理详细会议记录”只使用 `http://192.168.100.214:8007` 上的精确模型 `Qwen3.8-27B-FP8`；这项约束不表示 Feishu Archive 的其他洞察任务必须使用同一模型。
 
 Feishu Archive 不开放新的局域网同步 API。它使用已有 SSH 信任执行固定导出命令，只拉取已完成记录的结构化章节、会议日期、修订号、模型溯源与哈希，保存到独立的 `meeting-records.sqlite3`；录音、用户识别稿、FunASR 生成稿和服务器文件路径不会进入本机档案。
 
