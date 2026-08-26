@@ -42,7 +42,7 @@ DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS = 20
 # After this many consecutive step errors the loop exits and lets launchd
 # apply ThrottleInterval before restarting it.
 DEFAULT_INSIGHTS_BACKFILL_LOOP_MAX_CONSECUTIVE_ERRORS = 10
-DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
+DEFAULT_INSIGHTS_TIMEZONE = "Asia/Shanghai"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
 DEFAULT_VMLX_MODEL = "vmlx/qwen3.8-27b-8bit"

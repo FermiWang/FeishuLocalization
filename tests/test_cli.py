@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from feishu_archive.cli import (
     _mail_client,
     _mail_app_config,
     _mail_oauth_readiness,
+    _yesterday,
     build_parser,
     main,
 )
@@ -33,6 +35,7 @@ from feishu_archive.config import (
     DEFAULT_INSIGHTS_BACKFILL_LOOP_MONITOR_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_LOOP_POLL_SECONDS,
     DEFAULT_INSIGHTS_BACKFILL_LOOP_YIELD_SECONDS,
+    DEFAULT_INSIGHTS_TIMEZONE,
     DEFAULT_MAX_MAIL_ATTACHMENT_BYTES,
     DEFAULT_MAX_MAIL_BYTES,
     DEFAULT_SCOPES,
@@ -600,7 +603,7 @@ class AppConfigTests(unittest.TestCase):
 
     def test_insights_commands_default_to_secure_daily_model_route(self) -> None:
         args = build_parser().parse_args(["insights-run"])
-        self.assertEqual(args.timezone, "Europe/Amsterdam")
+        self.assertEqual(args.timezone, "Asia/Shanghai")
         self.assertEqual(args.host, "192.168.100.179")
         self.assertEqual(args.model, "vmlx/qwen3.8-27b-8bit")
         self.assertIsNone(args.identity_file)
@@ -608,6 +611,7 @@ class AppConfigTests(unittest.TestCase):
         self.assertFalse(args.no_model)
         self.assertFalse(args.dry_run)
         backfill = build_parser().parse_args(["insights-backfill-step", "--scheduled"])
+        self.assertEqual(backfill.timezone, "Asia/Shanghai")
         self.assertEqual(backfill.remote_port, 11435)
         self.assertEqual(backfill.minimum_idle_seconds, 60)
         self.assertEqual(backfill.maximum_step_seconds, 1800)
@@ -621,6 +625,18 @@ class AppConfigTests(unittest.TestCase):
             ["insights-run", "--identity-file", "/tmp/feishu-archive-key"]
         )
         self.assertEqual(custom_identity.identity_file, "/tmp/feishu-archive-key")
+
+    def test_daily_default_uses_previous_shanghai_day_at_0430(self) -> None:
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                instant = datetime(2026, 8, 25, 20, 30, tzinfo=timezone.utc)
+                return instant.astimezone(tz)
+
+        with patch("feishu_archive.cli.datetime", FixedDateTime):
+            self.assertEqual(DEFAULT_INSIGHTS_TIMEZONE, "Asia/Shanghai")
+            self.assertEqual(_yesterday(DEFAULT_INSIGHTS_TIMEZONE), "2026-08-25")
+            self.assertEqual(_yesterday("Europe/Amsterdam"), "2026-08-24")
 
     def test_wiki_rebuild_can_force_local_rendering(self) -> None:
         args = build_parser().parse_args(["wiki-rebuild", "--force"])

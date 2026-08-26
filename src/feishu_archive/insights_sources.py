@@ -148,6 +148,16 @@ def extract_daily_sources(
             continue
         status = str(state.get("status") or "unknown").lower()
         if status not in {"success", "succeeded", "completed", "ok"}:
+            if (
+                status == "partial"
+                and lane == "mail"
+                and _mail_partial_is_metadata_complete(state)
+            ):
+                warnings.append(
+                    "mail 最近同步仅附件因磁盘容量阈值未下载；"
+                    "每日洞察所需的邮件正文和附件元数据已同步"
+                )
+                continue
             warnings.append(f"{lane} 最近同步状态为 {status}")
             blocking_issues.append(f"{lane} 最近同步未成功")
         if state.get("finished_at") is None:
@@ -168,6 +178,26 @@ def extract_daily_sources(
         },
         "evidence": evidence,
     }
+
+
+def _mail_partial_is_metadata_complete(state: Mapping[str, Any]) -> bool:
+    """Accept only attachment-capacity partials for text/metadata analysis.
+
+    Insights never reads attachment bytes. A mail run that captured message
+    bodies and attachment metadata but paused binary downloads at the disk
+    threshold is therefore complete for this read-only derived layer. Any
+    mixed or unknown partial error remains blocking.
+    """
+
+    errors = [
+        line.strip()
+        for line in str(state.get("error") or "").splitlines()
+        if line.strip()
+    ]
+    return bool(errors) and all(
+        line.startswith("邮件 ") and line.endswith(" 的附件因磁盘阈值未下载")
+        for line in errors
+    )
 
 
 def archive_history_bounds(

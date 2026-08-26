@@ -1476,7 +1476,7 @@ insights.sqlite3
 当前源码默认：
 
 ```
-时区：Europe/Amsterdam
+时区：Asia/Shanghai
 模型服务器：192.168.100.179
 SSH用户：apple
 模型：vmlx/gemma-4-31b-it-8bit
@@ -1633,7 +1633,7 @@ open -a TextEdit src/feishu_archive/config.py
 只修改下面这些默认值，不要把密码、SSH 私钥、Bearer token 或飞书凭据写入该文件：
 
 ```
-DEFAULT_INSIGHTS_TIMEZONE = "Europe/Amsterdam"
+DEFAULT_INSIGHTS_TIMEZONE = "Asia/Shanghai"
 DEFAULT_VMLX_HOST = "192.168.100.179"
 DEFAULT_VMLX_USER = "apple"
 DEFAULT_VMLX_MODEL = "vmlx/gemma-4-31b-it-8bit"

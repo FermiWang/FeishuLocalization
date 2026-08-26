@@ -21,6 +21,7 @@ INSIGHTS_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_LABEL.plist"
 INSIGHTS_BACKFILL_PLIST_PATH="$HOME/Library/LaunchAgents/$INSIGHTS_BACKFILL_LABEL.plist"
 PYTHON_BIN=$(command -v python3)
 INSIGHTS_BACKFILL_INTERVAL_SECONDS=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS; print(DEFAULT_INSIGHTS_BACKFILL_INTERVAL_SECONDS)')
+INSIGHTS_TIMEZONE=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_INSIGHTS_TIMEZONE; print(DEFAULT_INSIGHTS_TIMEZONE)')
 MEETING_SYNC_INTERVAL_SECONDS=$(PYTHONPATH="$PROJECT_ROOT/src" "$PYTHON_BIN" -c 'from feishu_archive.config import DEFAULT_MEETING_RECORDS_SYNC_INTERVAL_SECONDS; print(DEFAULT_MEETING_RECORDS_SYNC_INTERVAL_SECONDS)')
 USER_DOMAIN="gui/$(id -u)"
 INSTALL_INSIGHTS=""
@@ -340,6 +341,8 @@ if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $ARCHIVE_DIR" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:3 string insights-run" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:4 string --scheduled" "$TEMP_INSIGHTS_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:5 string --timezone" "$TEMP_INSIGHTS_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:6 string $INSIGHTS_TIMEZONE" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $RUNTIME_DIR" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$TEMP_INSIGHTS_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin" "$TEMP_INSIGHTS_PLIST"
@@ -367,6 +370,8 @@ if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $ARCHIVE_DIR" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:3 string insights-backfill-step" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ProgramArguments:4 string --loop" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:5 string --timezone" "$TEMP_INSIGHTS_BACKFILL_PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments:6 string $INSIGHTS_TIMEZONE" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $RUNTIME_DIR" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$TEMP_INSIGHTS_BACKFILL_PLIST"
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin" "$TEMP_INSIGHTS_BACKFILL_PLIST"
@@ -447,7 +452,7 @@ while [ "$ATTEMPT" -lt 20 ]; do
     echo "邮箱同步：${MAIL_SYNC_LABEL}（每天 04:00；未授权时安全跳过，不影响其他通道）"
     echo "会议记录同步：${MEETING_SYNC_LABEL}（每 ${MEETING_SYNC_INTERVAL_SECONDS} 秒增量拉取一次）"
     if [ "$INSTALL_INSIGHTS" -eq 1 ]; then
-      echo "每日洞察：${INSIGHTS_LABEL}（每天 04:30，失败时 05:00/05:30 断点重试）"
+      echo "每日洞察：${INSIGHTS_LABEL}（${INSIGHTS_TIMEZONE} 每天 04:30，失败时 05:00/05:30 断点重试）"
       echo "历史洞察回填：${INSIGHTS_BACKFILL_LABEL}（常驻；vMLX 引擎空闲时从最早日期向最近日期连续回填，繁忙时轮询等待）"
     else
       echo "每日洞察与历史回填：未安装；验证模型和数据边界后使用 --with-insights 启用。"

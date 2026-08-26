@@ -212,6 +212,55 @@ class InsightsSourcesTests(unittest.TestCase):
         self.assertNotIn("BINARY-SECRET", rendered)
         self.assertNotIn("private.pdf", rendered)
 
+    def test_attachment_capacity_only_mail_partial_keeps_insights_coverage_complete(
+        self,
+    ) -> None:
+        chat_run = self.archive.start_sync_job("test")
+        self.archive.finish_sync_job(chat_run, status="success")
+        wiki_run = self.archive.start_wiki_sync_run("test", [])
+        self.archive.finish_wiki_sync_run(wiki_run, status="success")
+        mailbox_id = self.mail.upsert_mailbox(
+            {
+                "mailbox_id": "owner@example.com",
+                "primary_email_address": "owner@example.com",
+            }
+        )
+        mail_run = self.mail.start_sync_run(mailbox_id, "test")
+        self.mail.finish_sync_run(
+            mail_run,
+            status="partial",
+            error=(
+                "邮件 message-a 的附件因磁盘阈值未下载\n"
+                "邮件 message-b 的附件因磁盘阈值未下载"
+            ),
+        )
+
+        coverage = extract_daily_sources(
+            self.archive, self.mail, DAY, TIMEZONE
+        )["coverage"]
+
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(coverage["blocking_issues"], [])
+        self.assertTrue(
+            any("邮件正文和附件元数据已同步" in item for item in coverage["warnings"])
+        )
+
+        mixed_run = self.mail.start_sync_run(mailbox_id, "test")
+        self.mail.finish_sync_run(
+            mixed_run,
+            status="partial",
+            error=(
+                "邮件 message-c 的附件因磁盘阈值未下载\n"
+                "1 个邮件 ID 未返回详情"
+            ),
+        )
+        mixed_coverage = extract_daily_sources(
+            self.archive, self.mail, DAY, TIMEZONE
+        )["coverage"]
+
+        self.assertFalse(mixed_coverage["complete"])
+        self.assertIn("mail 最近同步未成功", mixed_coverage["blocking_issues"])
+
     def test_wiki_deduplicates_obj_token_and_marks_created_and_edited(self) -> None:
         with self.archive.connection() as con:
             con.execute(
