@@ -59,7 +59,7 @@ def _event(seq: int, *, revision: int = 1, content: str = "形成试点共识 [S
         },
         "structured": structured,
         "model_id": "Qwen3.8-27B-FP8",
-        "prompt_version": "detailed-meeting-record-v2",
+        "prompt_version": "detailed-meeting-record-v3",
         "editor_kind": "model" if revision == 1 else "user",
     }
     digest = hashlib.sha256(

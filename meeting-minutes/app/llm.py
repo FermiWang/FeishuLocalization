@@ -14,7 +14,7 @@ LLM_BASE_URL = os.environ.get(
     "LLM_BASE_URL", "http://192.168.100.214:8007/v1"
 ).rstrip("/")
 CONFIGURED_MODEL = os.environ.get("LLM_MODEL", EXACT_MODEL_ID)
-PROMPT_VERSION = "detailed-meeting-record-v2"
+PROMPT_VERSION = "detailed-meeting-record-v3"
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT", "900"))
 
 REQUIRED_SECTIONS = [
@@ -195,7 +195,12 @@ def _chat(messages: list[dict[str, str]], max_tokens: int) -> str:
                     "model": EXACT_MODEL_ID,
                     "messages": messages,
                     "temperature": 0.1,
-                    "max_tokens": max_tokens,
+                    "max_completion_tokens": max_tokens,
+                    "reasoning_effort": "none",
+                    "thinking_token_budget": 0,
+                    "include_reasoning": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "response_format": {"type": "json_object"},
                 },
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )

@@ -368,6 +368,12 @@ class ExactModelTests(unittest.TestCase):
             self.assertEqual(llm._chat([{"role": "user", "content": "x"}], 50), "{}")
         self.assertEqual(post.call_count, 2)
         self.assertTrue(all(call.kwargs["json"]["model"] == llm.EXACT_MODEL_ID for call in post.call_args_list))
+        self.assertTrue(all(call.kwargs["json"]["max_completion_tokens"] == 50 for call in post.call_args_list))
+        self.assertTrue(all(call.kwargs["json"]["reasoning_effort"] == "none" for call in post.call_args_list))
+        self.assertTrue(all(call.kwargs["json"]["thinking_token_budget"] == 0 for call in post.call_args_list))
+        self.assertTrue(all(call.kwargs["json"]["include_reasoning"] is False for call in post.call_args_list))
+        self.assertTrue(all(call.kwargs["json"]["chat_template_kwargs"] == {"enable_thinking": False} for call in post.call_args_list))
+        self.assertTrue(all(call.kwargs["json"]["response_format"] == {"type": "json_object"} for call in post.call_args_list))
 
 
 class MeetingApiTests(unittest.TestCase):
