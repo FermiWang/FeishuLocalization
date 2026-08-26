@@ -7,6 +7,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from importlib.resources import files
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +26,13 @@ from feishu_archive.web import ArchiveHTTPServer, is_loopback_host, serve
 
 
 class WebTests(unittest.TestCase):
+    def test_homepage_links_to_detailed_meeting_records_application(self) -> None:
+        index = files("feishu_archive").joinpath("static/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="meeting-records-link"', index)
+        self.assertIn('href="http://192.168.100.179:8765/"', index)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', index)
+        self.assertIn("详细会议记录整理", index)
+
     def test_insights_api_reuses_mail_unlock_and_returns_active_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = ArchivePaths(Path(temp))

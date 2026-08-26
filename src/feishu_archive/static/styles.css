@@ -22,8 +22,10 @@ button, input, select { font: inherit; }
 .brand p { margin: 0; color: var(--sidebar-muted); font-size: 12px; }
 .brand-mark { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; background: linear-gradient(135deg, #60a5fa, #4f46e5); font-weight: 800; }
 .mode-switch { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; padding: 4px; margin: -6px 0 18px; border-radius: 11px; background: rgba(255,255,255,.08); }
-.mode-button { border: 0; border-radius: 8px; padding: 8px 6px; background: transparent; color: var(--sidebar-muted); cursor: pointer; font-weight: 650; font-size: 12px; }
+.mode-button { display: block; border: 0; border-radius: 8px; padding: 8px 6px; background: transparent; color: var(--sidebar-muted); cursor: pointer; font-weight: 650; font-size: 12px; text-align: center; text-decoration: none; }
 .mode-button.active { background: white; color: #1d4ed8; }
+.mode-link { grid-column: 1 / -1; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: white; }
+.mode-link:hover, .mode-link:focus-visible { background: rgba(255,255,255,.16); outline: none; }
 #message-sidebar, #wiki-sidebar, #mail-sidebar, #insights-sidebar { min-height: 0; display: flex; flex: 1; flex-direction: column; }
 .status-card { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.1); border-radius: 12px; color: var(--sidebar-muted); padding: 12px; font-size: 12px; line-height: 1.6; margin-bottom: 18px; }
 .sync-card { display: grid; gap: 8px; margin: -6px 0 18px; }
