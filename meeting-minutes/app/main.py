@@ -14,7 +14,13 @@ from pydantic import BaseModel, Field
 
 from . import db, llm, processor
 from .docx_export import build_docx
-from .sources import extract_transcript, input_hash, safe_filename, source_type_for_filename
+from .sources import (
+    annotate_duplicate_sources,
+    extract_transcript,
+    input_hash,
+    safe_filename,
+    source_type_for_filename,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -117,6 +123,7 @@ def _public_source(source: dict, *, include_text: bool = False) -> dict:
         for key in (
             "id", "meeting_id", "source_type", "position", "pair_key", "original_name",
             "sha256", "generated", "processing_status", "error", "created_at", "updated_at",
+            "duplicate_of_source_id",
         )
     }
     if include_text and source.get("source_type") == "transcript":
@@ -131,7 +138,8 @@ def _public_job(job: dict | None) -> dict | None:
         key: job.get(key)
         for key in (
             "id", "meeting_id", "status", "stage", "progress", "error",
-            "attempts", "created_at", "started_at", "updated_at", "finished_at",
+            "attempts", "heartbeat_at", "last_error_code", "same_failure_count",
+            "created_at", "started_at", "updated_at", "finished_at",
         )
     }
 
@@ -270,7 +278,10 @@ def get_meeting(meeting_id: int):
     meeting = _meeting_or_404(meeting_id)
     meeting.pop("audio_path", None)
     meeting.pop("transcript_path", None)
-    meeting["sources"] = [_public_source(source) for source in meeting["sources"]]
+    meeting["sources"] = [
+        _public_source(source)
+        for source in annotate_duplicate_sources(meeting["sources"])
+    ]
     meeting["job"] = _public_job(meeting.get("job"))
     meeting["has_audio"] = any(source["source_type"] == "audio" for source in meeting["sources"])
     meeting["has_transcript"] = any(source["source_type"] == "transcript" for source in meeting["sources"])
@@ -294,7 +305,10 @@ def delete_meeting(meeting_id: int,
 @app.get("/api/meetings/{meeting_id}/sources")
 def list_sources(meeting_id: int, include_text: bool = False):
     _meeting_or_404(meeting_id)
-    return [_public_source(source, include_text=include_text) for source in db.list_sources(meeting_id)]
+    return [
+        _public_source(source, include_text=include_text)
+        for source in annotate_duplicate_sources(db.list_sources(meeting_id))
+    ]
 
 
 @app.post("/api/meetings/{meeting_id}/sources", status_code=201)
@@ -317,6 +331,15 @@ async def upload_source(meeting_id: int, file: UploadFile | None = File(default=
             suffix += 1
         limit = MAX_AUDIO_BYTES if source_type == "audio" else MAX_TRANSCRIPT_BYTES
         _, digest = await _save_upload(file, destination, limit)
+        duplicate = db.find_duplicate_source(
+            meeting_id, source_type=source_type, sha256=digest, pair_key=pair_key,
+        )
+        if duplicate is not None:
+            destination.unlink(missing_ok=True)
+            result = _public_source(duplicate)
+            result["duplicate_skipped"] = True
+            result["text_chars"] = len(db.source_text(duplicate)) if source_type == "transcript" else 0
+            return result
         extracted = ""
         if source_type == "transcript":
             try:
@@ -334,6 +357,15 @@ async def upload_source(meeting_id: int, file: UploadFile | None = File(default=
         raw = content.encode("utf-8")
         if len(raw) > MAX_TRANSCRIPT_BYTES:
             raise HTTPException(413, "粘贴识别稿超过大小限制")
+        digest = hashlib.sha256(raw).hexdigest()
+        duplicate = db.find_duplicate_source(
+            meeting_id, source_type="transcript", sha256=digest, pair_key=pair_key,
+        )
+        if duplicate is not None:
+            result = _public_source(duplicate)
+            result["duplicate_skipped"] = True
+            result["text_chars"] = len(content)
+            return result
         name = safe_filename(source_name or "粘贴识别稿.txt")
         destination = db.UPLOAD_DIR / f"{meeting_id}_{name}"
         suffix = 1
@@ -343,7 +375,7 @@ async def upload_source(meeting_id: int, file: UploadFile | None = File(default=
         destination.write_text(content, encoding="utf-8")
         source = db.add_source(
             meeting_id, source_type="transcript", original_name=source_name,
-            stored_path=str(destination), sha256=hashlib.sha256(raw).hexdigest(),
+            stored_path=str(destination), sha256=digest,
             text_content=content, pair_key=pair_key,
         )
     result = _public_source(source)

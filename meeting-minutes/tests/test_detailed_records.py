@@ -23,7 +23,13 @@ os.environ["MEETING_MINUTES_DATA_DIR"] = str(_DATA_DIR)
 from app import db, llm, processor  # noqa: E402
 from app.docx_export import build_docx  # noqa: E402
 from app.main import app  # noqa: E402
-from app.sources import extract_transcript, input_hash, stable_fragments  # noqa: E402
+from app.sources import (  # noqa: E402
+    annotate_duplicate_sources,
+    effective_sources,
+    extract_transcript,
+    input_hash,
+    stable_fragments,
+)
 
 
 def _structured(title="测试会议"):
@@ -221,6 +227,41 @@ class SourceAndDocumentTests(unittest.TestCase):
             [f"S{index:03d}" for index in range(1, len(fragments) + 1)],
         )
 
+    def test_exact_duplicate_sources_are_annotated_and_excluded_from_effective_input(self):
+        sources = [
+            {
+                "id": 10, "source_type": "transcript", "position": 0,
+                "pair_key": "", "sha256": "same", "generated": 0,
+            },
+            {
+                "id": 11, "source_type": "transcript", "position": 1,
+                "pair_key": "", "sha256": "same", "generated": 0,
+            },
+            {
+                "id": 12, "source_type": "transcript", "position": 2,
+                "pair_key": "other-audio", "sha256": "same", "generated": 0,
+            },
+        ]
+        annotated = annotate_duplicate_sources(sources)
+        self.assertIsNone(annotated[0]["duplicate_of_source_id"])
+        self.assertEqual(annotated[1]["duplicate_of_source_id"], 10)
+        self.assertIsNone(annotated[2]["duplicate_of_source_id"])
+        self.assertEqual([item["id"] for item in effective_sources(sources)], [10, 12])
+
+    def test_legacy_duplicate_checkpoint_reuses_only_the_proven_prefix(self):
+        fragments = [
+            {"id": "S001", "text": "第一段"},
+            {"id": "S002", "text": "第二段"},
+        ]
+        checkpoint = {
+            "fragment_ids": ["S001", "S002", "S003", "S004"],
+            "extracted": [{"items": [1]}, {"items": [2]}, {"items": [3]}, {"items": [4]}],
+        }
+        reconciled = llm.reconcile_checkpoint(checkpoint, fragments)
+        self.assertEqual(len(reconciled["extracted"]), 2)
+        self.assertEqual(reconciled["fragment_ids"], ["S001", "S002"])
+        self.assertIn("复用", reconciled["checkpoint_note"])
+
     def test_word_export_contains_all_sections_tables_and_page_fields(self):
         output = _DATA_DIR / "record.docx"
         record = _structured()
@@ -335,6 +376,18 @@ class ProcessorInputMatrixTests(unittest.TestCase):
         self.assertTrue(policy["transcript_authoritative"])
         self.assertFalse(policy["audio_asr_used"])
 
+    def test_duplicate_unpaired_transcript_is_skipped_without_deleting_raw_source(self):
+        meeting_id = db.create_meeting("重复识别稿", "2026-08-25", "", [])
+        first = self._source(meeting_id, "same-1.txt", "transcript", "相同内容。")
+        second = self._source(meeting_id, "same-2.txt", "transcript", "相同内容。")
+        meeting = db.get_meeting(meeting_id)
+        job = db.enqueue_job(meeting_id, input_hash(meeting))
+        fragments, policy = processor.prepare_fragments(job, meeting)
+        self.assertEqual(len(fragments), 1)
+        self.assertEqual(fragments[0]["source_id"], first["id"])
+        self.assertEqual(policy["duplicate_sources_skipped"], [second["id"]])
+        self.assertEqual(len(db.list_sources(meeting_id)), 2)
+
 
 class ExactModelTests(unittest.TestCase):
     @staticmethod
@@ -412,9 +465,13 @@ class ExactModelTests(unittest.TestCase):
     def test_repeated_invalid_json_is_recoverable_and_repair_sees_full_output(self):
         long_invalid = "x" * 20_000
         with mock.patch(
-            "app.llm._chat", side_effect=[long_invalid, "still invalid"]
+            "app.llm._chat",
+            side_effect=[
+                llm.ChatResult(long_invalid, "stop", {}, "first"),
+                llm.ChatResult("still invalid", "stop", {}, "repair"),
+            ],
         ) as chat:
-            with self.assertRaises(llm.ModelTemporaryError):
+            with self.assertRaises(llm.ModelDeterministicError):
                 llm._chat_json([{"role": "user", "content": "test"}], 100)
         repair_messages = chat.call_args_list[1].args[0]
         self.assertEqual(len(repair_messages[-2]["content"]), len(long_invalid))
@@ -429,7 +486,7 @@ class ExactModelTests(unittest.TestCase):
             200,
             text=(
                 'data: {"choices":[{"delta":{"content":"{"}}]}\n\n'
-                'data: {"choices":[{"delta":{"content":"}"}}]}\n\n'
+                'data: {"choices":[{"delta":{"content":"}"},"finish_reason":"stop"}]}\n\n'
                 'data: [DONE]\n\n'
             ),
             request=httpx.Request("POST", "http://local"),
@@ -439,7 +496,9 @@ class ExactModelTests(unittest.TestCase):
         with mock.patch("app.llm.model_preflight"), mock.patch(
             "app.llm.httpx.stream", return_value=context,
         ) as stream:
-            self.assertEqual(llm._chat([{"role": "user", "content": "x"}], 50), "{}")
+            result = llm._chat([{"role": "user", "content": "x"}], 50)
+            self.assertEqual(result.text, "{}")
+            self.assertEqual(result.finish_reason, "stop")
         self.assertEqual(stream.call_count, 1)
         payload = stream.call_args.kwargs["json"]
         self.assertEqual(payload["model"], llm.EXACT_MODEL_ID)
@@ -467,6 +526,105 @@ class ExactModelTests(unittest.TestCase):
             with self.assertRaises(llm.ModelTemporaryError):
                 llm._chat([{"role": "user", "content": "x"}], 50)
         self.assertEqual(stream.call_count, 1)
+
+    def test_chat_length_finish_is_detected_before_json_repair(self):
+        response = httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"{"}}]}\n\n'
+                'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+                'data: [DONE]\n\n'
+            ),
+            request=httpx.Request("POST", "http://local"),
+        )
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        with mock.patch("app.llm.model_preflight"), mock.patch(
+            "app.llm.httpx.stream", return_value=context,
+        ):
+            with self.assertRaises(llm.ModelOutputTruncatedError):
+                llm._chat_json(
+                    [{"role": "user", "content": "x"}], 1,
+                    response_schema=llm.EXTRACTION_SCHEMA,
+                    schema_name="length-test",
+                )
+
+    def test_aggregation_length_failure_splits_and_caches_each_half(self):
+        first = {"topics": [], "items": [{
+            "kind": "meeting_fact", "text": "一", "speaker": "", "owner": "",
+            "deadline": "", "source_refs": ["S001"],
+        }]}
+        second = {"topics": [], "items": [{
+            "kind": "meeting_fact", "text": "二", "speaker": "", "owner": "",
+            "deadline": "", "source_refs": ["S002"],
+        }]}
+        truncated = llm.ModelOutputTruncatedError(
+            "too long", code="output_truncated", fingerprint="root",
+        )
+        cache = {}
+        with mock.patch(
+            "app.llm._chat_json", side_effect=[truncated, first, second],
+        ) as chat:
+            result = llm._aggregate_adaptive(
+                [first, second], {"S001", "S002"}, cache,
+                label="议题聚合 1/1", on_progress=None, progress=70,
+            )
+        self.assertEqual(result, [first, second])
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(len(cache), 3)
+
+        with mock.patch("app.llm._chat_json") as resumed_chat:
+            resumed = llm._aggregate_adaptive(
+                [first, second], {"S001", "S002"}, cache,
+                label="议题聚合 1/1", on_progress=None, progress=70,
+            )
+        self.assertEqual(resumed, [first, second])
+        resumed_chat.assert_not_called()
+
+    def test_final_batch_length_failure_split_is_reused_after_resume(self):
+        specifications = llm.REQUIRED_SECTIONS[:2]
+
+        def response_for(specification):
+            section_id, title, kind = specification
+            return {
+                "title": "测试会议",
+                "sections": [{
+                    "id": section_id, "title": title, "kind": kind,
+                    "content": "有证据的内容 [S001]", "source_refs": ["S001"],
+                }],
+                "recognition_notes": [],
+            }
+
+        truncated = llm.ModelOutputTruncatedError(
+            "too long", code="output_truncated", fingerprint="final-root",
+        )
+        cache = {}
+        with mock.patch(
+            "app.llm._chat_json",
+            side_effect=[
+                truncated,
+                response_for(specifications[0]),
+                response_for(specifications[1]),
+            ],
+        ) as chat:
+            sections, notes = llm._generate_sections_adaptive(
+                specifications,
+                {"evidence": "[]", "valid_source_refs": ["S001"]},
+                {"S001"}, cache, on_progress=None, completed_before=0,
+            )
+        self.assertEqual([section["id"] for section in sections], [item[0] for item in specifications])
+        self.assertEqual(notes, [])
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(len(cache), 3)
+
+        with mock.patch("app.llm._chat_json") as resumed_chat:
+            resumed, _ = llm._generate_sections_adaptive(
+                specifications,
+                {"evidence": "[]", "valid_source_refs": ["S001"]},
+                {"S001"}, cache, on_progress=None, completed_before=0,
+            )
+        self.assertEqual([section["id"] for section in resumed], [item[0] for item in specifications])
+        resumed_chat.assert_not_called()
 
 
 class ParallelProcessorTests(unittest.TestCase):
@@ -532,6 +690,36 @@ class ParallelProcessorTests(unittest.TestCase):
         self.assertIn("extracted", recovered["checkpoint_json"])
         self.assertEqual(db.get_minutes(meeting_id)["status"], "processing")
 
+    def test_same_deterministic_failure_stops_after_three_attempts(self):
+        meeting_id = db.create_meeting("确定性失败限次", "2026-08-25", "", [])
+        source_path = db.UPLOAD_DIR / "deterministic.txt"
+        source_path.write_text("测试内容", encoding="utf-8")
+        db.add_source(
+            meeting_id, source_type="transcript", original_name="deterministic.txt",
+            stored_path=str(source_path), sha256=db.file_sha256(source_path),
+            text_content="测试内容",
+        )
+        meeting = db.get_meeting(meeting_id)
+        db.enqueue_job(meeting_id, input_hash(meeting))
+        failure = llm.ModelDeterministicError(
+            "相同输出失败", code="invalid_json", fingerprint="same-request",
+        )
+        with mock.patch(
+            "app.processor.prepare_fragments",
+            return_value=([{"id": "S001", "text": "测试内容"}], {}),
+        ), mock.patch(
+            "app.processor.llm.organize", side_effect=failure,
+        ), mock.patch.object(processor._stop, "wait", return_value=False):
+            for _ in range(3):
+                claimed = db.claim_next_job()
+                self.assertIsNotNone(claimed)
+                processor.process_job(claimed)
+        finished = db.get_latest_job(meeting_id)
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(finished["same_failure_count"], 3)
+        self.assertEqual(finished["last_error_code"], "invalid_json")
+        self.assertIn("停止自动重试", finished["error"])
+
 
 class MeetingApiTests(unittest.TestCase):
     def test_upload_response_does_not_echo_transcript_body(self):
@@ -552,6 +740,29 @@ class MeetingApiTests(unittest.TestCase):
             payload = response.json()
             self.assertNotIn("text", payload)
             self.assertEqual(payload["text_chars"], 14)
+
+    def test_duplicate_pasted_transcript_reuses_existing_source(self):
+        headers = {"X-Meeting-Minutes-Action": "confirm"}
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/meetings", headers=headers,
+                json={"title": "重复资料测试", "meeting_date": "2026-08-25"},
+            )
+            meeting_id = created.json()["id"]
+            first = client.post(
+                f"/api/meetings/{meeting_id}/sources", headers=headers,
+                data={"text": "完全相同的识别稿", "source_name": "first.txt"},
+            )
+            second = client.post(
+                f"/api/meetings/{meeting_id}/sources", headers=headers,
+                data={"text": "完全相同的识别稿", "source_name": "second.txt"},
+            )
+            self.assertEqual(first.status_code, 201)
+            self.assertEqual(second.status_code, 201)
+            self.assertEqual(second.json()["id"], first.json()["id"])
+            self.assertTrue(second.json()["duplicate_skipped"])
+            sources = client.get(f"/api/meetings/{meeting_id}/sources").json()
+            self.assertEqual(len(sources), 1)
 
     def test_date_is_required_before_organize_and_all_mutations_need_confirmation(self):
         headers = {"X-Meeting-Minutes-Action": "confirm"}

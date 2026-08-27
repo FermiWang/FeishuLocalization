@@ -15,6 +15,44 @@ MAX_DOCX_UNCOMPRESSED_BYTES = 200 * 1024**2
 MAX_EXTRACTED_TEXT_CHARS = 50 * 1024**2
 
 
+def _source_dedup_key(source: dict[str, Any]) -> tuple[str, str, str, int]:
+    """Return the exact-content identity used only for effective processing.
+
+    Pairing stays part of the identity because byte-identical transcripts may
+    legitimately be aligned to different recordings.  Raw source rows are
+    never deleted by this helper.
+    """
+    return (
+        str(source.get("source_type") or ""),
+        str(source.get("sha256") or ""),
+        str(source.get("pair_key") or "").strip(),
+        int(bool(source.get("generated"))),
+    )
+
+
+def annotate_duplicate_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Annotate later exact duplicates while preserving every raw source row."""
+    first_by_key: dict[tuple[str, str, str, int], int] = {}
+    result: list[dict[str, Any]] = []
+    for source in sorted(sources, key=lambda item: (item.get("position", 0), item.get("id", 0))):
+        item = dict(source)
+        key = _source_dedup_key(item)
+        duplicate_of = first_by_key.get(key) if key[1] else None
+        item["duplicate_of_source_id"] = duplicate_of
+        if duplicate_of is None:
+            first_by_key[key] = int(item["id"])
+        result.append(item)
+    return result
+
+
+def effective_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ordered sources that materially participate in processing."""
+    return [
+        source for source in annotate_duplicate_sources(sources)
+        if source.get("duplicate_of_source_id") is None
+    ]
+
+
 def safe_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w.\-()（）\u4e00-\u9fff]", "_", Path(name).name)
     return cleaned[:180] or "source"
@@ -86,6 +124,7 @@ def extract_transcript(path: str | Path) -> str:
 
 
 def input_hash(meeting: dict[str, Any]) -> str:
+    sources = effective_sources(list(meeting.get("sources", [])))
     payload = {
         "title": meeting.get("title") or "",
         "meeting_date": meeting.get("meeting_date") or "",
@@ -99,7 +138,7 @@ def input_hash(meeting: dict[str, Any]) -> str:
                 "pair_key": source.get("pair_key") or "",
                 "sha256": source["sha256"],
             }
-            for source in meeting.get("sources", [])
+            for source in sources
         ],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

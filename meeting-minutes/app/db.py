@@ -22,7 +22,7 @@ EXPORT_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "meetings.db"
 
 _local = threading.local()
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meetings (
@@ -79,12 +79,27 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     checkpoint_json TEXT NOT NULL DEFAULT '{}',
     error TEXT NOT NULL DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at TEXT,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    failure_fingerprint TEXT NOT NULL DEFAULT '',
+    same_failure_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     started_at TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_queue ON processing_jobs(status, id);
+CREATE TABLE IF NOT EXISTS processing_job_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES processing_jobs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_processing_job_events_job
+    ON processing_job_events(job_id, id);
 CREATE TABLE IF NOT EXISTS record_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -331,6 +346,10 @@ def init_db() -> None:
     _add_column_if_missing(
         "record_revisions", "source_fragments_json TEXT NOT NULL DEFAULT '{\"items\":[]}'"
     )
+    _add_column_if_missing("processing_jobs", "heartbeat_at TEXT")
+    _add_column_if_missing("processing_jobs", "last_error_code TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing("processing_jobs", "failure_fingerprint TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing("processing_jobs", "same_failure_count INTEGER NOT NULL DEFAULT 0")
     _migrate_legacy_sources()
     _migrate_legacy_minutes()
     _recover_legacy_processing_state()
@@ -449,6 +468,17 @@ def list_sources(meeting_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in get_conn().execute(
         "SELECT * FROM meeting_sources WHERE meeting_id=? ORDER BY position,id", (meeting_id,)
     )]
+
+
+def find_duplicate_source(meeting_id: int, *, source_type: str, sha256: str,
+                          pair_key: str = "", generated: bool = False) -> dict[str, Any] | None:
+    row = get_conn().execute(
+        """SELECT * FROM meeting_sources WHERE meeting_id=? AND source_type=?
+           AND sha256=? AND TRIM(pair_key)=? AND generated=?
+           ORDER BY position,id LIMIT 1""",
+        (meeting_id, source_type, sha256, pair_key.strip(), int(generated)),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def reorder_sources(meeting_id: int, source_ids: list[int]) -> None:
@@ -576,6 +606,15 @@ def enqueue_job(meeting_id: int, input_hash: str) -> dict[str, Any]:
            AND status='failed' ORDER BY id DESC""",
         (meeting_id, input_hash),
     ).fetchall()
+    if not failed_rows:
+        # Reuse the newest recoverable job even when canonical source
+        # de-duplication changed the input hash.  The processor reconciles the
+        # saved fragment prefix before it uses any checkpoint content.
+        failed_rows = conn.execute(
+            """SELECT * FROM processing_jobs WHERE meeting_id=? AND status='failed'
+               ORDER BY id DESC""",
+            (meeting_id,),
+        ).fetchall()
     for failed_row in failed_rows:
         try:
             checkpoint = json.loads(failed_row["checkpoint_json"] or "{}")
@@ -585,9 +624,16 @@ def enqueue_job(meeting_id: int, input_hash: str) -> dict[str, Any]:
             continue
         conn.execute(
             """UPDATE processing_jobs SET status='queued',stage='从失败断点恢复',
-               progress=1,error='',finished_at=NULL,updated_at=datetime('now','localtime')
+               progress=1,error='',finished_at=NULL,last_error_code='',
+               failure_fingerprint='',same_failure_count=0,
+               heartbeat_at=datetime('now','localtime'),
+               updated_at=datetime('now','localtime')
                WHERE id=?""",
             (failed_row["id"],),
+        )
+        record_job_event(
+            int(failed_row["id"]), status="queued", stage="从失败断点恢复",
+            message="复用已保存的分块断点",
         )
         conn.commit()
         set_minutes_status(meeting_id, "processing")
@@ -605,20 +651,24 @@ def recover_jobs() -> int:
     conn = get_conn()
     cur = conn.execute(
         """UPDATE processing_jobs SET status='queued',stage='应用重启后恢复排队',
+           heartbeat_at=datetime('now','localtime'),
            updated_at=datetime('now','localtime') WHERE status IN ('running','waiting')"""
     )
     conn.commit()
     return cur.rowcount
 
 
-def reset_job_input(job_id: int, input_hash: str, *, status: str = "running") -> None:
-    """Discard stage checkpoints when the ordered meeting input changed."""
+def reset_job_input(job_id: int, input_hash: str, *, status: str = "running",
+                    checkpoint: dict[str, Any] | None = None) -> None:
+    """Reconcile stage checkpoints when the effective ordered input changed."""
     conn = get_conn()
     conn.execute(
-        """UPDATE processing_jobs SET input_hash=?,status=?,checkpoint_json='{}',
+        """UPDATE processing_jobs SET input_hash=?,status=?,checkpoint_json=?,
            stage='输入已更新，重新开始',progress=1,
+           last_error_code='',failure_fingerprint='',same_failure_count=0,
+           heartbeat_at=datetime('now','localtime'),
            updated_at=datetime('now','localtime') WHERE id=?""",
-        (input_hash, status, job_id),
+        (input_hash, status, json.dumps(checkpoint or {}, ensure_ascii=False, sort_keys=True), job_id),
     )
     conn.commit()
 
@@ -635,10 +685,12 @@ def claim_next_job() -> dict[str, Any] | None:
     conn.execute(
         """UPDATE processing_jobs SET status='running',stage='准备输入',progress=1,
            attempts=attempts+1,started_at=COALESCE(started_at,datetime('now','localtime')),
+           error='',last_error_code='',heartbeat_at=datetime('now','localtime'),
            updated_at=datetime('now','localtime') WHERE id=?""",
         (row["id"],),
     )
     conn.commit()
+    record_job_event(int(row["id"]), status="running", stage="准备输入")
     return get_job(int(row["id"]))
 
 
@@ -656,8 +708,11 @@ def get_latest_job(meeting_id: int) -> dict[str, Any] | None:
 
 def update_job(job_id: int, *, status: str | None = None, stage: str | None = None,
                progress: int | None = None, checkpoint: dict[str, Any] | None = None,
-               error: str | None = None) -> None:
-    fields = ["updated_at=datetime('now','localtime')"]
+               error: str | None = None, last_error_code: str | None = None) -> None:
+    fields = [
+        "updated_at=datetime('now','localtime')",
+        "heartbeat_at=datetime('now','localtime')",
+    ]
     values: list[Any] = []
     for column, value in (("status", status), ("stage", stage),
                           ("progress", progress), ("error", error)):
@@ -667,22 +722,66 @@ def update_job(job_id: int, *, status: str | None = None, stage: str | None = No
     if checkpoint is not None:
         fields.append("checkpoint_json=?")
         values.append(json.dumps(checkpoint, ensure_ascii=False, sort_keys=True))
+    if last_error_code is not None:
+        fields.append("last_error_code=?")
+        values.append(last_error_code)
     values.append(job_id)
     conn = get_conn()
     conn.execute(f"UPDATE processing_jobs SET {', '.join(fields)} WHERE id=?", values)
     conn.commit()
 
 
-def finish_job(job_id: int, *, error: str = "") -> None:
+def record_job_event(job_id: int, *, status: str = "", stage: str = "",
+                     error_code: str = "", message: str = "") -> None:
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO processing_job_events(job_id,status,stage,error_code,message)
+           VALUES (?,?,?,?,?)""",
+        (job_id, status, stage, error_code, message[:1000]),
+    )
+    conn.commit()
+
+
+def record_deterministic_failure(job_id: int, *, fingerprint: str,
+                                 error_code: str, message: str) -> int:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT failure_fingerprint,same_failure_count FROM processing_jobs WHERE id=?",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    count = int(row["same_failure_count"] or 0) + 1 if row["failure_fingerprint"] == fingerprint else 1
+    conn.execute(
+        """UPDATE processing_jobs SET failure_fingerprint=?,same_failure_count=?,
+           last_error_code=?,error=?,heartbeat_at=datetime('now','localtime'),
+           updated_at=datetime('now','localtime') WHERE id=?""",
+        (fingerprint, count, error_code, message, job_id),
+    )
+    conn.commit()
+    record_job_event(
+        job_id, status="waiting", stage="确定性输出校验失败",
+        error_code=error_code, message=message,
+    )
+    return count
+
+
+def finish_job(job_id: int, *, error: str = "", error_code: str = "") -> None:
     conn = get_conn()
     conn.execute(
         """UPDATE processing_jobs SET status=?,stage=?,progress=?,error=?,
+           last_error_code=?,heartbeat_at=datetime('now','localtime'),
            finished_at=datetime('now','localtime'),updated_at=datetime('now','localtime')
            WHERE id=?""",
         ("failed" if error else "done", "处理失败" if error else "处理完成",
-         0 if error else 100, error, job_id),
+         0 if error else 100, error, error_code, job_id),
     )
     conn.commit()
+    record_job_event(
+        job_id, status="failed" if error else "done",
+        stage="处理失败" if error else "处理完成",
+        error_code=error_code, message=error,
+    )
 
 
 def _canonical_json(value: dict[str, Any]) -> str:

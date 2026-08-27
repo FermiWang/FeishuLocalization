@@ -9,7 +9,7 @@ from typing import Any
 
 from . import db, llm, spk
 from .docx_export import build_docx
-from .sources import input_hash, segment_text, stable_fragments
+from .sources import effective_sources, input_hash, segment_text, stable_fragments
 
 MAX_PARALLEL_JOBS = max(1, min(8, int(os.environ.get("MEETING_MAX_PARALLEL_JOBS", "6"))))
 MODEL_RETRY_SECONDS = max(1, int(os.environ.get("MODEL_RETRY_SECONDS", "30")))
@@ -54,7 +54,13 @@ def _analyze_audio(*args: Any) -> dict[str, Any] | None:
 
 def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[list[dict], dict[str, Any]]:
     """Apply transcript-authority and audio-only ASR rules, returning stable fragments."""
-    sources = list(meeting.get("sources") or [])
+    all_sources = list(meeting.get("sources") or [])
+    sources = effective_sources(all_sources)
+    effective_ids = {source.get("id") for source in sources}
+    duplicate_ids = [
+        int(source["id"]) for source in all_sources
+        if source.get("id") not in effective_ids
+    ]
     segments: list[dict[str, Any]] = []
     consumed_audio: set[int] = set()
     used_asr = False
@@ -146,6 +152,7 @@ def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[lis
         "audio_asr_used": used_asr,
         "audio_alignment_used": used_alignment,
         "speaker_identity_policy": "不可靠时保留说话人N或不署名，不猜测真实姓名",
+        "duplicate_sources_skipped": duplicate_ids,
     }
     return stable_fragments(segments), policy
 
@@ -155,17 +162,21 @@ def process_job(job: dict[str, Any]) -> None:
     meeting = db.get_meeting(meeting_id)
     if meeting is None:
         return
-    current_input_hash = input_hash(meeting)
-    if current_input_hash != str(job.get("input_hash") or ""):
-        db.reset_job_input(job["id"], current_input_hash)
-        job = db.get_job(job["id"]) or job
     checkpoint = json.loads(job.get("checkpoint_json") or "{}")
     try:
         fragments, policy = prepare_fragments(job, meeting)
+        current_input_hash = input_hash(meeting)
+        if current_input_hash != str(job.get("input_hash") or ""):
+            checkpoint = llm.reconcile_checkpoint(checkpoint, fragments)
+            db.reset_job_input(
+                job["id"], current_input_hash, checkpoint=checkpoint,
+            )
+            job = db.get_job(job["id"]) or job
         meeting = db.get_meeting(meeting_id) or meeting
         meeting["source_policy"] = policy
 
-        def progress(stage: str, value: int, new_checkpoint: dict[str, Any]) -> None:
+        def progress(stage: str, value: int,
+                     new_checkpoint: dict[str, Any] | None) -> None:
             _job_update(job["id"], meeting_id, stage, value, new_checkpoint)
 
         record = llm.organize(meeting, fragments, checkpoint=checkpoint, on_progress=progress)
@@ -197,15 +208,43 @@ def process_job(job: dict[str, Any]) -> None:
         db.set_stage(meeting_id, "")
         db.finish_job(job["id"])
     except (llm.ModelBusyError, llm.ModelTemporaryError) as exc:
-        db.update_job(job["id"], status="waiting", stage=str(exc), progress=1)
+        db.update_job(
+            job["id"], status="waiting", stage=str(exc), progress=1,
+            last_error_code="temporary_model_error",
+        )
+        db.record_job_event(
+            job["id"], status="waiting", stage=str(exc),
+            error_code="temporary_model_error", message=str(exc),
+        )
         db.set_stage(meeting_id, str(exc))
         _stop.wait(MODEL_RETRY_SECONDS)
         if db.get_job(job["id"]):
             db.update_job(job["id"], status="queued", stage="从已保存断点重新排队", progress=1)
             _wake.set()
+    except llm.ModelDeterministicError as exc:
+        count = db.record_deterministic_failure(
+            job["id"], fingerprint=exc.fingerprint,
+            error_code=exc.code, message=str(exc),
+        )
+        if count >= 3:
+            message = f"{exc}；相同请求连续失败 {count} 次，已停止自动重试"
+            db.finish_job(job["id"], error=message, error_code=exc.code)
+            db.set_minutes_status(meeting_id, "failed", error=message)
+            db.set_stage(meeting_id, "")
+        else:
+            stage = f"{exc}；第 {count}/3 次，保留断点后重试"
+            db.update_job(job["id"], status="waiting", stage=stage, progress=1)
+            db.set_stage(meeting_id, stage)
+            _stop.wait(MODEL_RETRY_SECONDS)
+            if db.get_job(job["id"]):
+                db.update_job(
+                    job["id"], status="queued",
+                    stage="确定性输出失败后从断点重新排队", progress=1,
+                )
+                _wake.set()
     except Exception as exc:  # noqa: BLE001 - persisted for visible recovery
         if db.get_meeting(meeting_id) is not None:
-            db.finish_job(job["id"], error=str(exc))
+            db.finish_job(job["id"], error=str(exc), error_code="unexpected_error")
             db.set_minutes_status(meeting_id, "failed", error=str(exc))
             db.set_stage(meeting_id, "")
 
