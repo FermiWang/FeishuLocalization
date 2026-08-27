@@ -138,6 +138,22 @@ class DetailedRecordDatabaseTests(unittest.TestCase):
         self.assertEqual(reset["input_hash"], "new-hash")
         self.assertEqual(json.loads(reset["checkpoint_json"]), {})
 
+    def test_failed_job_with_same_input_reuses_saved_checkpoint(self):
+        meeting_id = db.create_meeting("断点复用", "2026-08-25", "", [])
+        job = db.enqueue_job(meeting_id, "same-input")
+        claimed = db.claim_next_job()
+        self.assertEqual(claimed["id"], job["id"])
+        db.update_job(
+            job["id"],
+            checkpoint={"fragment_ids": ["S001"], "extracted": [{"items": []}]},
+        )
+        db.finish_job(job["id"], error="Expecting ',' delimiter")
+        resumed = db.enqueue_job(meeting_id, "same-input")
+        self.assertEqual(resumed["id"], job["id"])
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["error"], "")
+        self.assertEqual(len(json.loads(resumed["checkpoint_json"])["extracted"]), 1)
+
     def test_parallel_claims_are_atomic_and_unique(self):
         for index in range(6):
             meeting_id = db.create_meeting(f"并发会议{index}", "2026-08-25", "", [])
@@ -388,6 +404,20 @@ class ExactModelTests(unittest.TestCase):
         value["sections"][0]["content"] = "虚构内容 [S999]"
         with self.assertRaisesRegex(ValueError, "虚构片段引用"):
             llm._normalize_final(value, {"title": "测试"}, {"S001"})
+
+    def test_extract_json_repairs_bounded_missing_comma(self):
+        repaired = llm._extract_json('{"first": 1\n"second": [2]\n"third": {"x": 3}}')
+        self.assertEqual(repaired, {"first": 1, "second": [2], "third": {"x": 3}})
+
+    def test_repeated_invalid_json_is_recoverable_and_repair_sees_full_output(self):
+        long_invalid = "x" * 20_000
+        with mock.patch(
+            "app.llm._chat", side_effect=[long_invalid, "still invalid"]
+        ) as chat:
+            with self.assertRaises(llm.ModelTemporaryError):
+                llm._chat_json([{"role": "user", "content": "test"}], 100)
+        repair_messages = chat.call_args_list[1].args[0]
+        self.assertEqual(len(repair_messages[-2]["content"]), len(long_invalid))
 
     def test_preflight_network_timeout_is_recoverable(self):
         with mock.patch("app.llm.httpx.get", side_effect=httpx.ConnectTimeout("timeout")):

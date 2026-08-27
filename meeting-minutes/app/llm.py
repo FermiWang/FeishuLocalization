@@ -207,7 +207,31 @@ def _extract_json(text: str) -> dict[str, Any]:
         start, end = cleaned.find("{"), cleaned.rfind("}")
         if start >= 0 and end > start:
             cleaned = cleaned[start:end + 1]
-    value = json.loads(cleaned)
+    candidate = cleaned
+    value: Any = None
+    for _ in range(13):
+        try:
+            value = json.loads(candidate)
+            break
+        except json.JSONDecodeError as exc:
+            if exc.msg != "Expecting ',' delimiter":
+                raise
+            right = exc.pos
+            while right < len(candidate) and candidate[right].isspace():
+                right += 1
+            left = right - 1
+            while left >= 0 and candidate[left].isspace():
+                left -= 1
+            if left < 0 or right >= len(candidate):
+                raise
+            left_char, right_char = candidate[left], candidate[right]
+            left_can_end = left_char in {'"', '}', ']'} or left_char.isdigit()
+            right_can_start = right_char in {'"', '{', '[', '-'} or right_char.isdigit()
+            if not left_can_end or not right_can_start:
+                raise
+            candidate = candidate[:right] + "," + candidate[right:]
+    else:
+        raise ValueError("模型 JSON 缺少过多分隔符，已停止本地修复")
     if not isinstance(value, dict):
         raise ValueError("模型返回的 JSON 顶层不是对象")
     return value
@@ -286,12 +310,17 @@ def _chat_json(messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any
     except (json.JSONDecodeError, ValueError):
         repair = _chat(
             messages + [
-                {"role": "assistant", "content": first[:12000]},
+                {"role": "assistant", "content": first[:64000]},
                 {"role": "user", "content": "上次输出不是有效 JSON。请只返回符合既定结构的 JSON 对象。"},
             ],
             max_tokens,
         )
-        return _extract_json(repair)
+        try:
+            return _extract_json(repair)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ModelTemporaryError(
+                "模型连续返回无效 JSON，已保留分块断点并重新排队"
+            ) from exc
 
 
 def _validate_refs(refs: Any, valid: set[str]) -> list[str]:
@@ -420,7 +449,12 @@ def organize(meeting: dict[str, Any], fragments: list[dict[str, Any]],
                 }],
                 max_tokens=4096,
             )
-            validated_extraction = _validate_extraction(repaired, {fragment_id})
+            try:
+                validated_extraction = _validate_extraction(repaired, {fragment_id})
+            except ValueError as exc:
+                raise ModelTemporaryError(
+                    f"片段 {fragment_id} 连续未通过证据校验，已保留断点并重新排队"
+                ) from exc
         extracted.append(validated_extraction)
         checkpoint["extracted"] = extracted
         if on_progress:
@@ -451,7 +485,12 @@ def organize(meeting: dict[str, Any], fragments: list[dict[str, Any]],
                     json.dumps(group, ensure_ascii=False, separators=(",", ":"))
                 )},
             ], max_tokens=8192)
-            condensed.append(_validate_extraction(merged, all_refs))
+            try:
+                condensed.append(_validate_extraction(merged, all_refs))
+            except ValueError as exc:
+                raise ModelTemporaryError(
+                    f"议题聚合 {index} 未通过证据校验，已保留断点并重新排队"
+                ) from exc
             if on_progress:
                 on_progress(f"议题聚合 {index}/{len(groups)}", 65 + int(10 * index / len(groups)), checkpoint)
         evidence = json.dumps(condensed, ensure_ascii=False, separators=(",", ":"))
@@ -486,7 +525,12 @@ def organize(meeting: dict[str, Any], fragments: list[dict[str, Any]],
             }],
             max_tokens=16384,
         )
-        result = _normalize_final(repaired_final, meeting, all_refs)
+        try:
+            result = _normalize_final(repaired_final, meeting, all_refs)
+        except ValueError as final_exc:
+            raise ModelTemporaryError(
+                "最终记录连续未通过结构校验，已保留分块断点并重新排队"
+            ) from final_exc
     if on_progress:
         on_progress("结构化记录校验完成", 90, checkpoint)
     return result

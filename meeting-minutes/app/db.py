@@ -571,6 +571,27 @@ def enqueue_job(meeting_id: int, input_hash: str) -> dict[str, Any]:
     ).fetchone()
     if active:
         return dict(active)
+    failed_rows = conn.execute(
+        """SELECT * FROM processing_jobs WHERE meeting_id=? AND input_hash=?
+           AND status='failed' ORDER BY id DESC""",
+        (meeting_id, input_hash),
+    ).fetchall()
+    for failed_row in failed_rows:
+        try:
+            checkpoint = json.loads(failed_row["checkpoint_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not checkpoint.get("extracted"):
+            continue
+        conn.execute(
+            """UPDATE processing_jobs SET status='queued',stage='从失败断点恢复',
+               progress=1,error='',finished_at=NULL,updated_at=datetime('now','localtime')
+               WHERE id=?""",
+            (failed_row["id"],),
+        )
+        conn.commit()
+        set_minutes_status(meeting_id, "processing")
+        return get_job(int(failed_row["id"])) or {}
     cur = conn.execute(
         "INSERT INTO processing_jobs(meeting_id,status,stage,input_hash) VALUES (?,'queued','等待处理',?)",
         (meeting_id, input_hash),
