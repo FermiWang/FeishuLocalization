@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -551,6 +553,23 @@ class MeetingApiTests(unittest.TestCase):
                 headers={**headers, "Origin": "https://testserver"},
             )
             self.assertEqual(cross_scheme.status_code, 403)
+
+
+class StaticUiTests(unittest.TestCase):
+    def test_complete_inline_script_has_valid_javascript_syntax(self):
+        html = (Path(__file__).parents[1] / "app" / "static" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"<script>(.*)</script>", html, re.S)
+        self.assertIsNotNone(match)
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is unavailable for JavaScript syntax validation")
+        checked = subprocess.run(
+            [node, "--check"], input=match.group(1), text=True,
+            capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
 
 
 def tearDownModule():
