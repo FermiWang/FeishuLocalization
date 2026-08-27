@@ -355,12 +355,23 @@ class ExactModelTests(unittest.TestCase):
         ):
             result = llm.model_preflight()
             self.assertEqual(result["scheduler"]["num_running"], 1)
-        full_metrics = self._text_response(
+        full_but_prioritizable_metrics = self._text_response(
             f'vllm:num_requests_running{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 7.0\n'
             f'vllm:num_requests_waiting{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 1.0\n'
         )
         with mock.patch(
-            "app.llm.httpx.get", side_effect=[health, models, full_metrics]
+            "app.llm.httpx.get",
+            side_effect=[health, models, full_but_prioritizable_metrics],
+        ):
+            result = llm.model_preflight()
+            self.assertEqual(result["request_priority"], -(2**63))
+        congested_metrics = self._text_response(
+            f'vllm:num_requests_running{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 8.0\n'
+            f'vllm:num_requests_waiting{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} '
+            f'{float(llm.MODEL_MAX_WAITING_REQUESTS)}\n'
+        )
+        with mock.patch(
+            "app.llm.httpx.get", side_effect=[health, models, congested_metrics]
         ):
             with self.assertRaises(llm.ModelBusyError):
                 llm.model_preflight()
@@ -408,7 +419,11 @@ class ExactModelTests(unittest.TestCase):
         self.assertIs(payload["include_reasoning"], False)
         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["priority"], -(2**63))
         self.assertIs(payload["stream"], True)
+        self.assertEqual(
+            stream.call_args.kwargs["headers"]["X-Vllm-Priority"], str(-(2**63))
+        )
 
     def test_chat_timeout_is_recoverable_and_not_immediately_duplicated(self):
         response = mock.MagicMock()

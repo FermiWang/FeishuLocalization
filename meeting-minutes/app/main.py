@@ -188,18 +188,24 @@ def model_status():
         return {
             "status": "ready", "model_id": result["model_id"],
             "scheduler": result["scheduler"],
-            "model_max_concurrency": result["max_concurrency"], **workers,
+            "model_max_concurrency": result["max_concurrency"],
+            "model_max_waiting_requests": result["max_waiting_requests"],
+            "model_request_priority": result["request_priority"], **workers,
         }
     except llm.ModelBusyError as exc:
         return {
             "status": "busy", "model_id": llm.EXACT_MODEL_ID,
             "model_max_concurrency": llm.MODEL_MAX_CONCURRENCY,
+            "model_max_waiting_requests": llm.MODEL_MAX_WAITING_REQUESTS,
+            "model_request_priority": llm.MEETING_MODEL_PRIORITY,
             "detail": str(exc), **workers,
         }
     except Exception as exc:  # noqa: BLE001 - health endpoint
         return {
             "status": "unavailable", "model_id": llm.EXACT_MODEL_ID,
             "model_max_concurrency": llm.MODEL_MAX_CONCURRENCY,
+            "model_max_waiting_requests": llm.MODEL_MAX_WAITING_REQUESTS,
+            "model_request_priority": llm.MEETING_MODEL_PRIORITY,
             "detail": str(exc), **workers,
         }
 

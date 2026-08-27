@@ -17,6 +17,14 @@ CONFIGURED_MODEL = os.environ.get("LLM_MODEL", EXACT_MODEL_ID)
 PROMPT_VERSION = "detailed-meeting-record-v3"
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT", "900"))
 MODEL_MAX_CONCURRENCY = max(1, min(8, int(os.environ.get("MODEL_MAX_CONCURRENCY", "8"))))
+MODEL_MAX_WAITING_REQUESTS = max(
+    1, int(os.environ.get("MODEL_MAX_WAITING_REQUESTS", "16"))
+)
+_VLLM_HIGHEST_PRIORITY = -(2**63)
+MEETING_MODEL_PRIORITY = max(
+    _VLLM_HIGHEST_PRIORITY,
+    min(-1, int(os.environ.get("MEETING_MODEL_PRIORITY", str(_VLLM_HIGHEST_PRIORITY)))),
+)
 
 REQUIRED_SECTIONS = [
     ("core-conclusion", "核心结论", "callout"),
@@ -175,16 +183,18 @@ def model_preflight() -> dict[str, Any]:
     else:
         metrics_response = _preflight_get(f"{_root_url()}/metrics")
         active, queued = _vllm_scheduler_metrics(metrics_response.text)
-    if active + queued >= MODEL_MAX_CONCURRENCY:
+    if queued >= MODEL_MAX_WAITING_REQUESTS:
         raise ModelBusyError(
-            f"共享模型并发已满（{int(active)} 运行、{int(queued)} 等待，"
-            f"上限 {MODEL_MAX_CONCURRENCY}），会议记录已进入等待队列"
+            f"共享模型等待队列已达保护上限（{int(active)} 运行、{int(queued)} 等待，"
+            f"保护上限 {MODEL_MAX_WAITING_REQUESTS}），会议记录已在本地保留断点"
         )
     return {
         "health": health,
         "scheduler": {"num_running": active, "num_waiting": queued},
         "model_id": EXACT_MODEL_ID,
         "max_concurrency": MODEL_MAX_CONCURRENCY,
+        "max_waiting_requests": MODEL_MAX_WAITING_REQUESTS,
+        "request_priority": MEETING_MODEL_PRIORITY,
     }
 
 
@@ -217,6 +227,7 @@ def _chat(messages: list[dict[str, str]], max_tokens: int) -> str:
         "include_reasoning": False,
         "chat_template_kwargs": {"enable_thinking": False},
         "response_format": {"type": "json_object"},
+        "priority": MEETING_MODEL_PRIORITY,
         "stream": True,
     }
     timeout = httpx.Timeout(
@@ -225,7 +236,8 @@ def _chat(messages: list[dict[str, str]], max_tokens: int) -> str:
     chunks: list[str] = []
     try:
         with httpx.stream(
-            "POST", f"{LLM_BASE_URL}/chat/completions", json=payload, timeout=timeout
+            "POST", f"{LLM_BASE_URL}/chat/completions", json=payload,
+            headers={"X-Vllm-Priority": str(MEETING_MODEL_PRIORITY)}, timeout=timeout,
         ) as response:
             response.raise_for_status()
             for raw_line in response.iter_lines():
