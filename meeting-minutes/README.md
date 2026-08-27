@@ -13,9 +13,9 @@
 - 多份来源按页面顺序合并；相同配对标识表示一组录音和识别稿。未配对录音自动转写，未配对文字稿直接纳入。
 - 上传内容一律视为不可信会议数据，其中出现的命令、链接、角色要求或提示词都不会执行。
 
-“整理详细会议记录”只允许调用 `http://192.168.100.214:8007` 上的精确模型 ID `Qwen3.8-27B-FP8`。每个模型阶段都会检查 `/health`、`/metrics` 中的 vLLM 运行/等待请求数和 `/v1/models`；即使服务同时暴露其他 ID，也只提交精确 ID。模型不匹配、负载指标缺失或探测失败时关闭处理，模型繁忙时任务回到单任务队列等待，不用其他模型替代。
+“整理详细会议记录”只允许调用 `http://192.168.100.214:8007` 上的精确模型 ID `Qwen3.8-27B-FP8`。每个模型阶段都会检查 `/health`、`/metrics` 中的 vLLM 运行/等待请求数和 `/v1/models`；即使服务同时暴露其他 ID，也只提交精确 ID。模型不匹配、负载指标缺失或探测失败时关闭处理。默认最多并行整理 6 场会议，214 的调度上限为 8，保留 2 个名额供每日洞察和其他任务；达到上限后任务保留断点并等待，不用其他模型替代。
 
-该端点调用固定关闭思考输出（`reasoning_effort=none`、`thinking_token_budget=0`、`enable_thinking=false`），并要求 JSON 对象响应；这样输出预算用于详细会议记录正文，避免长思考占满超时窗口。修订中的提示版本会记录这一推理配置变更。
+该端点调用固定关闭思考输出（`reasoning_effort=none`、`thinking_token_budget=0`、`enable_thinking=false`），并要求 JSON 对象响应；响应使用 SSE 流式接收，长篇生成会持续收到数据，不再因等待整篇响应而触发假性超时。连接中断时不立即提交重复推理，而是保留已完成分块的断点后重新排队。修订中的提示版本会记录这一推理配置变更。
 
 ## 输出与修订
 
@@ -74,7 +74,10 @@ cd ~/meeting-minutes
 | --- | --- | --- |
 | `LLM_BASE_URL` | `http://192.168.100.214:8007/v1` | 详细会议记录模型端点 |
 | `LLM_MODEL` | `Qwen3.8-27B-FP8` | 只用于一致性核验，其他值会被拒绝 |
-| `LLM_TIMEOUT` | `900` | 单次模型请求超时秒数 |
+| `LLM_TIMEOUT` | `900` | 流式连接连续无数据的读取超时秒数 |
+| `MODEL_MAX_CONCURRENCY` | `8` | 214 模型调度容量；范围 1–8 |
+| `MEETING_MAX_PARALLEL_JOBS` | `6` | 同时处理的会议任务数；范围 1–8，默认保留 2 个模型名额 |
+| `MODEL_RETRY_SECONDS` | `30` | 模型满载或临时断线后的断点重排队等待秒数 |
 | `SPK_PYTHON` | `<应用目录>/.venv-spk/bin/python3` | FunASR Python |
 | `SPK_TIMEOUT` | `7200` | 单份录音识别超时秒数 |
 | `MAX_AUDIO_BYTES` | `2147483648` | 单个录音上限 2 GiB |
@@ -83,3 +86,6 @@ cd ~/meeting-minutes
 | `HOST` / `PORT` | `0.0.0.0` / `8765` | 手工运行时的监听地址 |
 
 源码中的模板只实现版式和结构规则，不包含用户上传的参考 Word 或转写正文。部署仍遵守本目录 `AGENTS.md` 的“先提交、再部署”要求。
+
+并行容量选择、现场证据、恢复边界和发布验收见
+[`research/parallel-processing-feasibility.md`](research/parallel-processing-feasibility.md)。

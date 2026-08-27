@@ -16,6 +16,7 @@ LLM_BASE_URL = os.environ.get(
 CONFIGURED_MODEL = os.environ.get("LLM_MODEL", EXACT_MODEL_ID)
 PROMPT_VERSION = "detailed-meeting-record-v3"
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT", "900"))
+MODEL_MAX_CONCURRENCY = max(1, min(8, int(os.environ.get("MODEL_MAX_CONCURRENCY", "8"))))
 
 REQUIRED_SECTIONS = [
     ("core-conclusion", "核心结论", "callout"),
@@ -65,7 +66,11 @@ closing, recognition-review。
 
 
 class ModelBusyError(RuntimeError):
-    """The shared model is healthy but occupied by another workload."""
+    """The shared model is healthy but its bounded scheduler is full."""
+
+
+class ModelTemporaryError(RuntimeError):
+    """A model request failed transiently and should resume from its checkpoint."""
 
 
 class ModelIdentityError(RuntimeError):
@@ -74,6 +79,21 @@ class ModelIdentityError(RuntimeError):
 
 def _root_url() -> str:
     return LLM_BASE_URL[:-3] if LLM_BASE_URL.endswith("/v1") else LLM_BASE_URL
+
+
+def _preflight_get(url: str) -> httpx.Response:
+    try:
+        response = httpx.get(url, timeout=10.0)
+        response.raise_for_status()
+        return response
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code >= 500:
+            raise ModelTemporaryError(
+                f"模型健康探测暂时异常（HTTP {exc.response.status_code}），已保留断点等待重试"
+            ) from exc
+        raise
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        raise ModelTemporaryError("模型健康探测连接失败，已保留断点等待重试") from exc
 
 
 def _vllm_scheduler_metrics(text: str) -> tuple[float, float]:
@@ -111,8 +131,7 @@ def model_preflight() -> dict[str, Any]:
         raise ModelIdentityError(
             f"整理详细会议记录只允许模型 {EXACT_MODEL_ID}，当前配置为 {CONFIGURED_MODEL}"
         )
-    health_response = httpx.get(f"{_root_url()}/health", timeout=10.0)
-    health_response.raise_for_status()
+    health_response = _preflight_get(f"{_root_url()}/health")
     health: dict[str, Any] = {}
     if health_response.content.strip():
         try:
@@ -122,8 +141,7 @@ def model_preflight() -> dict[str, Any]:
         if not isinstance(decoded_health, dict):
             raise RuntimeError("模型健康检查返回格式无效")
         health = decoded_health
-    models_response = httpx.get(f"{LLM_BASE_URL}/models", timeout=10.0)
-    models_response.raise_for_status()
+    models_response = _preflight_get(f"{LLM_BASE_URL}/models")
     decoded_models = models_response.json()
     if not isinstance(decoded_models, dict):
         raise RuntimeError("模型列表返回格式无效")
@@ -155,15 +173,18 @@ def model_preflight() -> dict[str, Any]:
         ):
             raise RuntimeError("scheduler 负载状态无效，已按繁忙处理")
     else:
-        metrics_response = httpx.get(f"{_root_url()}/metrics", timeout=10.0)
-        metrics_response.raise_for_status()
+        metrics_response = _preflight_get(f"{_root_url()}/metrics")
         active, queued = _vllm_scheduler_metrics(metrics_response.text)
-    if active > 0 or queued > 0 or bool(health.get("busy")):
-        raise ModelBusyError("共享模型正在处理每日洞察或其他任务，会议记录已进入等待队列")
+    if active + queued >= MODEL_MAX_CONCURRENCY:
+        raise ModelBusyError(
+            f"共享模型并发已满（{int(active)} 运行、{int(queued)} 等待，"
+            f"上限 {MODEL_MAX_CONCURRENCY}），会议记录已进入等待队列"
+        )
     return {
         "health": health,
         "scheduler": {"num_running": active, "num_waiting": queued},
         "model_id": EXACT_MODEL_ID,
+        "max_concurrency": MODEL_MAX_CONCURRENCY,
     }
 
 
@@ -183,44 +204,67 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _chat(messages: list[dict[str, str]], max_tokens: int) -> str:
-    response = None
-    for attempt in range(2):
-        # Recheck the shared scheduler before every request, allowing the daily
-        # insights lane to take priority between long-meeting stages.
-        model_preflight()
-        try:
-            response = httpx.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                json={
-                    "model": EXACT_MODEL_ID,
-                    "messages": messages,
-                    "temperature": 0.1,
-                    "max_completion_tokens": max_tokens,
-                    "reasoning_effort": "none",
-                    "thinking_token_budget": 0,
-                    "include_reasoning": False,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            break
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {409, 429, 503}:
-                raise ModelBusyError("共享模型繁忙，会议记录已进入等待队列") from exc
-            if attempt:
-                raise
-        except (httpx.TimeoutException, httpx.TransportError):
-            if attempt:
-                raise
-    if response is None:
-        raise RuntimeError("模型请求未返回响应")
-    data = response.json()
+    # Recheck before every stage.  Unlike the old single-lane gate, requests
+    # below the endpoint's configured capacity are allowed to run together.
+    model_preflight()
+    payload = {
+        "model": EXACT_MODEL_ID,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_completion_tokens": max_tokens,
+        "reasoning_effort": "none",
+        "thinking_token_budget": 0,
+        "include_reasoning": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "response_format": {"type": "json_object"},
+        "stream": True,
+    }
+    timeout = httpx.Timeout(
+        REQUEST_TIMEOUT_SECONDS, connect=10.0, write=60.0, pool=60.0
+    )
+    chunks: list[str] = []
     try:
-        return str(data["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("模型响应缺少 choices[0].message.content") from exc
+        with httpx.stream(
+            "POST", f"{LLM_BASE_URL}/chat/completions", json=payload, timeout=timeout
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                line = raw_line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_text = line[5:].strip()
+                if data_text == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_text)
+                except json.JSONDecodeError as exc:
+                    raise ModelTemporaryError("模型流式响应包含无效数据，已保留断点等待重试") from exc
+                if isinstance(data, dict) and data.get("error"):
+                    raise ModelTemporaryError(
+                        f"模型流式响应出错：{str(data['error'])[:300]}"
+                    )
+                try:
+                    delta = data["choices"][0]["delta"]
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise ModelTemporaryError("模型流式响应缺少 choices[0].delta") from exc
+                content = delta.get("content") if isinstance(delta, dict) else None
+                if content:
+                    chunks.append(str(content))
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {409, 429, 503}:
+            raise ModelBusyError("共享模型并发已满，会议记录已进入等待队列") from exc
+        if exc.response.status_code in {500, 502, 504}:
+            raise ModelTemporaryError(
+                f"模型服务暂时异常（HTTP {exc.response.status_code}），已保留断点等待重试"
+            ) from exc
+        raise
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        # Do not submit an immediate duplicate: the endpoint may still be
+        # finishing the timed-out inference.  The queue retries from checkpoint.
+        raise ModelTemporaryError("模型流式连接超时或中断，已保留断点等待重试") from exc
+    if not chunks:
+        raise ModelTemporaryError("模型流式响应没有正文，已保留断点等待重试")
+    return "".join(chunks)
 
 
 def _chat_json(messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:

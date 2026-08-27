@@ -182,13 +182,26 @@ def index():
 
 @app.get("/api/system/model")
 def model_status():
+    workers = processor.worker_status()
     try:
         result = llm.model_preflight()
-        return {"status": "ready", "model_id": result["model_id"]}
+        return {
+            "status": "ready", "model_id": result["model_id"],
+            "scheduler": result["scheduler"],
+            "model_max_concurrency": result["max_concurrency"], **workers,
+        }
     except llm.ModelBusyError as exc:
-        return {"status": "busy", "model_id": llm.EXACT_MODEL_ID, "detail": str(exc)}
+        return {
+            "status": "busy", "model_id": llm.EXACT_MODEL_ID,
+            "model_max_concurrency": llm.MODEL_MAX_CONCURRENCY,
+            "detail": str(exc), **workers,
+        }
     except Exception as exc:  # noqa: BLE001 - health endpoint
-        return {"status": "unavailable", "model_id": llm.EXACT_MODEL_ID, "detail": str(exc)}
+        return {
+            "status": "unavailable", "model_id": llm.EXACT_MODEL_ID,
+            "model_max_concurrency": llm.MODEL_MAX_CONCURRENCY,
+            "detail": str(exc), **workers,
+        }
 
 
 @app.post("/api/meetings", status_code=201)

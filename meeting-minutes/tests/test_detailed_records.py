@@ -3,8 +3,10 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -133,6 +135,16 @@ class DetailedRecordDatabaseTests(unittest.TestCase):
         reset = db.get_job(job["id"])
         self.assertEqual(reset["input_hash"], "new-hash")
         self.assertEqual(json.loads(reset["checkpoint_json"]), {})
+
+    def test_parallel_claims_are_atomic_and_unique(self):
+        for index in range(6):
+            meeting_id = db.create_meeting(f"并发会议{index}", "2026-08-25", "", [])
+            db.enqueue_job(meeting_id, f"hash-{index}")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            claimed = list(pool.map(lambda _: db.claim_next_job(), range(6)))
+        ids = [job["id"] for job in claimed if job]
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(set(ids)), 6)
 
     def test_completed_legacy_six_section_result_migrates_without_rewriting_original(self):
         meeting_id = db.create_meeting("历史会议", "2026-08-20", "旧数据", [])
@@ -317,7 +329,7 @@ class ExactModelTests(unittest.TestCase):
             200, text=value, request=httpx.Request("GET", "http://local")
         )
 
-    def test_preflight_requires_exact_model_and_idle_vllm_metrics(self):
+    def test_preflight_requires_exact_model_and_honors_vllm_capacity(self):
         health = self._text_response("")
         models = self._response({
             "data": [{"id": llm.EXACT_MODEL_ID}, {"id": "Qwen3.6-27B-FP8"}]
@@ -332,12 +344,21 @@ class ExactModelTests(unittest.TestCase):
             "app.llm.httpx.get", side_effect=[health, models, idle_metrics]
         ):
             self.assertEqual(llm.model_preflight()["model_id"], llm.EXACT_MODEL_ID)
-        busy_metrics = self._text_response(
+        available_metrics = self._text_response(
             f'vllm:num_requests_running{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 1.0\n'
             f'vllm:num_requests_waiting{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 0.0\n'
         )
         with mock.patch(
-            "app.llm.httpx.get", side_effect=[health, models, busy_metrics]
+            "app.llm.httpx.get", side_effect=[health, models, available_metrics]
+        ):
+            result = llm.model_preflight()
+            self.assertEqual(result["scheduler"]["num_running"], 1)
+        full_metrics = self._text_response(
+            f'vllm:num_requests_running{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 7.0\n'
+            f'vllm:num_requests_waiting{{engine="0",model_name="{llm.EXACT_MODEL_ID}"}} 1.0\n'
+        )
+        with mock.patch(
+            "app.llm.httpx.get", side_effect=[health, models, full_metrics]
         ):
             with self.assertRaises(llm.ModelBusyError):
                 llm.model_preflight()
@@ -355,25 +376,114 @@ class ExactModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "虚构片段引用"):
             llm._normalize_final(value, {"title": "测试"}, {"S001"})
 
-    def test_chat_retries_one_timeout_and_sends_only_exact_model(self):
+    def test_preflight_network_timeout_is_recoverable(self):
+        with mock.patch("app.llm.httpx.get", side_effect=httpx.ConnectTimeout("timeout")):
+            with self.assertRaises(llm.ModelTemporaryError):
+                llm.model_preflight()
+
+    def test_chat_streams_and_sends_only_exact_model(self):
         response = httpx.Response(
             200,
-            json={"choices": [{"message": {"content": "{}"}}]},
+            text=(
+                'data: {"choices":[{"delta":{"content":"{"}}]}\n\n'
+                'data: {"choices":[{"delta":{"content":"}"}}]}\n\n'
+                'data: [DONE]\n\n'
+            ),
             request=httpx.Request("POST", "http://local"),
         )
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
         with mock.patch("app.llm.model_preflight"), mock.patch(
-            "app.llm.httpx.post",
-            side_effect=[httpx.ReadTimeout("timeout"), response],
-        ) as post:
+            "app.llm.httpx.stream", return_value=context,
+        ) as stream:
             self.assertEqual(llm._chat([{"role": "user", "content": "x"}], 50), "{}")
-        self.assertEqual(post.call_count, 2)
-        self.assertTrue(all(call.kwargs["json"]["model"] == llm.EXACT_MODEL_ID for call in post.call_args_list))
-        self.assertTrue(all(call.kwargs["json"]["max_completion_tokens"] == 50 for call in post.call_args_list))
-        self.assertTrue(all(call.kwargs["json"]["reasoning_effort"] == "none" for call in post.call_args_list))
-        self.assertTrue(all(call.kwargs["json"]["thinking_token_budget"] == 0 for call in post.call_args_list))
-        self.assertTrue(all(call.kwargs["json"]["include_reasoning"] is False for call in post.call_args_list))
-        self.assertTrue(all(call.kwargs["json"]["chat_template_kwargs"] == {"enable_thinking": False} for call in post.call_args_list))
-        self.assertTrue(all(call.kwargs["json"]["response_format"] == {"type": "json_object"} for call in post.call_args_list))
+        self.assertEqual(stream.call_count, 1)
+        payload = stream.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], llm.EXACT_MODEL_ID)
+        self.assertEqual(payload["max_completion_tokens"], 50)
+        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(payload["thinking_token_budget"], 0)
+        self.assertIs(payload["include_reasoning"], False)
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertIs(payload["stream"], True)
+
+    def test_chat_timeout_is_recoverable_and_not_immediately_duplicated(self):
+        response = mock.MagicMock()
+        response.raise_for_status.return_value = None
+        response.iter_lines.side_effect = httpx.ReadTimeout("timeout")
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        with mock.patch("app.llm.model_preflight"), mock.patch(
+            "app.llm.httpx.stream", return_value=context,
+        ) as stream:
+            with self.assertRaises(llm.ModelTemporaryError):
+                llm._chat([{"role": "user", "content": "x"}], 50)
+        self.assertEqual(stream.call_count, 1)
+
+
+class ParallelProcessorTests(unittest.TestCase):
+    def setUp(self):
+        db.init_db()
+        con = db.get_conn()
+        for table in (
+            "sync_events", "record_revisions", "processing_jobs", "meeting_sources",
+            "minutes", "attendees", "meetings",
+        ):
+            con.execute(f"DELETE FROM {table}")
+        con.commit()
+
+    def test_worker_pool_starts_bounded_parallel_workers_only_once(self):
+        processor.stop_worker()
+        ready = threading.Barrier(4)
+        release = threading.Event()
+
+        def held_loop():
+            ready.wait(timeout=2)
+            release.wait(timeout=2)
+
+        try:
+            with mock.patch.object(processor, "MAX_PARALLEL_JOBS", 3), mock.patch(
+                "app.processor.db.recover_jobs"
+            ) as recover, mock.patch("app.processor._loop", side_effect=held_loop):
+                processor.start_worker()
+                ready.wait(timeout=2)
+                self.assertEqual(processor.worker_status()["active_workers"], 3)
+                processor.start_worker()
+                self.assertEqual(recover.call_count, 1)
+        finally:
+            release.set()
+            processor.stop_worker()
+
+    def test_temporary_model_failure_requeues_without_losing_checkpoint(self):
+        meeting_id = db.create_meeting("临时错误恢复", "2026-08-25", "", [])
+        source_path = db.UPLOAD_DIR / "temporary-retry.txt"
+        source_path.write_text("测试内容", encoding="utf-8")
+        db.add_source(
+            meeting_id, source_type="transcript", original_name="temporary-retry.txt",
+            stored_path=str(source_path), sha256="hash", text_content="测试内容",
+        )
+        meeting = db.get_meeting(meeting_id)
+        job = db.enqueue_job(meeting_id, input_hash(meeting))
+        db.update_job(
+            job["id"],
+            checkpoint={"fragment_ids": ["S001"], "extracted": [{"x": 1}]},
+        )
+        claimed = db.claim_next_job()
+        with mock.patch(
+            "app.processor.prepare_fragments",
+            return_value=([{"id": "S001", "text": "测试内容"}], {}),
+        ), mock.patch(
+            "app.processor.llm.organize",
+            side_effect=llm.ModelTemporaryError(
+                "模型流式连接超时或中断，已保留断点等待重试"
+            ),
+        ), mock.patch.object(processor._stop, "wait", return_value=False):
+            processor.process_job(claimed)
+        recovered = db.get_job(job["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertIn("extracted", recovered["checkpoint_json"])
+        self.assertEqual(db.get_minutes(meeting_id)["status"], "processing")
 
 
 class MeetingApiTests(unittest.TestCase):

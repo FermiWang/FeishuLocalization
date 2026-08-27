@@ -1,7 +1,8 @@
-"""Single recoverable processing queue shared by ASR and the detailed-record model."""
+"""Bounded recoverable workers shared by ASR and the detailed-record model."""
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,11 @@ from . import db, llm, spk
 from .docx_export import build_docx
 from .sources import input_hash, segment_text, stable_fragments
 
-_worker: threading.Thread | None = None
+MAX_PARALLEL_JOBS = max(1, min(8, int(os.environ.get("MEETING_MAX_PARALLEL_JOBS", "6"))))
+MODEL_RETRY_SECONDS = max(1, int(os.environ.get("MODEL_RETRY_SECONDS", "30")))
+_workers: list[threading.Thread] = []
+_worker_lock = threading.Lock()
+_asr_slot = threading.Semaphore(1)
 _wake = threading.Event()
 _stop = threading.Event()
 
@@ -41,6 +46,12 @@ def _generated_exists(audio_id: int, sources: list[dict[str, Any]]) -> dict[str,
                  and source.get("pair_key") == key), None)
 
 
+def _analyze_audio(*args: Any) -> dict[str, Any] | None:
+    """Keep the memory-heavy FunASR lane serial while text jobs run in parallel."""
+    with _asr_slot:
+        return spk.analyze(*args)
+
+
 def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[list[dict], dict[str, Any]]:
     """Apply transcript-authority and audio-only ASR rules, returning stable fragments."""
     sources = list(meeting.get("sources") or [])
@@ -65,7 +76,9 @@ def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[lis
             _job_update(job["id"], meeting["id"],
                         f"识别稿优先：为 {source['original_name']} 对齐时间轴和说话人", 5)
             db.set_source_processing(paired["id"], "processing")
-            analysis = spk.analyze(meeting["id"], paired["id"], paired["stored_path"], text, db.UPLOAD_DIR)
+            analysis = _analyze_audio(
+                meeting["id"], paired["id"], paired["stored_path"], text, db.UPLOAD_DIR
+            )
             if analysis:
                 used_alignment = True
                 db.set_source_processing(paired["id"], "ready")
@@ -99,7 +112,9 @@ def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[lis
         _job_update(job["id"], meeting["id"],
                     f"FunASR 转写与说话人分离：{audio['original_name']}", 5)
         db.set_source_processing(audio["id"], "processing")
-        analysis = spk.analyze(meeting["id"], audio["id"], audio["stored_path"], None, db.UPLOAD_DIR)
+        analysis = _analyze_audio(
+            meeting["id"], audio["id"], audio["stored_path"], None, db.UPLOAD_DIR
+        )
         if not analysis:
             db.set_source_processing(audio["id"], "failed", "FunASR 未返回有效识别稿")
             raise RuntimeError(f"录音 {audio['original_name']} 识别失败")
@@ -181,12 +196,12 @@ def process_job(job: dict[str, Any]) -> None:
         db.set_minutes_status(meeting_id, "done", content=markdown)
         db.set_stage(meeting_id, "")
         db.finish_job(job["id"])
-    except llm.ModelBusyError as exc:
+    except (llm.ModelBusyError, llm.ModelTemporaryError) as exc:
         db.update_job(job["id"], status="waiting", stage=str(exc), progress=1)
         db.set_stage(meeting_id, str(exc))
-        _stop.wait(30)
+        _stop.wait(MODEL_RETRY_SECONDS)
         if db.get_job(job["id"]):
-            db.update_job(job["id"], status="queued", stage="等待共享模型空闲", progress=1)
+            db.update_job(job["id"], status="queued", stage="从已保存断点重新排队", progress=1)
             _wake.set()
     except Exception as exc:  # noqa: BLE001 - persisted for visible recovery
         if db.get_meeting(meeting_id) is not None:
@@ -211,13 +226,21 @@ def _loop() -> None:
 
 
 def start_worker() -> None:
-    global _worker
-    if _worker and _worker.is_alive():
-        return
-    db.recover_jobs()
-    _stop.clear()
-    _worker = threading.Thread(target=_loop, name="meeting-processing-queue", daemon=True)
-    _worker.start()
+    global _workers
+    with _worker_lock:
+        _workers = [worker for worker in _workers if worker.is_alive()]
+        if _workers:
+            return
+        db.recover_jobs()
+        _stop.clear()
+        _workers = [
+            threading.Thread(
+                target=_loop, name=f"meeting-processing-{index + 1}", daemon=True
+            )
+            for index in range(MAX_PARALLEL_JOBS)
+        ]
+        for worker in _workers:
+            worker.start()
 
 
 def wake_worker() -> None:
@@ -225,5 +248,19 @@ def wake_worker() -> None:
 
 
 def stop_worker() -> None:
+    global _workers
     _stop.set()
     _wake.set()
+    with _worker_lock:
+        workers = list(_workers)
+        _workers = []
+    for worker in workers:
+        if worker is not threading.current_thread():
+            worker.join(timeout=1)
+
+
+def worker_status() -> dict[str, int]:
+    return {
+        "configured_parallel_jobs": MAX_PARALLEL_JOBS,
+        "active_workers": sum(worker.is_alive() for worker in _workers),
+    }
