@@ -426,7 +426,7 @@ class Tunnel:
         remote_port: int = 8067,
         identity_file: str | None = None,
         *,
-        startup_timeout: float = 10.0,
+        startup_timeout: float = 30.0,
         poll_interval: float = 0.05,
         shutdown_timeout: float = 3.0,
         popen_factory: Callable[..., Any] = subprocess.Popen,
