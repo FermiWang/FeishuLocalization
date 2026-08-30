@@ -902,7 +902,7 @@ def main(argv: list[str] | None = None) -> None:
                             base_url,
                             model=args.model,
                             bearer_token=bearer,
-                            timeout=900.0,
+                            timeout=1800.0,
                         )
                         available_models = {
                             str(item.get("id") or "") for item in client.models()
@@ -1447,7 +1447,7 @@ def _run_insights_backfill_step(
                     remote_port=args.remote_port,
                     identity_file=args.identity_file,
                 ) as base_url:
-                    raw_client = VMLXClient(base_url, model=args.model, timeout=900.0)
+                    raw_client = VMLXClient(base_url, model=args.model, timeout=1800.0)
                     models = raw_client.models()
                     first = evaluate_vmlx_load(
                         raw_client.health(),
