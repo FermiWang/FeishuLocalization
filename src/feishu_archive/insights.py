@@ -707,6 +707,15 @@ def render_markdown(report: dict[str, Any]) -> str:
 # restart an in-flight backfill campaign.
 _REDUCE_COMPACT_MAX_OBSERVATIONS = 80
 
+# Beyond twice the compact limit the full input is hopeless: the reply needs
+# more tokens than even the corrective retry budget provides, so the full
+# attempt always burns ~25 minutes (a 4096-token try plus a 16384-token retry)
+# only to fail — and the longer the step runs, the more likely the SSH tunnel
+# to the engine dies mid-step (engine log: 499 Client disconnected). Extremely
+# dense days therefore skip the full input and go straight to the compacted
+# one, which is also the only path observed to succeed there.
+_REDUCE_SKIP_FULL_OBSERVATIONS = _REDUCE_COMPACT_MAX_OBSERVATIONS * 2
+
 
 def _compact_reduce_observations(
     observations: list[dict[str, Any]], *, limit: int
@@ -758,12 +767,20 @@ def _reduce_report(
     }
     failure_codes: list[str] = []
     inputs = [observations]
+    compaction: dict[str, int] | None = None
     if len(observations) > _REDUCE_COMPACT_MAX_OBSERVATIONS:
         compacted = _compact_reduce_observations(
             observations, limit=_REDUCE_COMPACT_MAX_OBSERVATIONS
         )
         if len(compacted) < len(observations):
-            inputs.append(compacted)
+            compaction = {
+                "input_observations": len(observations),
+                "used_observations": len(compacted),
+            }
+            if len(observations) > _REDUCE_SKIP_FULL_OBSERVATIONS:
+                inputs = [compacted]
+            else:
+                inputs.append(compacted)
     for index, current in enumerate(inputs):
         messages = [
             {"role": "system", "content": REDUCE_SYSTEM_PROMPT},
@@ -784,11 +801,8 @@ def _reduce_report(
                 report = _validated_reducer_report(value, reducer_evidence_by_id)
                 if failure_codes:
                     report["reduce_retries"] = len(failure_codes)
-                if index > 0:
-                    report["reduce_compaction"] = {
-                        "input_observations": len(observations),
-                        "used_observations": len(current),
-                    }
+                if compaction is not None and len(current) == compaction["used_observations"]:
+                    report["reduce_compaction"] = compaction
                 return report
             except Exception as exc:
                 failure_codes.append(_reduce_failure_code(exc))
