@@ -1788,6 +1788,7 @@ class _LoadAwareBackfillClient:
         if admission_deadline is not None:
             deadline = min(deadline, admission_deadline)
         ready_samples = 0
+        health_errors = 0
         while True:
             if admission_deadline is not None and time.monotonic() >= admission_deadline:
                 self._raise_step_budget_exhausted()
@@ -1798,7 +1799,17 @@ class _LoadAwareBackfillClient:
                     requested_model=self.requested_model,
                     minimum_idle_seconds=0,
                 )
+                health_errors = 0
             except Exception:
+                # A single transient health-probe error (tunnel blip, engine
+                # briefly busy right after a long generation) must not latch
+                # the gate: the step may already have invested tens of minutes
+                # in earlier requests. Tolerate a few probes within the same
+                # admission deadline before closing.
+                health_errors += 1
+                if health_errors < 3 and time.monotonic() < deadline:
+                    time.sleep(self.poll_seconds)
+                    continue
                 self.blocked = True
                 raise RuntimeError("historical_backfill_load_gate_closed") from None
             if (
