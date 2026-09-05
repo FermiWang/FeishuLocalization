@@ -388,6 +388,53 @@ class ProcessorInputMatrixTests(unittest.TestCase):
         self.assertEqual(policy["duplicate_sources_skipped"], [second["id"]])
         self.assertEqual(len(db.list_sources(meeting_id)), 2)
 
+    def test_srt_zero_duration_multiline_cues_keep_their_evidence_timestamps(self):
+        meeting_id = db.create_meeting("字幕多行", "2026-09-05", "", [])
+        path = db.UPLOAD_DIR / "multi-cue.srt"
+        path.write_text(
+            "1\n00:00:22,725 --> 00:00:22,725\nFirst sentence.\nSecond line.\n\n"
+            "2\n00:00:24,245 --> 00:00:24,245\n第三句。第四句。\n",
+            encoding="utf-8",
+        )
+        db.add_source(
+            meeting_id, source_type="transcript", original_name=path.name,
+            stored_path=str(path), sha256=db.file_sha256(path),
+            text_content=extract_transcript(path),
+        )
+        meeting = db.get_meeting(meeting_id)
+        job = db.enqueue_job(meeting_id, input_hash(meeting))
+        with mock.patch("app.processor._analyze_audio") as analyze:
+            fragments, policy = processor.prepare_fragments(job, meeting)
+        analyze.assert_not_called()
+        self.assertEqual(len(fragments), 1)
+        self.assertIn("[00:00:22.725 --> 00:00:22.725]\nFirst sentence.\nSecond line.",
+                      fragments[0]["text"])
+        self.assertIn("[00:00:24.245 --> 00:00:24.245]\n第三句。第四句。", fragments[0]["text"])
+        self.assertFalse(fragments[0]["speaker_labeled"])
+        self.assertTrue(policy["transcript_authoritative"])
+        self.assertFalse(policy["audio_asr_used"])
+
+    def test_paired_srt_audio_is_auxiliary_and_cannot_rewrite_existing_cue_times(self):
+        meeting_id = db.create_meeting("字幕配对录音", "2026-09-05", "", [])
+        rendered = "[00:00:22.725 --> 00:00:22.725]\nAuthoritative original words."
+        self._source(meeting_id, "authority.SRT", "transcript", rendered, "pair-SRT")
+        self._source(meeting_id, "srt-auxiliary.wav", "audio", pair_key="pair-SRT")
+        meeting = db.get_meeting(meeting_id)
+        job = db.enqueue_job(meeting_id, input_hash(meeting))
+        with mock.patch("app.processor.spk.available", return_value=True), mock.patch(
+            "app.processor._analyze_audio",
+            return_value={"labeled": "发言人1：ASR rewritten text.", "segments": []},
+        ) as analyze:
+            fragments, policy = processor.prepare_fragments(job, meeting)
+        analyze.assert_not_called()
+        self.assertEqual(fragments[0]["text"], rendered)
+        self.assertFalse(fragments[0]["speaker_labeled"])
+        self.assertTrue(policy["transcript_authoritative"])
+        self.assertFalse(policy["audio_asr_used"])
+        self.assertFalse(policy["audio_alignment_used"])
+        self.assertEqual(len(db.list_sources(meeting_id)), 2)
+        self.assertFalse(any(source["generated"] for source in db.list_sources(meeting_id)))
+
 
 class ExactModelTests(unittest.TestCase):
     @staticmethod
@@ -722,6 +769,55 @@ class ParallelProcessorTests(unittest.TestCase):
 
 
 class MeetingApiTests(unittest.TestCase):
+    def test_srt_upload_preserves_cues_and_duplicate_upload_reuses_source(self):
+        headers = {"X-Meeting-Minutes-Action": "confirm"}
+        raw = (
+            "1\r\n00:00:22,725 --> 00:00:22,725\r\n<i>First line.</i>\r\nSecond line.\r\n"
+        ).encode("utf-8-sig")
+        with mock.patch("app.processor.start_worker"), TestClient(app) as client:
+            created = client.post(
+                "/api/meetings", headers=headers,
+                json={"title": "SRT 上传测试", "meeting_date": "2026-09-05"},
+            )
+            meeting_id = created.json()["id"]
+            first = client.post(
+                f"/api/meetings/{meeting_id}/sources", headers=headers,
+                files={"file": ("webinar.SRT", raw, "application/x-subrip")},
+            )
+            self.assertEqual(first.status_code, 201)
+            self.assertEqual(first.json()["source_type"], "transcript")
+            saved_files = set(db.UPLOAD_DIR.iterdir())
+            duplicate = client.post(
+                f"/api/meetings/{meeting_id}/sources", headers=headers,
+                files={"file": ("renamed.srt", raw, "application/x-subrip")},
+            )
+            self.assertEqual(duplicate.status_code, 201)
+            self.assertEqual(duplicate.json()["id"], first.json()["id"])
+            self.assertTrue(duplicate.json()["duplicate_skipped"])
+            self.assertEqual(set(db.UPLOAD_DIR.iterdir()), saved_files)
+            sources = client.get(f"/api/meetings/{meeting_id}/sources?include_text=true").json()
+            self.assertEqual(len(sources), 1)
+            self.assertEqual(sources[0]["text"],
+                             "[00:00:22.725 --> 00:00:22.725]\nFirst line.\nSecond line.")
+
+    def test_invalid_srt_upload_returns_readable_error_and_removes_temporary_file(self):
+        headers = {"X-Meeting-Minutes-Action": "confirm"}
+        with mock.patch("app.processor.start_worker"), TestClient(app) as client:
+            created = client.post(
+                "/api/meetings", headers=headers,
+                json={"title": "损坏 SRT 测试", "meeting_date": "2026-09-05"},
+            )
+            meeting_id = created.json()["id"]
+            saved_files = set(db.UPLOAD_DIR.iterdir())
+            response = client.post(
+                f"/api/meetings/{meeting_id}/sources", headers=headers,
+                files={"file": ("invalid.srt", b"1\nmissing timestamp\nHello\n", "application/x-subrip")},
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("第 1 段时间格式无效", response.json()["detail"])
+            self.assertEqual(set(db.UPLOAD_DIR.iterdir()), saved_files)
+            self.assertEqual(client.get(f"/api/meetings/{meeting_id}/sources").json(), [])
+
     def test_upload_response_does_not_echo_transcript_body(self):
         headers = {"X-Meeting-Minutes-Action": "confirm"}
         with TestClient(app) as client:

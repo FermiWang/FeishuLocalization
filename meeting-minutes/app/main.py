@@ -40,14 +40,14 @@ class Attendee(BaseModel):
 class MeetingCreate(BaseModel):
     title: str
     meeting_date: str = ""
-    background: str = ""
+    background: str = Field(default="", max_length=50_000)
     attendees: list[Attendee] = Field(default_factory=list)
 
 
 class MeetingUpdate(BaseModel):
     title: str
     meeting_date: str
-    background: str = ""
+    background: str = Field(default="", max_length=50_000)
 
 
 class SourceOrder(BaseModel):
@@ -185,7 +185,7 @@ def shutdown() -> None:
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/system/model")
@@ -238,6 +238,10 @@ def update_meeting(meeting_id: int, payload: MeetingUpdate,
     if not payload.title.strip():
         raise HTTPException(400, "会议标题不能为空")
     meeting_date = _validate_meeting_date(payload.meeting_date, required=True)
+    if (payload.title.strip(), meeting_date, payload.background.strip()) == (
+        meeting["title"], meeting["meeting_date"], meeting["background"],
+    ):
+        return {"ok": True, "revision": meeting.get("current_revision") or 0}
     db.update_meeting(
         meeting_id, title=payload.title.strip(),
         meeting_date=meeting_date, background=payload.background.strip(),
@@ -271,6 +275,18 @@ def update_meeting(meeting_id: int, payload: MeetingUpdate,
 @app.get("/api/meetings")
 def list_meetings():
     return db.list_meetings()
+
+
+@app.post("/api/meetings/{meeting_id}/background/refresh")
+def refresh_background(meeting_id: int,
+                       x_meeting_minutes_action: str | None = Header(default=None)):
+    _require_confirmation(x_meeting_minutes_action)
+    meeting = _meeting_or_404(meeting_id)
+    try:
+        refreshed = processor.prepare_background(meeting, force=True)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"items": refreshed.get("background_pages") or []}
 
 
 @app.get("/api/meetings/{meeting_id}")

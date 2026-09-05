@@ -22,7 +22,7 @@ EXPORT_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "meetings.db"
 
 _local = threading.local()
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meetings (
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     title TEXT NOT NULL,
     meeting_date TEXT DEFAULT '',
     background TEXT DEFAULT '',
+    background_pages_json TEXT NOT NULL DEFAULT '[]',
     audio_path TEXT DEFAULT '',
     transcript_path TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -342,6 +343,7 @@ def init_db() -> None:
         )
     conn.executescript(SCHEMA)
     _add_column_if_missing("meetings", "updated_at TEXT DEFAULT ''")
+    _add_column_if_missing("meetings", "background_pages_json TEXT NOT NULL DEFAULT '[]'")
     _add_column_if_missing("minutes", "stage TEXT DEFAULT ''")
     _add_column_if_missing(
         "record_revisions", "source_fragments_json TEXT NOT NULL DEFAULT '{\"items\":[]}'"
@@ -381,11 +383,26 @@ def update_meeting(meeting_id: int, *, title: str, meeting_date: str,
                    background: str) -> None:
     conn = get_conn()
     conn.execute(
-        """UPDATE meetings SET title=?, meeting_date=?, background=?,
+        """UPDATE meetings SET title=?, meeting_date=?,
+           background_pages_json=CASE WHEN background=? THEN background_pages_json ELSE '[]' END,
+           background=?,
            updated_at=datetime('now','localtime') WHERE id=?""",
-        (title, meeting_date, background, meeting_id),
+        (title, meeting_date, background, background, meeting_id),
     )
     conn.commit()
+
+
+def save_background_pages(meeting_id: int, expected_background: str,
+                          pages: list[dict[str, Any]]) -> bool:
+    """Keep a fetched snapshot only while its user-supplied background is current."""
+    conn = get_conn()
+    result = conn.execute(
+        """UPDATE meetings SET background_pages_json=?,
+           updated_at=datetime('now','localtime') WHERE id=? AND background=?""",
+        (json.dumps(pages, ensure_ascii=False, sort_keys=True), meeting_id, expected_background),
+    )
+    conn.commit()
+    return result.rowcount == 1
 
 
 def list_meetings() -> list[dict[str, Any]]:
@@ -416,6 +433,7 @@ def get_meeting(meeting_id: int) -> dict[str, Any] | None:
     if row is None:
         return None
     meeting = dict(row)
+    meeting["background_pages"] = json.loads(meeting.pop("background_pages_json", "[]") or "[]")
     meeting["attendees"] = [dict(item) for item in conn.execute(
         "SELECT name,role FROM attendees WHERE meeting_id=? ORDER BY id", (meeting_id,)
     )]

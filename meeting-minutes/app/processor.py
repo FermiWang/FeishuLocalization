@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import db, llm, spk
+from . import background, db, llm, spk
 from .docx_export import build_docx
 from .sources import effective_sources, input_hash, segment_text, stable_fragments
 
@@ -52,6 +52,33 @@ def _analyze_audio(*args: Any) -> dict[str, Any] | None:
         return spk.analyze(*args)
 
 
+def prepare_background(meeting: dict[str, Any], *, job: dict[str, Any] | None = None,
+                       force: bool = False) -> dict[str, Any]:
+    """Fetch explicit background links once; errors are visible but never block transcripts."""
+    value = str(meeting.get("background") or "")
+    urls = background.extract_background_urls(value)
+    saved = {page.get("url"): page for page in meeting.get("background_pages") or []}
+    pages: list[dict[str, Any]] = []
+    for index, url in enumerate(urls):
+        if not force and url in saved:
+            pages.append(saved[url])
+            continue
+        if index >= 3:
+            pages.append({"url": url, "status": "error", "error": "每场会议最多读取 3 个背景网页，请精简链接后重试"})
+            continue
+        if job:
+            _job_update(job["id"], meeting["id"], f"读取会议网页背景 {index + 1}/{min(len(urls), 3)}", 2)
+        try:
+            page = {**background.fetch_background(url), "url": url, "status": "ready"}
+        except background.BackgroundFetchError as exc:
+            page = {"url": url, "status": "error", "error": str(exc)}
+        pages.append(page)
+    if pages != (meeting.get("background_pages") or []):
+        if not db.save_background_pages(meeting["id"], value, pages):
+            raise ValueError("读取期间会议背景已修改，请重新读取网页")
+    return db.get_meeting(meeting["id"]) or meeting
+
+
 def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[list[dict], dict[str, Any]]:
     """Apply transcript-authority and audio-only ASR rules, returning stable fragments."""
     all_sources = list(meeting.get("sources") or [])
@@ -78,7 +105,8 @@ def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[lis
             # unavailable or alignment fails, do not reinterpret it as an
             # unpaired audio-only source and overwrite the transcript policy.
             consumed_audio.add(paired["id"])
-        if paired and spk.available():
+        is_subtitle = Path(str(source.get("original_name") or "")).suffix.lower() == ".srt"
+        if paired and not is_subtitle and spk.available():
             _job_update(job["id"], meeting["id"],
                         f"识别稿优先：为 {source['original_name']} 对齐时间轴和说话人", 5)
             db.set_source_processing(paired["id"], "processing")
@@ -153,6 +181,10 @@ def prepare_fragments(job: dict[str, Any], meeting: dict[str, Any]) -> tuple[lis
         "audio_alignment_used": used_alignment,
         "speaker_identity_policy": "不可靠时保留说话人N或不署名，不猜测真实姓名",
         "duplicate_sources_skipped": duplicate_ids,
+        "subtitle_timestamps_preserved": any(
+            Path(str(source.get("original_name") or "")).suffix.lower() == ".srt"
+            for source in sources
+        ),
     }
     return stable_fragments(segments), policy
 
@@ -164,6 +196,7 @@ def process_job(job: dict[str, Any]) -> None:
         return
     checkpoint = json.loads(job.get("checkpoint_json") or "{}")
     try:
+        meeting = prepare_background(meeting, job=job)
         fragments, policy = prepare_fragments(job, meeting)
         current_input_hash = input_hash(meeting)
         if current_input_hash != str(job.get("input_hash") or ""):
