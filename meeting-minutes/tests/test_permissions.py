@@ -36,7 +36,9 @@ def test_meeting_access_is_enforced_on_list_detail_export_and_mutations():
                 client = TestClient(main.app)
                 assert client.get("/api/meetings").status_code == 401
                 assert client.get("/", follow_redirects=False).headers["location"] == main.LOGIN_URL
-                assert client.get("/api/meetings", headers={"Authorization": "Bearer a"}).json()[0]["id"] == own_id
+                own_list = client.get("/api/meetings", headers={"Authorization": "Bearer a"})
+                assert own_list.json()[0]["id"] == own_id
+                assert own_list.headers["cache-control"] == "private, no-store"
                 assert len(client.get("/api/meetings", headers={"Authorization": "Bearer a"}).json()) == 1
                 client.cookies.set("dl_auth_token", "b")
                 assert client.get("/api/meetings").json()[0]["id"] == other_id
