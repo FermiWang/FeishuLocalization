@@ -1,0 +1,38 @@
+# 会议纪要整理应用 — 开发约定
+
+## 铁律：先提交，再部署
+
+任何代码改动必须**先在本仓库完成 git 提交，再部署到服务器**。
+禁止把未提交的改动直接 rsync 到线上；部署的内容必须能在 git 历史中复现。
+
+## 部署（仅在提交后执行）
+
+服务器：apple@192.168.100.179（Mac-Studio），应用目录 `~/meeting-minutes/`。
+
+```bash
+# 1. 提交
+git add -A && git commit -m "<说明>"
+
+# 2. 同步代码（排除运行数据与虚拟环境）
+rsync -a --exclude data --exclude __pycache__ --exclude .venv --exclude .git \
+  ./ apple@192.168.100.179:meeting-minutes/
+
+# 3. 安装 deploy/ 下的两个 launchd 配置并重启服务（HTTPS 应用与旧 HTTP 跳转）
+ssh apple@192.168.100.179 "
+  launchctl unload ~/Library/LaunchAgents/com.apple.meeting-minutes.plist
+  sleep 1
+  launchctl load ~/Library/LaunchAgents/com.apple.meeting-minutes.plist
+  launchctl load ~/Library/LaunchAgents/com.apple.meeting-minutes-redirect.plist"
+
+# 4. 验证
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.100.179:8765/
+curl -k -s -o /dev/null -w '%{http_code}\n' https://192.168.100.179:8766/api/meetings
+```
+
+## 环境要点
+
+- 主应用 venv（远端）：`~/meeting-minutes/.venv`，py3.14，fastapi/uvicorn/httpx/python-multipart
+- 声纹分离 venv（远端）：`~/meeting-minutes/.venv-spk`，py3.11，funasr/torch/torchaudio，
+  由 `app/spk.py` 子进程调用 `app/diarize_worker.py`；缺失时自动跳过声纹步骤
+- 详细会议记录模型端点：`http://192.168.100.214:8007/v1`（精确 ID `Qwen3.8-27B-FP8`）
+- 详细架构与配置见 README.md；声纹选型验证记录见 research/README.md
