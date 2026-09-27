@@ -149,4 +149,4 @@ def test_migration_adds_background_column_without_losing_old_data(meeting_db):
     migrated = db.get_meeting(mid)
     assert migrated["background"] == "旧背景"
     assert migrated["background_pages"] == []
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 6

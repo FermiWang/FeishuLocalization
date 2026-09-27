@@ -17,14 +17,16 @@ git add -A && git commit -m "<说明>"
 rsync -a --exclude data --exclude __pycache__ --exclude .venv --exclude .git \
   ./ apple@192.168.100.179:meeting-minutes/
 
-# 3. 重启服务（launchd 常驻）
+# 3. 安装 deploy/ 下的两个 launchd 配置并重启服务（HTTPS 应用与旧 HTTP 跳转）
 ssh apple@192.168.100.179 "
   launchctl unload ~/Library/LaunchAgents/com.apple.meeting-minutes.plist
   sleep 1
-  launchctl load ~/Library/LaunchAgents/com.apple.meeting-minutes.plist"
+  launchctl load ~/Library/LaunchAgents/com.apple.meeting-minutes.plist
+  launchctl load ~/Library/LaunchAgents/com.apple.meeting-minutes-redirect.plist"
 
 # 4. 验证
 curl -s -o /dev/null -w '%{http_code}\n' http://192.168.100.179:8765/
+curl -k -s -o /dev/null -w '%{http_code}\n' https://192.168.100.179:8766/api/meetings
 ```
 
 ## 环境要点

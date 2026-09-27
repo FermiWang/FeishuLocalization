@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from datetime import date
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -13,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db, llm, processor
+from .auth import AuthUnavailable, resolve_identity
 from .docx_export import build_docx
 from .sources import (
     annotate_duplicate_sources,
@@ -30,6 +32,9 @@ CONFIRM_HEADER = "confirm"
 
 app = FastAPI(title="详细会议记录整理")
 db.init_db()
+
+LOGIN_URL = "https://192.168.100.179:3000/login?redirect=/meeting-minutes/open"
+MEETING_PATH = re.compile(r"^/api/meetings/(\d+)(?:/|$)")
 
 
 class Attendee(BaseModel):
@@ -66,6 +71,28 @@ class RecordEdit(BaseModel):
 
 def _model_dump(value: BaseModel) -> dict:
     return value.model_dump() if hasattr(value, "model_dump") else value.dict()
+
+
+@app.middleware("http")
+async def require_digital_lab_session(request: Request, call_next):
+    authorization = request.headers.get("authorization", "")
+    token = (authorization[7:] if authorization.startswith("Bearer ")
+             else request.cookies.get("dl_auth_token", ""))
+    try:
+        identity = await resolve_identity(token)
+    except AuthUnavailable as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=503)
+    if identity is None:
+        if request.url.path == "/" and request.method in ("GET", "HEAD"):
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(LOGIN_URL, status_code=302)
+        return JSONResponse({"detail": "请先登录 DigitalLab"}, status_code=401)
+    request.state.identity = identity
+    match = MEETING_PATH.match(request.url.path)
+    if match and not identity.is_super_admin:
+        if db.meeting_owner(int(match.group(1))) != identity.user_id:
+            return JSONResponse({"detail": "会议不存在"}, status_code=404)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -188,6 +215,16 @@ def index():
     return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/session")
+def session(request: Request):
+    identity = request.state.identity
+    return {
+        "user_id": identity.user_id,
+        "display_name": identity.display_name,
+        "is_super_admin": identity.is_super_admin,
+    }
+
+
 @app.get("/api/system/model")
 def model_status():
     workers = processor.worker_status()
@@ -219,13 +256,14 @@ def model_status():
 
 
 @app.post("/api/meetings", status_code=201)
-def create_meeting(payload: MeetingCreate):
+def create_meeting(payload: MeetingCreate, request: Request):
     if not payload.title.strip():
         raise HTTPException(400, "会议标题不能为空")
     meeting_id = db.create_meeting(
         payload.title.strip(), _validate_meeting_date(payload.meeting_date, required=False),
         payload.background.strip(),
         [_model_dump(attendee) for attendee in payload.attendees],
+        owner_user_id=request.state.identity.user_id,
     )
     return {"id": meeting_id}
 
@@ -273,8 +311,9 @@ def update_meeting(meeting_id: int, payload: MeetingUpdate,
 
 
 @app.get("/api/meetings")
-def list_meetings():
-    return db.list_meetings()
+def list_meetings(request: Request):
+    identity = request.state.identity
+    return db.list_meetings(None if identity.is_super_admin else identity.user_id)
 
 
 @app.post("/api/meetings/{meeting_id}/background/refresh")

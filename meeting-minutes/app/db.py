@@ -22,7 +22,7 @@ EXPORT_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "meetings.db"
 
 _local = threading.local()
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meetings (
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     meeting_date TEXT DEFAULT '',
     background TEXT DEFAULT '',
     background_pages_json TEXT NOT NULL DEFAULT '[]',
+    owner_user_id TEXT,
     audio_path TEXT DEFAULT '',
     transcript_path TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -344,6 +345,8 @@ def init_db() -> None:
     conn.executescript(SCHEMA)
     _add_column_if_missing("meetings", "updated_at TEXT DEFAULT ''")
     _add_column_if_missing("meetings", "background_pages_json TEXT NOT NULL DEFAULT '[]'")
+    _add_column_if_missing("meetings", "owner_user_id TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meetings_owner ON meetings(owner_user_id, id)")
     _add_column_if_missing("minutes", "stage TEXT DEFAULT ''")
     _add_column_if_missing(
         "record_revisions", "source_fragments_json TEXT NOT NULL DEFAULT '{\"items\":[]}'"
@@ -360,11 +363,11 @@ def init_db() -> None:
 
 
 def create_meeting(title: str, meeting_date: str, background: str,
-                   attendees: list[dict[str, str]]) -> int:
+                   attendees: list[dict[str, str]], owner_user_id: str | None = None) -> int:
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO meetings(title,meeting_date,background) VALUES (?,?,?)",
-        (title, meeting_date, background),
+        "INSERT INTO meetings(title,meeting_date,background,owner_user_id) VALUES (?,?,?,?)",
+        (title, meeting_date, background, owner_user_id),
     )
     meeting_id = int(cur.lastrowid)
     for attendee in attendees:
@@ -405,9 +408,11 @@ def save_background_pages(meeting_id: int, expected_background: str,
     return result.rowcount == 1
 
 
-def list_meetings() -> list[dict[str, Any]]:
+def list_meetings(owner_user_id: str | None = None) -> list[dict[str, Any]]:
+    where = "" if owner_user_id is None else "WHERE m.owner_user_id=?"
+    params = () if owner_user_id is None else (owner_user_id,)
     rows = get_conn().execute(
-        """SELECT m.id,m.title,m.meeting_date,m.created_at,
+        f"""SELECT m.id,m.title,m.meeting_date,m.created_at,m.owner_user_id,
                   SUM(CASE WHEN s.source_type='audio' THEN 1 ELSE 0 END) audio_count,
                   SUM(CASE WHEN s.source_type='transcript' THEN 1 ELSE 0 END) transcript_count,
                   COALESCE(mi.status,'pending') minutes_status,
@@ -416,7 +421,7 @@ def list_meetings() -> list[dict[str, Any]]:
            FROM meetings m
            LEFT JOIN meeting_sources s ON s.meeting_id=m.id
            LEFT JOIN minutes mi ON mi.meeting_id=m.id
-           GROUP BY m.id ORDER BY m.id DESC"""
+           {where} GROUP BY m.id ORDER BY m.id DESC""", params
     ).fetchall()
     result = []
     for row in rows:
@@ -442,6 +447,13 @@ def get_meeting(meeting_id: int) -> dict[str, Any] | None:
     latest = get_record(meeting_id)
     meeting["current_revision"] = latest["revision"] if latest else 0
     return meeting
+
+
+def meeting_owner(meeting_id: int) -> str | None:
+    row = get_conn().execute(
+        "SELECT owner_user_id FROM meetings WHERE id=?", (meeting_id,)
+    ).fetchone()
+    return row["owner_user_id"] if row else None
 
 
 def _next_position(meeting_id: int) -> int:

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.apple.meeting-minutes</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/apple/meeting-minutes/.venv/bin/python3</string>
+    <string>-m</string><string>uvicorn</string><string>app.main:app</string>
+    <string>--host</string><string>0.0.0.0</string>
+    <string>--port</string><string>8766</string>
+    <string>--ssl-certfile</string><string>/Users/apple/Workplace/DigitalLab/var/certs/digitallab-local.crt</string>
+    <string>--ssl-keyfile</string><string>/Users/apple/Workplace/DigitalLab/var/certs/digitallab-local.key</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/apple/meeting-minutes</string>
+  <key>StandardOutPath</key><string>/Users/apple/meeting-minutes/data/server.log</string>
+  <key>StandardErrorPath</key><string>/Users/apple/meeting-minutes/data/server.log</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>

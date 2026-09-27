@@ -19,7 +19,7 @@ aside{background:#fff;border-right:1px solid var(--line);padding:18px;overflow:a
 </style>
 </head>
 <body>
-<header><h1>详细会议记录整理</h1><div class="model" id="model-state">模型：Qwen3.8-27B-FP8</div></header>
+<header><h1>详细会议记录整理</h1><div class="row"><span id="current-user"></span><div class="model" id="model-state">模型：Qwen3.8-27B-FP8</div></div></header>
 <div class="layout"><aside><button class="primary wide" onclick="showCreate()">＋ 新建会议</button><h3>会议列表</h3><div id="meeting-list"></div></aside><main class="main" id="main"><div class="empty">请选择会议，或新建一场会议</div></main></div>
 <script>
 let currentId=null,pollTimer=null,currentRecord=null;
@@ -59,6 +59,7 @@ async function loadRecord(revision){try{const r=await api(revision?`/api/meeting
 async function loadFragments(revision){const data=await api(`/api/meetings/${currentId}/records/${revision}/fragments`),root=$("#fragment-view");root.innerHTML=`<div class="card"><h3>证据片段索引</h3><div class="hint">用于核对正文中的 S 编号；不会同步到 Feishu Archive。</div>${(data.items||[]).map(f=>`<div class="revision"><b>${esc(f.id)}</b> · 来源 #${Number(f.source_id)||0}<div>${esc(f.text)}</div></div>`).join("")}</div>`}
 function editSection(id){const s=currentRecord.structured.sections.find(x=>x.id===id),body=$(`#body-${id}`);body.innerHTML=`<textarea rows="12" id="edit-${id}">${esc(s.content)}</textarea><div class="row spaced"><button class="primary" onclick="saveSection('${id}')">保存为新修订版</button><button class="secondary" onclick="loadRecord()">取消</button></div>`}
 async function saveSection(id){const sections={};for(const s of currentRecord.structured.sections)sections[s.id]=s.id===id?$(`#edit-${id}`).value:s.content;try{await api(`/api/meetings/${currentId}/records`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_revision:currentRecord.revision,sections})});await selectMeeting(currentId)}catch(e){alert(e.message)}}
+api("/api/session").then(s=>{$("#current-user").textContent=`${s.display_name}${s.is_super_admin?" · 超级管理员":""}`}).catch(()=>{});
 loadList();modelStatus();setInterval(modelStatus,30000);
 </script>
 </body>
